@@ -23,6 +23,7 @@ jobs:
 
         - name: Install snap dependencies
           run: |
+            pip3 install --upgrade pip
             for f in $(find -name '*requirements.txt'); do
               echo "${f}"
               pip3 install --requirement "${f}"
@@ -34,6 +35,6 @@ jobs:
             mode: qserver
             viewerUrl: https://canonical.tiobe.com/tiobeweb/TICS/api/cfg?name=default
             ticsAuthToken: ${{ secrets.TICSAUTHTOKEN }}
-            project: snap-openstack
+            project: charm-rabbitmq-k8s
             branchdir: ${{ env.GITHUB_WORKSPACE }}
             installTics: true
