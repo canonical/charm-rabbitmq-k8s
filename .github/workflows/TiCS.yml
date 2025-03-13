@@ -16,7 +16,9 @@ jobs:
           uses: actions/checkout@v4
 
         - name: Install dependencies
-          run: python -m pip install tox
+          run: |
+            sudo apt update
+            sudo apt install tox -y
 
         - name: Run coverage tests
           run: tox -e cover
