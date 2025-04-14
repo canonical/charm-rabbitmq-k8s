@@ -145,6 +145,9 @@ class RabbitMQOperatorCharm(CharmBase):
         )
         self.framework.observe(self.on.config_changed, self._on_config_changed)
         self.framework.observe(
+            self.on.rabbitmq_data_storage_attached, self._on_config_changed
+        )
+        self.framework.observe(
             self.on.get_operator_info_action, self._on_get_operator_info_action
         )
         self.framework.observe(
@@ -250,7 +253,10 @@ class RabbitMQOperatorCharm(CharmBase):
             return
 
         # Change ownership of /var/lib/rabbitmq
-        self._set_ownership_on_data_dir()
+        if not self._set_ownership_on_data_dir():
+            # Waiting for rabbitmq-data-storage-attached event
+            self._on_update_status(event)
+            return
 
         # Render and push configuration files
         self._render_and_push_config_files()
@@ -803,18 +809,19 @@ class RabbitMQOperatorCharm(CharmBase):
         logging.warning("Deleting the guest user.")
         api.delete_user("guest")
 
-    def _set_ownership_on_data_dir(self) -> None:
+    def _set_ownership_on_data_dir(self) -> bool:
         """Set ownership on /var/lib/rabbitmq."""
         container = self.unit.get_container(RABBITMQ_CONTAINER)
         paths = container.list_files(RABBITMQ_DATA_DIR, itself=True)
         if len(paths) == 0:
-            return
+            logging.info("Rabbitmq data dir not yet created, rechecking..")
+            return False
 
         logger.debug(
             f"rabbitmq lib directory ownership: {paths[0].user}:{paths[0].group}"
         )
         if paths[0].user != RABBITMQ_USER or paths[0].group != RABBITMQ_GROUP:
-            logger.debug(
+            logger.info(
                 f"Changing ownership to {RABBITMQ_USER}:{RABBITMQ_GROUP}"
             )
             try:
@@ -830,6 +837,8 @@ class RabbitMQOperatorCharm(CharmBase):
                 logger.error(
                     f"Exited with code {e.exit_code}. Stderr:\n{e.stderr}"
                 )
+
+        return True
 
     def _render_and_push_config_files(self) -> None:
         """Render and push configuration files.
