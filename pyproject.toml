@@ -1,9 +1,46 @@
 # Copyright 2022 Canonical Ltd.
 # See LICENSE file for licensing details.
 
+[project]
+name = "rabbitmq-k8s"
+version = "3.12"
+requires-python = "~=3.12.0"
+
+dependencies = [
+    "ops",
+    "pika",
+    "pwgen",
+    "rabbitmq-admin",
+    "tenacity",
+    "lightkube",
+    "lightkube-models",
+    "lightkube-extensions @ git+https://github.com/canonical/lightkube-extensions.git@main",
+    "jsonschema",
+]
+
+[project.optional-dependencies]
+dev = [
+    "coverage",
+    "flake8",
+    "stestr",
+    "rabbitmq_admin",
+    "ops",
+    "cosl",
+    "zaza @ git+https://github.com/openstack-charmers/zaza.git@master",
+    "zaza.openstack @ git+https://github.com/openstack-charmers/zaza-openstack-tests.git@master",
+]
+
 # Testing tools configuration
 [tool.coverage.run]
 branch = true
+concurrency = ["multiprocessing"]
+parallel = true
+source = ["."]
+omit = [
+    ".tox/*",
+    "tests/*",
+    "src/templates/*",
+]
 
 [tool.coverage.report]
 show_missing = true
@@ -30,7 +67,7 @@ exclude = [".git", "__pycache__", ".tox", "build", "dist", "*.egg_info", "venv"]
 select = ["E", "W", "F", "C", "N", "R", "D", "H"]
 # Ignore W503, E501 because using black creates errors with this
 # Ignore D107 Missing docstring in __init__
-ignore = ["W503", "E501", "D107", "E402"]
+ignore = ["W503", "E501", "D107", "E402", "E226"]
 per-file-ignores = []
 docstring-convention = "google"
 # Check for properly formatted copyright header in each file

@@ -24,6 +24,7 @@ jobs:
         run: |
           sudo snap install --classic terraform
           sudo snap install --classic juju-wait
+          sudo snap install astral-uv --channel latest/stable --classic
       - name: Configure LXD
         run: |
           sudo groupadd --force --system lxd
