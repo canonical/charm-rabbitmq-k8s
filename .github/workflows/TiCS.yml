@@ -17,19 +17,18 @@ jobs:
 
         - name: Install dependencies
           run: |
-            sudo apt update
-            sudo apt install tox -y
+            sudo apt update && sudo apt install -y pipx
+            pipx install tox
+            sudo snap install astral-uv --classic
 
         - name: Run coverage tests
           run: tox -e cover
 
-        - name: Install snap dependencies
+        - name: Activate and prepare Python virtual environment
           run: |
-            pip3 install --upgrade pip
-            for f in $(find -name '*requirements.txt'); do
-              echo "${f}"
-              pip3 install --requirement "${f}"
-            done
+            uv sync --extra=dev
+            source .venv/bin/activate
+            uv pip install pylint flake8
 
         - name: TICS
           uses: tiobe/tics-github-action@v3
