@@ -293,6 +293,7 @@ class RabbitMQOperatorCharm(CharmBase):
         if not self._set_ownership_on_data_dir():
             # Waiting for rabbitmq-data-storage-attached event
             self._on_update_status(event)
+            event.defer()
             return
 
         # Render and push configuration files
