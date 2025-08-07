@@ -585,3 +585,238 @@ class TestCharm(unittest.TestCase):
                     self.harness.charm._loadbalancer_annotations,
                     expected_result,
                 )
+
+    def test_ensure_ownership_same_ownership(self):
+        """Test _ensure_ownership when ownership is already correct."""
+        # Mock container
+        mock_container = Mock()
+        mock_file_info = Mock()
+        mock_file_info.user = "rabbitmq"
+        mock_file_info.group = "rabbitmq"
+        mock_container.list_files.return_value = [mock_file_info]
+
+        # Test with correct ownership
+        result = self.harness.charm._ensure_ownership(
+            mock_container, "/test/path", "rabbitmq", "rabbitmq"
+        )
+
+        # Should return True and not call exec
+        self.assertTrue(result)
+        mock_container.list_files.assert_called_once_with(
+            "/test/path", itself=True
+        )
+        mock_container.exec.assert_not_called()
+
+    def test_ensure_ownership_different_ownership(self):
+        """Test _ensure_ownership when ownership needs to be changed."""
+        # Mock container
+        mock_container = Mock()
+        mock_file_info = Mock()
+        mock_file_info.user = "root"
+        mock_file_info.group = "root"
+        mock_container.list_files.return_value = [mock_file_info]
+
+        # Test with incorrect ownership
+        result = self.harness.charm._ensure_ownership(
+            mock_container, "/test/path", "rabbitmq", "rabbitmq"
+        )
+
+        # Should return True and call exec to change ownership
+        self.assertTrue(result)
+        mock_container.list_files.assert_called_once_with(
+            "/test/path", itself=True
+        )
+        mock_container.exec.assert_called_once_with(
+            ["chown", "-R", "rabbitmq:rabbitmq", "/test/path"]
+        )
+
+    def test_ensure_ownership_exec_error(self):
+        """Test _ensure_ownership when chown command fails."""
+        from ops.pebble import (
+            ExecError,
+        )
+
+        # Mock container
+        mock_container = Mock()
+        mock_file_info = Mock()
+        mock_file_info.user = "root"
+        mock_file_info.group = "root"
+        mock_container.list_files.return_value = [mock_file_info]
+        mock_container.exec.side_effect = ExecError(
+            ["chown"], 1, "stdout", "Permission denied"
+        )
+
+        # Test with exec error
+        result = self.harness.charm._ensure_ownership(
+            mock_container, "/test/path", "rabbitmq", "rabbitmq"
+        )
+
+        # Should return False when exec fails
+        self.assertFalse(result)
+        mock_container.list_files.assert_called_once_with(
+            "/test/path", itself=True
+        )
+        mock_container.exec.assert_called_once_with(
+            ["chown", "-R", "rabbitmq:rabbitmq", "/test/path"]
+        )
+
+    def test_set_ownership_on_data_dir_not_mounted(self):
+        """Test _set_ownership_on_data_dir when data directory is not mounted."""
+        from ops.pebble import (
+            ExecError,
+        )
+
+        # Mock the container
+        mock_container = Mock()
+        mock_container.exec.side_effect = ExecError(
+            ["mountpoint"], 1, "", "not a mountpoint"
+        )
+        self.harness.charm.unit.get_container = Mock(
+            return_value=mock_container
+        )
+
+        # Test when data dir is not mounted
+        result = self.harness.charm._set_ownership_on_data_dir()
+
+        # Should return False when not mounted
+        self.assertFalse(result)
+        mock_container.exec.assert_called_once_with(
+            ["mountpoint", "/var/lib/rabbitmq"]
+        )
+
+    def test_set_ownership_on_data_dir_ensure_ownership_fails(self):
+        """Test _set_ownership_on_data_dir when _ensure_ownership fails."""
+        # Mock the container
+        mock_container = Mock()
+        mock_container.exec.return_value = None  # mountpoint succeeds
+        self.harness.charm.unit.get_container = Mock(
+            return_value=mock_container
+        )
+
+        # Mock _ensure_ownership to fail
+        self.harness.charm._ensure_ownership = Mock(return_value=False)
+
+        # Test when ensure ownership fails
+        result = self.harness.charm._set_ownership_on_data_dir()
+
+        # Should return False when ensure ownership fails
+        self.assertFalse(result)
+        mock_container.exec.assert_called_once_with(
+            ["mountpoint", "/var/lib/rabbitmq"]
+        )
+        self.harness.charm._ensure_ownership.assert_called_once_with(
+            mock_container, "/var/lib/rabbitmq", "rabbitmq", "rabbitmq"
+        )
+
+    def test_set_ownership_on_data_dir_no_mnesia_dir(self):
+        """Test _set_ownership_on_data_dir when mnesia directory doesn't exist."""
+        # Mock the container
+        mock_container = Mock()
+        mock_container.exec.return_value = None  # mountpoint succeeds
+        mock_container.list_files.return_value = []  # no mnesia directory
+        self.harness.charm.unit.get_container = Mock(
+            return_value=mock_container
+        )
+
+        # Mock _ensure_ownership to succeed
+        self.harness.charm._ensure_ownership = Mock(return_value=True)
+
+        # Test when mnesia directory doesn't exist
+        result = self.harness.charm._set_ownership_on_data_dir()
+
+        # Should return True and create mnesia directory
+        self.assertTrue(result)
+        mock_container.exec.assert_called_once_with(
+            ["mountpoint", "/var/lib/rabbitmq"]
+        )
+        mock_container.list_files.assert_called_once_with(
+            "/var/lib/rabbitmq", pattern="mnesia"
+        )
+        mock_container.make_dir.assert_called_once_with(
+            "/var/lib/rabbitmq/mnesia",
+            permissions=0o750,
+            user="rabbitmq",
+            group="rabbitmq",
+        )
+
+    def test_set_ownership_on_data_dir_mnesia_exists(self):
+        """Test _set_ownership_on_data_dir when mnesia directory exists."""
+        # Mock the container
+        mock_container = Mock()
+        mock_container.exec.return_value = None  # mountpoint succeeds
+        mock_file_info = Mock()
+        mock_container.list_files.return_value = [
+            mock_file_info
+        ]  # mnesia directory exists
+        self.harness.charm.unit.get_container = Mock(
+            return_value=mock_container
+        )
+
+        # Mock _ensure_ownership to succeed for both calls
+        self.harness.charm._ensure_ownership = Mock(return_value=True)
+
+        # Test when mnesia directory exists
+        result = self.harness.charm._set_ownership_on_data_dir()
+
+        # Should return True and ensure ownership on both directories
+        self.assertTrue(result)
+        mock_container.exec.assert_called_once_with(
+            ["mountpoint", "/var/lib/rabbitmq"]
+        )
+        mock_container.list_files.assert_called_once_with(
+            "/var/lib/rabbitmq", pattern="mnesia"
+        )
+        mock_container.make_dir.assert_not_called()
+
+        # Should call _ensure_ownership twice: once for data dir, once for mnesia dir
+        expected_calls = [
+            call(mock_container, "/var/lib/rabbitmq", "rabbitmq", "rabbitmq"),
+            call(
+                mock_container,
+                "/var/lib/rabbitmq/mnesia",
+                "rabbitmq",
+                "rabbitmq",
+            ),
+        ]
+        self.harness.charm._ensure_ownership.assert_has_calls(expected_calls)
+
+    def test_set_ownership_on_data_dir_mnesia_ownership_fails(self):
+        """Test _set_ownership_on_data_dir when mnesia ownership fails."""
+        # Mock the container
+        mock_container = Mock()
+        mock_container.exec.return_value = None  # mountpoint succeeds
+        mock_file_info = Mock()
+        mock_container.list_files.return_value = [
+            mock_file_info
+        ]  # mnesia directory exists
+        self.harness.charm.unit.get_container = Mock(
+            return_value=mock_container
+        )
+
+        # Mock _ensure_ownership to succeed for data dir but fail for mnesia
+        self.harness.charm._ensure_ownership = Mock(side_effect=[True, False])
+
+        # Test when mnesia ownership fails
+        result = self.harness.charm._set_ownership_on_data_dir()
+
+        # Should return False when mnesia ownership fails
+        self.assertFalse(result)
+        mock_container.exec.assert_called_once_with(
+            ["mountpoint", "/var/lib/rabbitmq"]
+        )
+        mock_container.list_files.assert_called_once_with(
+            "/var/lib/rabbitmq", pattern="mnesia"
+        )
+        mock_container.make_dir.assert_not_called()
+
+        # Should call _ensure_ownership twice
+        expected_calls = [
+            call(mock_container, "/var/lib/rabbitmq", "rabbitmq", "rabbitmq"),
+            call(
+                mock_container,
+                "/var/lib/rabbitmq/mnesia",
+                "rabbitmq",
+                "rabbitmq",
+            ),
+        ]
+        self.harness.charm._ensure_ownership.assert_has_calls(expected_calls)
