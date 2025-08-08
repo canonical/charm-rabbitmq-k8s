@@ -98,6 +98,7 @@ RABBITMQ_USER = "rabbitmq"
 RABBITMQ_GROUP = "rabbitmq"
 RABBITMQ_DATA_DIR = "/var/lib/rabbitmq"
 RABBITMQ_COOKIE_PATH = "/var/lib/rabbitmq/.erlang.cookie"
+RABBITMQ_MNESIA_DIR = "/var/lib/rabbitmq/mnesia"
 
 SELECTOR_ALL = "all"
 SELECTOR_NONE = "none"
@@ -293,6 +294,7 @@ class RabbitMQOperatorCharm(CharmBase):
         if not self._set_ownership_on_data_dir():
             # Waiting for rabbitmq-data-storage-attached event
             self._on_update_status(event)
+            event.defer()
             return
 
         # Render and push configuration files
@@ -875,34 +877,62 @@ class RabbitMQOperatorCharm(CharmBase):
         logging.warning("Deleting the guest user.")
         api.delete_user("guest")
 
+    def _ensure_ownership(
+        self, container: ops.Container, path: str, user: str, group: str
+    ) -> bool:
+        """Ensure ownership of a path.
+
+        :param container: The container to check ownership in
+        :param path: Path to check ownership of
+        :param user: User to set ownership to
+        :param group: Group to set ownership to
+        :returns: True if ownership was set, False otherwise
+        """
+        try:
+            paths = container.list_files(path, itself=True)
+            if paths[0].user != user or paths[0].group != group:
+                logger.info(
+                    "Setting ownership of %s to %s:%s", path, user, group
+                )
+                container.exec(["chown", "-R", f"{user}:{group}", path])
+        except ExecError as e:
+            logger.error(f"Failed to set ownership: {e.stderr}")
+            return False
+        return True
+
     def _set_ownership_on_data_dir(self) -> bool:
         """Set ownership on /var/lib/rabbitmq."""
         container = self.unit.get_container(RABBITMQ_CONTAINER)
-        paths = container.list_files(RABBITMQ_DATA_DIR, itself=True)
-        if len(paths) == 0:
-            logging.info("Rabbitmq data dir not yet created, rechecking..")
+        try:
+            container.exec(["mountpoint", RABBITMQ_DATA_DIR])
+        except ExecError:
+            logger.info(f"{RABBITMQ_DATA_DIR} is not mounted yet.")
             return False
 
-        logger.debug(
-            f"rabbitmq lib directory ownership: {paths[0].user}:{paths[0].group}"
-        )
-        if paths[0].user != RABBITMQ_USER or paths[0].group != RABBITMQ_GROUP:
-            logger.info(
-                f"Changing ownership to {RABBITMQ_USER}:{RABBITMQ_GROUP}"
+        if not self._ensure_ownership(
+            container,
+            RABBITMQ_DATA_DIR,
+            RABBITMQ_USER,
+            RABBITMQ_GROUP,
+        ):
+            return False
+
+        paths = container.list_files(RABBITMQ_DATA_DIR, pattern="mnesia")
+        if len(paths) == 0:
+            logger.info("Creating mnesia directory")
+            container.make_dir(
+                RABBITMQ_MNESIA_DIR,
+                permissions=0o750,
+                user=RABBITMQ_USER,
+                group=RABBITMQ_GROUP,
             )
-            try:
-                container.exec(
-                    [
-                        "chown",
-                        "-R",
-                        f"{RABBITMQ_USER}:{RABBITMQ_GROUP}",
-                        RABBITMQ_DATA_DIR,
-                    ]
-                )
-            except ExecError as e:
-                logger.error(
-                    f"Exited with code {e.exit_code}. Stderr:\n{e.stderr}"
-                )
+        else:
+            return self._ensure_ownership(
+                container,
+                RABBITMQ_MNESIA_DIR,
+                RABBITMQ_USER,
+                RABBITMQ_GROUP,
+            )
 
         return True
 
