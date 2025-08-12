@@ -21,6 +21,7 @@ import collections
 import functools
 import logging
 import re
+import secrets
 import textwrap
 from ipaddress import (
     IPv4Address,
@@ -303,19 +304,11 @@ class RabbitMQOperatorCharm(CharmBase):
         # Render and push notifier script
         notifier_changed = self._render_and_push_pebble_notifier()
 
+        # Ensure erlang cookie is consistent
+        self._ensure_erlang_cookie()
+
         # Get the rabbitmq container so we can configure/manipulate it
         container = self.unit.get_container(RABBITMQ_CONTAINER)
-
-        # Ensure erlang cookie is consistent
-        if self.peers.erlang_cookie:
-            container.push(
-                RABBITMQ_COOKIE_PATH,
-                self.peers.erlang_cookie,
-                permissions=0o600,
-                make_dirs=True,
-                user=RABBITMQ_USER,
-                group=RABBITMQ_GROUP,
-            )
 
         # Add initial Pebble config layer using the Pebble API
         container.add_layer("rabbitmq", self._rabbitmq_layer(), combine=True)
@@ -935,6 +928,37 @@ class RabbitMQOperatorCharm(CharmBase):
             )
 
         return True
+
+    def _ensure_erlang_cookie(self):
+        """Ensure an erlang cookie file is present."""
+        container = self.unit.get_container(RABBITMQ_CONTAINER)
+        if self.peers.erlang_cookie:
+            container.push(
+                RABBITMQ_COOKIE_PATH,
+                self.peers.erlang_cookie,
+                permissions=0o600,
+                make_dirs=True,
+                user=RABBITMQ_USER,
+                group=RABBITMQ_GROUP,
+            )
+            return
+        if (
+            not container.exists(RABBITMQ_COOKIE_PATH)
+            and self.unit.is_leader()
+        ):
+            logger.info("Creating erlang cookie file")
+            cookie = secrets.token_hex(32)
+            container.push(
+                path=RABBITMQ_COOKIE_PATH,
+                source=cookie,
+                make_dirs=True,
+                user=RABBITMQ_USER,
+                group=RABBITMQ_GROUP,
+                permissions=0o600,
+            )
+            # _ensure_erlang_cookie is called after checking the peer
+            # relation is present.
+            self.peers.set_erlang_cookie(cookie)
 
     def _render_and_push_config_files(self) -> None:
         """Render and push configuration files.
