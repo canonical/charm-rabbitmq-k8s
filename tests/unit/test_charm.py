@@ -21,9 +21,11 @@ from unittest.mock import (
     MagicMock,
     Mock,
     call,
+    patch,
 )
 
 import ops.model
+import ops.pebble
 from ops.testing import (
     Harness,
 )
@@ -820,3 +822,143 @@ class TestCharm(unittest.TestCase):
             ),
         ]
         self.harness.charm._ensure_ownership.assert_has_calls(expected_calls)
+
+    def test_ensure_erlang_cookie_with_existing_peer_cookie(self):
+        """Test _ensure_erlang_cookie when peer relation has erlang_cookie."""
+        mock_container = Mock()
+        self.harness.charm.unit.get_container = Mock(
+            return_value=mock_container
+        )
+        peers_relation_id = self.harness.add_relation("peers", "rabbitmq-k8s")
+        self.harness.add_relation_unit(peers_relation_id, "rabbitmq-k8s/0")
+        self.harness.update_relation_data(
+            peers_relation_id,
+            self.harness.charm.app.name,
+            {"erlang_cookie": "existing-cookie-value"},
+        )
+        self.harness.charm._ensure_erlang_cookie()
+        mock_container.push.assert_called_once_with(
+            "/var/lib/rabbitmq/.erlang.cookie",
+            "existing-cookie-value",
+            permissions=0o600,
+            make_dirs=True,
+            user="rabbitmq",
+            group="rabbitmq",
+        )
+        mock_container.exists.assert_not_called()
+
+    def test_ensure_erlang_cookie_generate_new_when_leader(self):
+        """Test _ensure_erlang_cookie generates new cookie when leader and no file exists."""
+        mock_container = Mock()
+        mock_container.exists.return_value = False
+        mock_pull_context = Mock()
+        mock_pull_context.read.return_value = "existing-cookie-from-file"
+        mock_container.pull.return_value.__enter__ = Mock(
+            return_value=mock_pull_context
+        )
+        mock_container.pull.return_value.__exit__ = Mock(return_value=None)
+        self.harness.charm.unit.get_container = Mock(
+            return_value=mock_container
+        )
+        self.harness.set_leader(True)
+        peers_relation_id = self.harness.add_relation("peers", "rabbitmq-k8s")
+        self.harness.add_relation_unit(peers_relation_id, "rabbitmq-k8s/0")
+        self.harness.update_relation_data(
+            peers_relation_id,
+            self.harness.charm.app.name,
+            {"erlang_cookie": ""},
+        )
+        mock_container.reset_mock()
+        mock_container.exists.return_value = False
+        with patch(
+            "charm.secrets.token_hex", return_value="generated-cookie-value"
+        ):
+            self.harness.charm._ensure_erlang_cookie()
+        mock_container.exists.assert_called_once_with(
+            "/var/lib/rabbitmq/.erlang.cookie"
+        )
+        mock_container.push.assert_called_once_with(
+            path="/var/lib/rabbitmq/.erlang.cookie",
+            source="generated-cookie-value",
+            make_dirs=True,
+            user="rabbitmq",
+            group="rabbitmq",
+            permissions=0o600,
+        )
+        # Verify that the generated cookie is stored in the peer relation
+        relation_data = self.harness.get_relation_data(
+            peers_relation_id, self.harness.charm.app.name
+        )
+        self.assertEqual(
+            relation_data["erlang_cookie"], "generated-cookie-value"
+        )
+
+    def test_ensure_erlang_cookie_no_action_when_not_leader(self):
+        """Test _ensure_erlang_cookie takes no action when not leader and no peer cookie."""
+        mock_container = Mock()
+        mock_container.exists.return_value = False
+        mock_container.pull.side_effect = ops.pebble.PathError(
+            "kind", "message"
+        )
+        self.harness.charm.unit.get_container = Mock(
+            return_value=mock_container
+        )
+        self.harness.set_leader(False)
+        peers_relation_id = self.harness.add_relation("peers", "rabbitmq-k8s")
+        self.harness.add_relation_unit(peers_relation_id, "rabbitmq-k8s/0")
+        mock_container.reset_mock()
+        mock_container.exists.return_value = False
+        self.harness.charm._ensure_erlang_cookie()
+        mock_container.exists.assert_called_once_with(
+            "/var/lib/rabbitmq/.erlang.cookie"
+        )
+        mock_container.push.assert_not_called()
+
+    def test_ensure_erlang_cookie_no_action_when_file_exists(self):
+        """Test _ensure_erlang_cookie takes no action when file exists and no peer cookie."""
+        mock_container = Mock()
+        mock_container.exists.return_value = True
+        mock_pull_context = Mock()
+        mock_pull_context.read.return_value = "existing-cookie-from-file"
+        mock_container.pull.return_value.__enter__ = Mock(
+            return_value=mock_pull_context
+        )
+        mock_container.pull.return_value.__exit__ = Mock(return_value=None)
+        self.harness.charm.unit.get_container = Mock(
+            return_value=mock_container
+        )
+        self.harness.set_leader(True)
+        peers_relation_id = self.harness.add_relation("peers", "rabbitmq-k8s")
+        self.harness.add_relation_unit(peers_relation_id, "rabbitmq-k8s/0")
+        self.harness.update_relation_data(
+            peers_relation_id,
+            self.harness.charm.app.name,
+            {"erlang_cookie": ""},
+        )
+        mock_container.reset_mock()
+        mock_container.exists.return_value = True
+        self.harness.charm._ensure_erlang_cookie()
+        mock_container.exists.assert_called_once_with(
+            "/var/lib/rabbitmq/.erlang.cookie"
+        )
+        mock_container.push.assert_not_called()
+
+    def test_ensure_erlang_cookie_called_in_pebble_ready(self):
+        """Test that _ensure_erlang_cookie is called during pebble ready event."""
+        self.harness.charm._ensure_erlang_cookie = Mock()
+        self.harness.charm._set_ownership_on_data_dir = Mock()
+        peers_relation_id = self.harness.add_relation("peers", "rabbitmq-k8s")
+        self.harness.add_relation_unit(peers_relation_id, "rabbitmq-k8s/0")
+        self.harness.update_relation_data(
+            peers_relation_id,
+            self.harness.charm.app.name,
+            {
+                "operator_password": "foobar",
+                "operator_user_created": "rmqadmin",
+                "erlang_cookie": "magicsecurity",
+            },
+        )
+        self.harness.set_can_connect("rabbitmq", True)
+        container = self.harness.model.unit.get_container("rabbitmq")
+        self.harness.charm.on.rabbitmq_pebble_ready.emit(container)
+        self.harness.charm._ensure_erlang_cookie.assert_called_once()
