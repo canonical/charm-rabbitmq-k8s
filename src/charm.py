@@ -283,6 +283,11 @@ class RabbitMQOperatorCharm(CharmBase):
             event.defer()
             return
 
+        # Ensure operator user is created
+        if not self.unit.is_leader() and not self.peers.operator_user_created:
+            event.defer()
+            return
+
         # Wait for the peers binding address to be ready before configuring
         # the rabbit environment. This is due to rabbitmq-env.conf needing
         # the unit address for peering.

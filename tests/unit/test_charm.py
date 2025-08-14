@@ -131,6 +131,113 @@ class TestCharm(unittest.TestCase):
         ).get_service("rabbitmq")
         self.assertTrue(service.is_running())
 
+    def test_config_changed_defers_when_non_leader_without_operator_user(self):
+        """Test that _on_config_changed defers when non-leader and no operator user."""
+        # Set up non-leader unit
+        self.harness.set_leader(False)
+        self.harness.set_can_connect("rabbitmq", True)
+
+        # Mock the event and track defer calls
+        mock_event = Mock()
+        mock_event.defer = Mock()
+
+        # Set up peers relation without operator user
+        peers_relation_id = self.harness.add_relation("peers", "rabbitmq-k8s")
+        self.harness.add_relation_unit(peers_relation_id, "rabbitmq-k8s/0")
+        self.harness.update_relation_data(
+            peers_relation_id,
+            self.harness.charm.app.name,
+            {
+                "operator_password": "foobar",
+                "erlang_cookie": "magicsecurity",
+                # Note: operator_user_created is NOT set
+            },
+        )
+
+        # Call _on_config_changed directly
+        self.harness.charm._on_config_changed(mock_event)
+
+        # Verify the event was deferred
+        mock_event.defer.assert_called_once()
+
+    def test_config_changed_proceeds_when_leader_without_operator_user(self):
+        """Test that _on_config_changed proceeds when leader even without operator user."""
+        # Set up leader unit
+        self.harness.set_leader(True)
+        self.harness.set_can_connect("rabbitmq", True)
+
+        # Mock necessary methods to avoid side effects
+        self.harness.charm._set_ownership_on_data_dir = Mock(return_value=True)
+        self.harness.charm._render_and_push_config_files = Mock()
+        self.harness.charm._render_and_push_pebble_notifier = Mock(
+            return_value=False
+        )
+        self.harness.charm._ensure_erlang_cookie = Mock()
+        self.harness.charm._on_update_status = Mock()
+        self.harness.charm._reconcile_lb = Mock()
+
+        # Mock the event and track defer calls
+        mock_event = Mock()
+        mock_event.defer = Mock()
+
+        # Set up peers relation without operator user
+        peers_relation_id = self.harness.add_relation("peers", "rabbitmq-k8s")
+        self.harness.add_relation_unit(peers_relation_id, "rabbitmq-k8s/0")
+        self.harness.update_relation_data(
+            peers_relation_id,
+            self.harness.charm.app.name,
+            {
+                "operator_password": "foobar",
+                "erlang_cookie": "magicsecurity",
+                # Note: operator_user_created is NOT set
+            },
+        )
+
+        # Call _on_config_changed directly
+        self.harness.charm._on_config_changed(mock_event)
+
+        # Verify the event was NOT deferred (since this is the leader)
+        mock_event.defer.assert_not_called()
+
+    def test_config_changed_proceeds_when_non_leader_with_operator_user(self):
+        """Test that _on_config_changed proceeds when non-leader but operator user exists."""
+        # Set up non-leader unit
+        self.harness.set_leader(False)
+        self.harness.set_can_connect("rabbitmq", True)
+
+        # Mock necessary methods to avoid side effects
+        self.harness.charm._set_ownership_on_data_dir = Mock(return_value=True)
+        self.harness.charm._render_and_push_config_files = Mock()
+        self.harness.charm._render_and_push_pebble_notifier = Mock(
+            return_value=False
+        )
+        self.harness.charm._ensure_erlang_cookie = Mock()
+        self.harness.charm._on_update_status = Mock()
+        self.harness.charm._reconcile_lb = Mock()
+
+        # Mock the event and track defer calls
+        mock_event = Mock()
+        mock_event.defer = Mock()
+
+        # Set up peers relation WITH operator user
+        peers_relation_id = self.harness.add_relation("peers", "rabbitmq-k8s")
+        self.harness.add_relation_unit(peers_relation_id, "rabbitmq-k8s/0")
+        self.harness.update_relation_data(
+            peers_relation_id,
+            self.harness.charm.app.name,
+            {
+                "operator_password": "foobar",
+                "operator_user_created": "rmqadmin",  # operator user is created
+                "erlang_cookie": "magicsecurity",
+            },
+        )
+
+        # Call _on_config_changed directly
+        self.harness.charm._on_config_changed(mock_event)
+
+        # Verify the event was NOT deferred (since operator user exists)
+        mock_event.defer.assert_not_called()
+
     def test_update_status(self):
         """This test validates the charm, the peers and the amqp relation."""
         self.harness.set_leader(True)
