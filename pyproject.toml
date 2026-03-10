@@ -7,7 +7,7 @@ version = "3.12"
 requires-python = "~=3.12.0"
 
 dependencies = [
-    "ops==2.22.0",
+    "ops",
     "pika",
     "pwgen",
     "rabbitmq-admin",
@@ -23,7 +23,7 @@ dev = [
     "coverage",
     "flake8",
     "rabbitmq_admin",
-    "ops[testing]==2.22.0",
+    "ops[testing]",
     "pytest",
     "pytest-cov",
     "pyyaml",

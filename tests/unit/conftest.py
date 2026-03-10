@@ -81,7 +81,7 @@ def build_peer_relation(
     return testing.PeerRelation(
         endpoint="peers",
         local_app_data=app_data,
-        peers_data={0: {}},
+        local_unit_data={},
     )
 
 

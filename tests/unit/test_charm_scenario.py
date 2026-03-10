@@ -70,7 +70,7 @@ def test_get_operator_info_action(ctx, rabbitmq_container, networks):
     peer = testing.PeerRelation(
         endpoint="peers",
         local_app_data={"operator_password": "foobar"},
-        peers_data={0: {}},
+        local_unit_data={},
     )
     state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
 
@@ -91,7 +91,7 @@ def test_rabbitmq_pebble_ready(ctx, rabbitmq_container, networks, monkeypatch):
             "operator_user_created": "rmqadmin",
             "erlang_cookie": "magicsecurity",
         },
-        peers_data={0: {}},
+        local_unit_data={},
     )
     state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
 
@@ -121,7 +121,7 @@ def test_config_changed_defers_without_operator_user(
             "operator_password": "foobar",
             "erlang_cookie": "magicsecurity",
         },
-        peers_data={0: {}},
+        local_unit_data={},
     )
     state = _state(
         rabbitmq_container, networks, leader=False, relations=[peer]
@@ -143,7 +143,7 @@ def test_config_changed_proceeds_for_leader_without_operator_user(
             "operator_password": "foobar",
             "erlang_cookie": "magicsecurity",
         },
-        peers_data={0: {}},
+        local_unit_data={},
     )
     state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
 
@@ -165,7 +165,7 @@ def test_config_changed_proceeds_for_non_leader_with_operator_user(
             "operator_user_created": "rmqadmin",
             "erlang_cookie": "magicsecurity",
         },
-        peers_data={0: {}},
+        local_unit_data={},
     )
     state = _state(
         rabbitmq_container, networks, leader=False, relations=[peer]
@@ -188,7 +188,7 @@ def test_config_changed_defers_without_erlang_cookie(
             "operator_password": "foobar",
             "operator_user_created": "rmqadmin",
         },
-        peers_data={0: {}},
+        local_unit_data={},
     )
     state = _state(
         rabbitmq_container, networks, leader=False, relations=[peer]
@@ -209,7 +209,7 @@ def test_config_changed_defers_without_container_connectivity(ctx, networks):
             "operator_user_created": "rmqadmin",
             "erlang_cookie": "magicsecurity",
         },
-        peers_data={0: {}},
+        local_unit_data={},
     )
     container = testing.Container(name=charm.RABBITMQ_CONTAINER)
     state = testing.State(
@@ -236,7 +236,7 @@ def test_config_changed_defers_without_peers_bind_address(
             "operator_user_created": "rmqadmin",
             "erlang_cookie": "magicsecurity",
         },
-        peers_data={0: {}},
+        local_unit_data={},
     )
     networks = [
         testing.Network(
@@ -287,7 +287,7 @@ def test_update_status_active_when_relations_ready(
             "operator_user_created": "rmqadmin",
             "erlang_cookie": "magicsecurity",
         },
-        peers_data={0: {}},
+        local_unit_data={},
     )
     amqp_relation = testing.Relation(
         endpoint="amqp",
@@ -333,7 +333,7 @@ def test_update_status_waiting_without_erlang_cookie(
             "operator_password": "foobar",
             "operator_user_created": "rmqadmin",
         },
-        peers_data={0: {}},
+        local_unit_data={},
     )
     state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
 
@@ -355,7 +355,7 @@ def test_update_status_blocked_when_rabbit_not_running(
             "operator_user_created": "rmqadmin",
             "erlang_cookie": "magicsecurity",
         },
-        peers_data={0: {}},
+        local_unit_data={},
     )
     state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
 
@@ -383,7 +383,7 @@ def test_update_status_warns_when_queues_are_undersized(
             "operator_user_created": "rmqadmin",
             "erlang_cookie": "magicsecurity",
         },
-        peers_data={0: {}},
+        local_unit_data={},
     )
     state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
 
@@ -478,7 +478,7 @@ def test_ensure_queue_ha_action_reports_result(
             "operator_user_created": "rmqadmin",
             "erlang_cookie": "magicsecurity",
         },
-        peers_data={0: {}},
+        local_unit_data={},
     )
     state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
 
@@ -523,7 +523,7 @@ def test_get_service_account_action_returns_credentials(
             "erlang_cookie": "magicsecurity",
             "svc-user": "svc-password",
         },
-        peers_data={0: {}},
+        local_unit_data={},
     )
     state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
 
@@ -575,7 +575,7 @@ def test_timer_notice_calls_ensure_queue_ha_for_leader(
             "operator_user_created": "rmqadmin",
             "erlang_cookie": "magicsecurity",
         },
-        peers_data={0: {}},
+        local_unit_data={},
     )
     container = testing.Container(
         name=charm.RABBITMQ_CONTAINER,
@@ -618,7 +618,7 @@ def test_timer_notice_skips_ensure_queue_ha_for_non_leader(
             "operator_user_created": "rmqadmin",
             "erlang_cookie": "magicsecurity",
         },
-        peers_data={0: {}},
+        local_unit_data={},
     )
     container = testing.Container(
         name=charm.RABBITMQ_CONTAINER,
