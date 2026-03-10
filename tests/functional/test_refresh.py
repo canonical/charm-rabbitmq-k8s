@@ -18,6 +18,7 @@ from .helpers import (
     cluster_status,
     deploy_stable,
     expected_rabbit_node,
+    leader_unit,
     run_action,
     wait_for_app,
 )
@@ -50,11 +51,12 @@ def test_refresh_from_stable_to_local(
     assert post_refresh.results["operator-user"] == "operator"
     assert post_refresh.results["operator-password"]
 
+    leader = leader_unit(juju, app_name)
     username = f"refresh-{uuid.uuid4().hex[:8]}"
     vhost = f"refresh-{uuid.uuid4().hex[:8]}"
     service_account = run_action(
         juju,
-        f"{app_name}/0",
+        leader,
         "get-service-account",
         {"username": username, "vhost": vhost},
     )

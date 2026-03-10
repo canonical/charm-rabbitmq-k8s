@@ -1,0 +1,19 @@
+#!/bin/bash
+set -u
+
+if rabbitmq-diagnostics check_running >/dev/null 2>&1; then
+    echo alive
+    exit 0
+fi
+
+beam_pid="$(pgrep -u rabbitmq -f 'beam.smp' | head -n1 || true)"
+if [ -n "$beam_pid" ]; then
+    beam_age="$(ps -o etimes= -p "$beam_pid" | tr -d ' ' || true)"
+    if [ -n "$beam_age" ] && [ "$beam_age" -lt "{{ startup_grace_seconds }}" ]; then
+        echo "RabbitMQ starting"
+        exit 0
+    fi
+fi
+
+echo "{{ safety_reason_not_running }}"
+exit 1

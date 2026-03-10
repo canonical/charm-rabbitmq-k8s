@@ -41,7 +41,9 @@ omit = [
     ".tox/*",
     "tests/*",
     "src/templates/*",
+    "lib/charms/grafana_k8s/*",
     "lib/charms/loki_k8s/*",
+    "lib/charms/prometheus_k8s/*",
     "lib/charms/traefik_k8s/*",
 ]
 

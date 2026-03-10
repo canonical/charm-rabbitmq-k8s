@@ -68,6 +68,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default="3.12/stable",
         help="Charmhub channel used as the refresh source baseline.",
     )
+    parser.addoption(
+        "--cos-channel",
+        action="store",
+        default="latest/stable",
+        help="Charmhub channel used for the COS Lite bundle.",
+    )
 
 
 @pytest.fixture(scope="session")
@@ -104,6 +110,12 @@ def rabbitmq_image(
 def stable_channel(pytestconfig: pytest.Config) -> str:
     """Return the Charmhub channel used for refresh baseline deploys."""
     return pytestconfig.getoption("--stable-channel")
+
+
+@pytest.fixture(scope="session")
+def cos_channel(pytestconfig: pytest.Config) -> str:
+    """Return the Charmhub channel used for COS Lite deployments."""
+    return pytestconfig.getoption("--cos-channel")
 
 
 @pytest.fixture(scope="session")
@@ -146,7 +158,11 @@ def juju(
 
     def show_debug_log(client: jubilant.Juju) -> None:
         if request.session.testsfailed:
-            print(client.debug_log(limit=1000), end="")
+            try:
+                print(client.debug_log(limit=1000), end="")
+            except Exception:
+                # Temporary models may already be gone by the time teardown runs.
+                return
 
     model = request.config.getoption("--model")
     if model:
