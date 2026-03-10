@@ -11,8 +11,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v3
-      - name: Install Tox
-        run: pip install tox
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
       - name: Setup microk8s
         uses: charmed-kubernetes/actions-operator@main
         with:
@@ -24,7 +24,6 @@ jobs:
         run: |
           sudo snap install --classic terraform
           sudo snap install --classic juju-wait
-          sudo snap install astral-uv --channel latest/stable --classic
       - name: Configure LXD
         run: |
           sudo groupadd --force --system lxd
@@ -38,4 +37,4 @@ jobs:
           mv rabbitmq-k8s*charm rabbitmq-k8s.charm
       - name: Run functional tests
         run: |
-          tox -e func-smoke -- --charm-file rabbitmq-k8s.charm
+          uv run --with tox tox -e func-smoke -- --charm-file rabbitmq-k8s.charm
