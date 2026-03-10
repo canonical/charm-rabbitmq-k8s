@@ -38,4 +38,4 @@ jobs:
           mv rabbitmq-k8s*charm rabbitmq-k8s.charm
       - name: Run functional tests
         run: |
-          tox -e func-smoke
+          tox -e func-smoke -- --charm-file rabbitmq-k8s.charm
