@@ -1038,16 +1038,14 @@ log.file = false
             logger.error(msg)
             raise RabbitOperatorError(msg)
         container = self.unit.get_container(RABBITMQ_CONTAINER)
-        notifier = textwrap.dedent(
-            f"""#!/bin/bash
+        notifier = textwrap.dedent(f"""#!/bin/bash
             while true; do
                 echo "Next event at $(date -d '+{auto_ha_frequency} minutes')"
                 sleep {auto_ha_frequency * 60}
                 echo "Notifying operator of timer event"
                 /charm/bin/pebble notify {TIMER_NOTICE}
             done
-            """
-        )
+            """)
         try:
             with container.pull("/usr/bin/notifier") as stream:
                 content = stream.read()
