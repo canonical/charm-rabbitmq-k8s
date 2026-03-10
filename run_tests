@@ -13,5 +13,4 @@ else
 fi
 
 flake8 src tests
-coverage run --source=src -m unittest -v "$@"
-coverage report -m
+pytest tests/unit -v "$@"

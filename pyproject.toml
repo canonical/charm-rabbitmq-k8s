@@ -22,9 +22,10 @@ dependencies = [
 dev = [
     "coverage",
     "flake8",
-    "stestr",
     "rabbitmq_admin",
-    "ops",
+    "ops[testing]",
+    "pytest",
+    "pytest-cov",
     "cosl",
     "zaza @ git+https://github.com/openstack-charmers/zaza.git@master",
     "zaza.openstack @ git+https://github.com/openstack-charmers/zaza-openstack-tests.git@master",
