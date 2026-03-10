@@ -106,6 +106,9 @@ def test_metrics_endpoint_provider_is_configured(ctx):
             "static_configs": [{"targets": ["*:15692"]}],
         }
     ]
+    assert manager.charm.metrics_endpoint._alert_rules_path.endswith(
+        "src/prometheus_alert_rules"
+    )
 
 
 def test_grafana_dashboard_provider_loads_bundled_dashboard(ctx):

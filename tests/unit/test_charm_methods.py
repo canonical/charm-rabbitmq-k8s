@@ -33,6 +33,7 @@ import ops.model
 import ops.pebble
 import pytest
 import requests
+import yaml
 
 import charm
 
@@ -45,6 +46,33 @@ def test_grafana_dashboard_uses_cos_datasource_convention():
         assert "${DS_PROMETHEUS}" not in dashboard
         assert '"__inputs"' not in dashboard
         assert "${prometheusds}" in dashboard
+
+
+def test_prometheus_alert_rules_are_well_formed():
+    """Bundled alert rules should be parseable and contain the expected alerts."""
+    expected_alerts = {
+        "RabbitMQNodeDown": "critical",
+        "RabbitMQDiskAlarm": "critical",
+        "RabbitMQDiskHeadroomLow": "warning",
+        "RabbitMQMemoryAlarm": "critical",
+        "RabbitMQMemoryHeadroomHigh": "warning",
+        "RabbitMQFDAlarm": "critical",
+        "RabbitMQRaftCommitLatencyHigh": "warning",
+        "RabbitMQRaftUncommittedEntriesHigh": "warning",
+    }
+
+    found_alerts = {}
+    for rule_path in Path("src/prometheus_alert_rules").glob("*.*"):
+        document = yaml.safe_load(rule_path.read_text())
+        assert "groups" in document
+        for group in document["groups"]:
+            assert group["name"] == "RabbitMQ"
+            for rule in group["rules"]:
+                assert rule["expr"]
+                assert "%%juju_topology%%" not in rule["expr"]
+                found_alerts[rule["alert"]] = rule["labels"]["severity"]
+
+    assert found_alerts == expected_alerts
 
 
 def _fake_charm(**kwargs):
