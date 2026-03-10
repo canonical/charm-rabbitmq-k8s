@@ -18,6 +18,7 @@ cluster_formation.k8s.hostname_suffix = .{{ app_name }}-endpoints
 cluster_formation.node_cleanup.interval = 30
 cluster_formation.node_cleanup.only_log_warning = true
 cluster_partition_handling = {{ cluster_partition_handling }}
+disk_free_limit = {{ disk_free_limit_bytes }}
 
 queue_master_locator = min-masters
 

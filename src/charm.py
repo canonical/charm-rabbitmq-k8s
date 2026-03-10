@@ -75,6 +75,8 @@ from lightkube.models.meta_v1 import (
     ObjectMeta,
 )
 from lightkube.resources.core_v1 import (
+    PersistentVolumeClaim,
+    Pod,
     Service,
 )
 from lightkube_extensions.batch import (
@@ -142,6 +144,23 @@ VALID_CLUSTER_PARTITION_HANDLING = {
     "pause_minority",
     "autoheal",
     "ignore",
+}
+BYTE_SUFFIXES = {
+    "K": 1000,
+    "KB": 1000,
+    "KI": 1024,
+    "M": 1000**2,
+    "MB": 1000**2,
+    "MI": 1024**2,
+    "G": 1000**3,
+    "GB": 1000**3,
+    "GI": 1024**3,
+    "T": 1000**4,
+    "TB": 1000**4,
+    "TI": 1024**4,
+    "P": 1000**5,
+    "PB": 1000**5,
+    "PI": 1024**5,
 }
 
 # Regex for Kubernetes annotation values:
@@ -358,7 +377,11 @@ class RabbitMQOperatorCharm(CharmBase):
             return
 
         # Render and push configuration files
-        self._render_and_push_config_files()
+        try:
+            self._render_and_push_config_files()
+        except RabbitOperatorError as e:
+            self.unit.status = BlockedStatus(str(e))
+            return
 
         # Render and push notifier script
         changed_services = self._render_and_push_workload_scripts()
@@ -967,6 +990,106 @@ class RabbitMQOperatorCharm(CharmBase):
         """Whether fail-closed protection is enabled."""
         return bool(self.config["protect-members"])
 
+    @property
+    def resolved_disk_free_limit_bytes(self) -> int:
+        """Return the numeric RabbitMQ disk free limit."""
+        configured = str(self.config["disk-free-limit-bytes"]).strip()
+        pvc_capacity = self._rabbitmq_data_pvc_capacity_bytes()
+        try:
+            parsed = self._bytes_from_string(configured)
+        except ValueError as e:
+            raise RabbitOperatorError(
+                f"Invalid disk-free-limit-bytes value: {configured}"
+            ) from e
+
+        if parsed == "auto":
+            resolved = int(pvc_capacity * 0.10)
+        else:
+            resolved = parsed
+
+        if resolved <= 0:
+            raise RabbitOperatorError(
+                "disk-free-limit-bytes must resolve to a value greater than 0"
+            )
+        if resolved > pvc_capacity:
+            raise RabbitOperatorError(
+                "disk-free-limit-bytes exceeds bound rabbitmq-data PVC capacity"
+            )
+        return resolved
+
+    def _bytes_from_string(self, value: str) -> int | str:
+        """Parse a raw byte value or human-readable size string."""
+        normalized = value.strip()
+        if normalized.lower() == "auto":
+            return "auto"
+        if normalized.isdigit():
+            return int(normalized)
+
+        match = re.fullmatch(
+            r"(?i)\s*(\d+)\s*([kmgtp](?:i|b)?)\s*", normalized
+        )
+        if not match:
+            raise ValueError(f"Unsupported size value: {value}")
+
+        amount = int(match.group(1))
+        suffix = match.group(2).upper()
+        return amount * BYTE_SUFFIXES[suffix]
+
+    def _rabbitmq_data_pvc_capacity_bytes(self) -> int:
+        """Resolve the bound rabbitmq-data PVC storage capacity in bytes."""
+        pod_name = self.unit.name.replace("/", "-")
+        try:
+            pod = self.lightkube_client.get(
+                Pod, name=pod_name, namespace=self.model.name
+            )
+        except ApiError as e:
+            raise RabbitOperatorError(
+                f"Failed to fetch pod {pod_name} for rabbitmq-data PVC lookup"
+            ) from e
+
+        volumes = getattr(getattr(pod, "spec", None), "volumes", None) or []
+        volume = next(
+            (v for v in volumes if getattr(v, "name", "") == "rabbitmq-data"),
+            None,
+        )
+        if volume is None:
+            raise RabbitOperatorError(
+                "Failed to resolve rabbitmq-data volume from current pod"
+            )
+
+        pvc_source = getattr(volume, "persistentVolumeClaim", None)
+        claim_name = getattr(pvc_source, "claimName", None)
+        if not claim_name:
+            raise RabbitOperatorError(
+                "Failed to resolve rabbitmq-data PersistentVolumeClaim name"
+            )
+
+        try:
+            pvc = self.lightkube_client.get(
+                PersistentVolumeClaim,
+                name=claim_name,
+                namespace=self.model.name,
+            )
+        except ApiError as e:
+            raise RabbitOperatorError(
+                f"Failed to fetch PersistentVolumeClaim {claim_name}"
+            ) from e
+
+        storage = getattr(getattr(pvc, "status", None), "capacity", {}).get(
+            "storage"
+        )
+        if not storage:
+            raise RabbitOperatorError(
+                f"PersistentVolumeClaim {claim_name} has no storage capacity"
+            )
+
+        try:
+            return self._bytes_from_string(str(storage))
+        except ValueError as e:
+            raise RabbitOperatorError(
+                f"PersistentVolumeClaim {claim_name} has invalid storage capacity {storage}"
+            ) from e
+
     def _refresh_rabbitmq_version(self) -> None:
         """Refresh the cached RabbitMQ version when the management API is ready."""
         try:
@@ -1235,6 +1358,7 @@ class RabbitMQOperatorCharm(CharmBase):
             loopback_users="none",
             app_name=self.app.name,
             cluster_partition_handling=self.cluster_partition_handling,
+            disk_free_limit_bytes=self.resolved_disk_free_limit_bytes,
         )
         logger.info("Pushing new rabbitmq.conf")
         container.push(
@@ -1373,6 +1497,9 @@ class RabbitMQOperatorCharm(CharmBase):
             )
             return
 
+        if not self._validate_disk_free_limit():
+            return
+
         if not self._rabbitmq_running():
             self.unit.status = BlockedStatus(SAFETY_REASON_NOT_RUNNING)
             return
@@ -1399,6 +1526,15 @@ class RabbitMQOperatorCharm(CharmBase):
         self._publish_relation_data()
 
         self.unit.status = ActiveStatus()
+
+    def _validate_disk_free_limit(self) -> bool:
+        """Validate that disk-free-limit-bytes resolves cleanly."""
+        try:
+            self.resolved_disk_free_limit_bytes
+        except RabbitOperatorError as e:
+            self.unit.status = BlockedStatus(str(e))
+            return False
+        return True
 
     def _set_unsafe_status(self, reason: str) -> None:
         """Set unit status for an unsafe broker state."""

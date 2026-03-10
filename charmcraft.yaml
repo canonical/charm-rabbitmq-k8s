@@ -33,6 +33,16 @@ config:
         Refuse new client traffic automatically when the unit is running but no
         longer considered safe to serve.
       type: boolean
+    disk-free-limit-bytes:
+      default: auto
+      description: |
+        RabbitMQ disk free limit. Use `auto` to derive the limit from the
+        bound `rabbitmq-data` PVC capacity, or specify a raw byte value or a
+        human-readable size such as `500M`, `500MB`, `5G`, `5Gi`, or `5TB`.
+        When `auto` is used, the charm resolves the PVC capacity from
+        Kubernetes and sets RabbitMQ `disk_free_limit` to 10 percent of the
+        total storage.
+      type: string
     loadbalancer_annotations:
       description: |
         A comma-separated list of annotations to apply to the LoadBalancer service.

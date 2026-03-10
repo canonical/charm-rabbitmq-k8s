@@ -75,6 +75,11 @@ def _patch_config_changed_for_success(
         "_reconcile_listener_protection",
         lambda safe: None,
     )
+    monkeypatch.setattr(
+        type(charm_instance),
+        "resolved_disk_free_limit_bytes",
+        property(lambda self: 536870912),
+    )
 
 
 def test_get_operator_info_action(ctx, rabbitmq_container, networks):
@@ -317,6 +322,46 @@ def test_config_changed_non_leader_skips_cluster_name_update(
     admin_api.set_cluster_name.assert_not_called()
 
 
+def test_config_changed_blocks_when_disk_limit_resolution_fails(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """Config-changed blocks if disk free limit resolution cannot succeed."""
+    peer = testing.PeerRelation(
+        endpoint="peers",
+        local_app_data={
+            "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
+            "erlang_cookie": "magicsecurity",
+        },
+        local_unit_data={},
+    )
+    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
+
+    with ctx(ctx.on.config_changed(), state) as manager:
+        monkeypatch.setattr(
+            manager.charm, "_set_ownership_on_data_dir", lambda: True
+        )
+        monkeypatch.setattr(
+            type(manager.charm), "rabbit_running", property(lambda self: True)
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(
+                lambda self: (_ for _ in ()).throw(
+                    charm.RabbitOperatorError(
+                        "Invalid disk-free-limit-bytes value: nope"
+                    )
+                )
+            ),
+        )
+        state_out = manager.run()
+
+    assert state_out.unit_status == ops.model.BlockedStatus(
+        "Invalid disk-free-limit-bytes value: nope"
+    )
+
+
 def test_config_changed_defers_without_erlang_cookie(
     ctx, rabbitmq_container, networks
 ):
@@ -462,6 +507,11 @@ def test_update_status_active_when_relations_ready(
             lambda safe: None,
         )
         monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
+        )
+        monkeypatch.setattr(
             manager.charm,
             "_get_admin_api",
             lambda *args, **kwargs: Mock(
@@ -511,6 +561,11 @@ def test_update_status_blocked_when_rabbit_not_running(
 
     with ctx(ctx.on.update_status(), state) as manager:
         monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: False)
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
+        )
         state_out = manager.run()
 
     assert state_out.unit_status == ops.model.BlockedStatus(
@@ -545,6 +600,11 @@ def test_update_status_blocked_when_protection_mode_engaged(
             manager.charm,
             "_reconcile_listener_protection",
             reconcile,
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
         )
         state_out = manager.run()
 
@@ -588,6 +648,11 @@ def test_update_status_warns_instead_of_blocking_when_protection_disabled(
             "_reconcile_listener_protection",
             reconcile,
         )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
+        )
         state_out = manager.run()
 
     reconcile.assert_called_once_with(False)
@@ -627,6 +692,11 @@ def test_update_status_warns_when_queues_are_undersized(
             manager.charm,
             "_reconcile_listener_protection",
             lambda safe: None,
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
         )
         monkeypatch.setattr(
             manager.charm,

@@ -89,11 +89,17 @@ def _fake_charm(**kwargs):
         "min_replicas": lambda: 3,
         "config": {
             "cluster-partition-handling": "pause_minority",
+            "disk-free-limit-bytes": "auto",
             "protect-members": True,
             "minimum-replicas": 3,
         },
         "cluster_partition_handling": "pause_minority",
         "protect_members": True,
+        "resolved_disk_free_limit_bytes": 536870912,
+        "_rabbitmq_data_pvc_capacity_bytes": Mock(return_value=1073741824),
+        "_bytes_from_string": lambda value: charm.RabbitMQOperatorCharm._bytes_from_string(  # noqa: E501
+            SimpleNamespace(), value
+        ),
         "peers_bind_address": "10.10.1.1",
         "get_hostname": Mock(return_value="rabbitmq-k8s-endpoints"),
         "does_vhost_exist": Mock(return_value=True),
@@ -934,18 +940,205 @@ def test_rabbit_running_returns_false_when_diagnostics_reports_down():
     fake._refresh_rabbitmq_version.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("auto", "auto"),
+        ("12345", 12345),
+        ("500M", 500_000_000),
+        ("500MB", 500_000_000),
+        ("5G", 5_000_000_000),
+        ("5Gi", 5 * 1024**3),
+    ],
+)
+def test_bytes_from_string(value, expected):
+    """Disk size strings are parsed using raw bytes or human-readable units."""
+    assert (
+        charm.RabbitMQOperatorCharm._bytes_from_string(
+            SimpleNamespace(), value
+        )
+        == expected
+    )
+
+
+def test_bytes_from_string_rejects_invalid_values():
+    """Unsupported size strings raise ValueError."""
+    with pytest.raises(ValueError):
+        charm.RabbitMQOperatorCharm._bytes_from_string(
+            SimpleNamespace(), "definitely-not-a-size"
+        )
+
+
 def test_render_rabbitmq_conf_uses_safer_defaults():
     """The rendered broker config includes the new fail-closed defaults."""
     container = Mock()
     fake = _fake_charm(
         unit=Mock(get_container=Mock(return_value=container)),
         _rabbitmq_running=Mock(return_value=True),
+        resolved_disk_free_limit_bytes=107374182,
     )
 
     charm.RabbitMQOperatorCharm._render_and_push_rabbitmq_conf(fake)
 
     rendered_conf = container.push.call_args.args[1]
     assert "cluster_partition_handling = pause_minority" in rendered_conf
+    assert "disk_free_limit = 107374182" in rendered_conf
+
+
+def test_rabbitmq_data_pvc_capacity_bytes():
+    """The rabbitmq-data PVC capacity is resolved from the current unit pod."""
+    volume = SimpleNamespace(
+        name="rabbitmq-data",
+        persistentVolumeClaim=SimpleNamespace(claimName="pvc-rabbitmq-data"),
+    )
+    pod = SimpleNamespace(spec=SimpleNamespace(volumes=[volume]))
+    pvc = SimpleNamespace(status=SimpleNamespace(capacity={"storage": "1Gi"}))
+    lightkube_client = SimpleNamespace(get=Mock(side_effect=[pod, pvc]))
+    fake = _fake_charm(
+        unit=SimpleNamespace(name="rabbitmq-k8s/0"),
+        model=SimpleNamespace(name="test-model"),
+        lightkube_client=lightkube_client,
+        _bytes_from_string=lambda value: charm.RabbitMQOperatorCharm._bytes_from_string(  # noqa: E501
+            SimpleNamespace(), value
+        ),
+    )
+
+    resolved = charm.RabbitMQOperatorCharm._rabbitmq_data_pvc_capacity_bytes(
+        fake
+    )
+
+    assert resolved == 1024**3
+
+
+def test_rabbitmq_data_pvc_capacity_bytes_missing_pod_raises():
+    """PVC lookup errors are surfaced as charm errors."""
+    request = httpx.Request("GET", "https://kubernetes.invalid")
+    response = httpx.Response(
+        404,
+        request=request,
+        json={
+            "apiVersion": "v1",
+            "kind": "Status",
+            "status": "Failure",
+            "message": "not found",
+            "reason": "NotFound",
+            "code": 404,
+        },
+    )
+    fake = _fake_charm(
+        unit=SimpleNamespace(name="rabbitmq-k8s/0"),
+        model=SimpleNamespace(name="test-model"),
+        lightkube_client=SimpleNamespace(
+            get=Mock(
+                side_effect=charm.ApiError(request=request, response=response)
+            )
+        ),
+    )
+
+    with pytest.raises(charm.RabbitOperatorError):
+        charm.RabbitMQOperatorCharm._rabbitmq_data_pvc_capacity_bytes(fake)
+
+
+def test_rabbitmq_data_pvc_capacity_bytes_missing_volume_raises():
+    """Missing rabbitmq-data volumes are surfaced as charm errors."""
+    pod = SimpleNamespace(spec=SimpleNamespace(volumes=[]))
+    fake = _fake_charm(
+        unit=SimpleNamespace(name="rabbitmq-k8s/0"),
+        model=SimpleNamespace(name="test-model"),
+        lightkube_client=SimpleNamespace(get=Mock(return_value=pod)),
+    )
+
+    with pytest.raises(charm.RabbitOperatorError):
+        charm.RabbitMQOperatorCharm._rabbitmq_data_pvc_capacity_bytes(fake)
+
+
+def test_rabbitmq_data_pvc_capacity_bytes_missing_pvc_raises():
+    """Missing PVC lookups are surfaced as charm errors."""
+    volume = SimpleNamespace(
+        name="rabbitmq-data",
+        persistentVolumeClaim=SimpleNamespace(claimName="pvc-rabbitmq-data"),
+    )
+    pod = SimpleNamespace(spec=SimpleNamespace(volumes=[volume]))
+    request = httpx.Request("GET", "https://kubernetes.invalid")
+    response = httpx.Response(
+        404,
+        request=request,
+        json={
+            "apiVersion": "v1",
+            "kind": "Status",
+            "status": "Failure",
+            "message": "not found",
+            "reason": "NotFound",
+            "code": 404,
+        },
+    )
+    fake = _fake_charm(
+        unit=SimpleNamespace(name="rabbitmq-k8s/0"),
+        model=SimpleNamespace(name="test-model"),
+        lightkube_client=SimpleNamespace(
+            get=Mock(
+                side_effect=[
+                    pod,
+                    charm.ApiError(request=request, response=response),
+                ]
+            )
+        ),
+    )
+
+    with pytest.raises(charm.RabbitOperatorError):
+        charm.RabbitMQOperatorCharm._rabbitmq_data_pvc_capacity_bytes(fake)
+
+
+def test_resolved_disk_free_limit_bytes_auto_uses_ten_percent_of_pvc():
+    """The auto setting resolves to 10 percent of the PVC capacity."""
+    fake = _fake_charm(
+        config={
+            "cluster-partition-handling": "pause_minority",
+            "disk-free-limit-bytes": "auto",
+            "protect-members": True,
+            "minimum-replicas": 3,
+        },
+        _rabbitmq_data_pvc_capacity_bytes=Mock(return_value=1024**3),
+    )
+
+    assert (
+        charm.RabbitMQOperatorCharm.resolved_disk_free_limit_bytes.fget(fake)
+        == 107374182
+    )
+
+
+def test_resolved_disk_free_limit_bytes_explicit_value_is_parsed():
+    """Explicit human-readable values are resolved to bytes."""
+    fake = _fake_charm(
+        config={
+            "cluster-partition-handling": "pause_minority",
+            "disk-free-limit-bytes": "5Gi",
+            "protect-members": True,
+            "minimum-replicas": 3,
+        },
+        _rabbitmq_data_pvc_capacity_bytes=Mock(return_value=10 * 1024**3),
+    )
+
+    assert (
+        charm.RabbitMQOperatorCharm.resolved_disk_free_limit_bytes.fget(fake)
+        == 5 * 1024**3
+    )
+
+
+def test_resolved_disk_free_limit_bytes_rejects_values_larger_than_pvc():
+    """Explicit limits larger than the PVC capacity are rejected."""
+    fake = _fake_charm(
+        config={
+            "cluster-partition-handling": "pause_minority",
+            "disk-free-limit-bytes": "2Gi",
+            "protect-members": True,
+            "minimum-replicas": 3,
+        },
+        _rabbitmq_data_pvc_capacity_bytes=Mock(return_value=1024**3),
+    )
+
+    with pytest.raises(charm.RabbitOperatorError):
+        charm.RabbitMQOperatorCharm.resolved_disk_free_limit_bytes.fget(fake)
 
 
 def test_render_safety_check_checks_listener_and_honours_protection_flag():
@@ -1084,6 +1277,7 @@ def test_reconcile_listener_protection_skips_suspension_when_disabled():
         unit=Mock(get_container=Mock(return_value=container)),
         config={
             "cluster-partition-handling": "pause_minority",
+            "disk-free-limit-bytes": 536870912,
             "protect-members": False,
             "minimum-replicas": 3,
         },
