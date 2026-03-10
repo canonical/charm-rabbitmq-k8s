@@ -41,6 +41,8 @@ omit = [
     ".tox/*",
     "tests/*",
     "src/templates/*",
+    "lib/charms/loki_k8s/*",
+    "lib/charms/traefik_k8s/*",
 ]
 
 [tool.coverage.report]
