@@ -239,7 +239,9 @@ class RabbitMQOperatorCharm(CharmBase):
         self.framework.observe(
             self.on.rabbitmq_pebble_ready, self._on_config_changed
         )
+        self.framework.observe(self.on.upgrade_charm, self._on_config_changed)
         self.framework.observe(self.on.config_changed, self._on_config_changed)
+        self.framework.observe(self.on.upgrade_charm, self._reconcile_lb)
         self.framework.observe(self.on.config_changed, self._reconcile_lb)
         self.framework.observe(
             self.on.rabbitmq_data_storage_attached, self._on_config_changed

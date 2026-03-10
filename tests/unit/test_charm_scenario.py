@@ -161,6 +161,33 @@ def test_rabbitmq_pebble_ready(ctx, rabbitmq_container, networks, monkeypatch):
     )
 
 
+def test_upgrade_charm_reconciles_and_autostarts(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """Upgrade-charm should run the same startup reconciliation path."""
+    peer = testing.PeerRelation(
+        endpoint="peers",
+        local_app_data={
+            "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
+            "erlang_cookie": "magicsecurity",
+        },
+        local_unit_data={},
+    )
+    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
+
+    with ctx(ctx.on.upgrade_charm(), state) as manager:
+        _patch_config_changed_for_success(monkeypatch, manager.charm)
+        state_out = manager.run()
+
+    container = state_out.get_container(charm.RABBITMQ_CONTAINER)
+    assert (
+        container.service_statuses[charm.RABBITMQ_SERVICE]
+        == ops.pebble.ServiceStatus.ACTIVE
+    )
+    assert state_out.deferred == []
+
+
 def test_config_changed_defers_without_operator_user(
     ctx, rabbitmq_container, networks
 ):
