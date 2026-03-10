@@ -15,14 +15,15 @@ jobs:
         - name: Checkout
           uses: actions/checkout@v4
 
+        - name: Setup uv
+          uses: astral-sh/setup-uv@v7
+
         - name: Install dependencies
           run: |
-            sudo apt update && sudo apt install -y pipx
-            pipx install tox
-            sudo snap install astral-uv --classic
+            sudo apt update
 
         - name: Run coverage tests
-          run: tox -e cover
+          run: uv run --with tox tox -e cover
 
         - name: Activate and prepare Python virtual environment
           run: |

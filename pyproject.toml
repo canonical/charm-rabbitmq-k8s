@@ -22,12 +22,13 @@ dependencies = [
 dev = [
     "coverage",
     "flake8",
-    "stestr",
     "rabbitmq_admin",
-    "ops",
+    "ops[testing]",
+    "pytest",
+    "pytest-cov",
+    "pyyaml",
+    "jubilant",
     "cosl",
-    "zaza @ git+https://github.com/openstack-charmers/zaza.git@master",
-    "zaza.openstack @ git+https://github.com/openstack-charmers/zaza-openstack-tests.git@master",
 ]
 
 # Testing tools configuration
@@ -40,6 +41,8 @@ omit = [
     ".tox/*",
     "tests/*",
     "src/templates/*",
+    "lib/charms/loki_k8s/*",
+    "lib/charms/traefik_k8s/*",
 ]
 
 [tool.coverage.report]
