@@ -178,6 +178,91 @@ def test_config_changed_proceeds_for_non_leader_with_operator_user(
     assert state_out.deferred == []
 
 
+def test_config_changed_defers_without_erlang_cookie(
+    ctx, rabbitmq_container, networks
+):
+    """A non-leader defers config-changed until the Erlang cookie exists."""
+    peer = testing.PeerRelation(
+        endpoint="peers",
+        local_app_data={
+            "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
+        },
+        peers_data={0: {}},
+    )
+    state = _state(
+        rabbitmq_container, networks, leader=False, relations=[peer]
+    )
+
+    state_out = ctx.run(ctx.on.config_changed(), state)
+
+    assert len(state_out.deferred) == 1
+    assert state_out.deferred[0].observer == "_on_config_changed"
+
+
+def test_config_changed_defers_without_container_connectivity(ctx, networks):
+    """Config-changed defers until Pebble is connectable."""
+    peer = testing.PeerRelation(
+        endpoint="peers",
+        local_app_data={
+            "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
+            "erlang_cookie": "magicsecurity",
+        },
+        peers_data={0: {}},
+    )
+    container = testing.Container(name=charm.RABBITMQ_CONTAINER)
+    state = testing.State(
+        leader=True,
+        relations=[peer],
+        containers=[container],
+        networks=networks,
+    )
+
+    state_out = ctx.run(ctx.on.config_changed(), state)
+
+    assert len(state_out.deferred) == 1
+    assert state_out.deferred[0].observer == "_on_config_changed"
+
+
+def test_config_changed_defers_without_peers_bind_address(
+    ctx, rabbitmq_container, monkeypatch
+):
+    """Config-changed defers until the peer binding address is available."""
+    peer = testing.PeerRelation(
+        endpoint="peers",
+        local_app_data={
+            "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
+            "erlang_cookie": "magicsecurity",
+        },
+        peers_data={0: {}},
+    )
+    networks = [
+        testing.Network(
+            "peers",
+            bind_addresses=[
+                testing.BindAddress(addresses=[testing.Address("10.10.1.1")])
+            ],
+        ),
+        testing.Network(
+            "amqp",
+            bind_addresses=[
+                testing.BindAddress(addresses=[testing.Address("10.5.0.1")])
+            ],
+            ingress_addresses=["10.5.0.1"],
+        ),
+    ]
+    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
+
+    with ctx(ctx.on.config_changed(), state) as manager:
+        monkeypatch.setattr(manager.charm, "_peers_bind_address", lambda: None)
+        state_out = manager.run()
+
+    assert len(state_out.deferred) == 1
+    assert state_out.deferred[0].observer == "_on_config_changed"
+
+
 def test_update_status_waiting_without_operator_user(
     ctx, rabbitmq_container, networks
 ):
@@ -238,6 +323,92 @@ def test_update_status_active_when_relations_ready(
     assert state_out.unit_status == ops.model.ActiveStatus()
 
 
+def test_update_status_waiting_without_erlang_cookie(
+    ctx, rabbitmq_container, networks
+):
+    """Update status waits until the leader shares the Erlang cookie."""
+    peer = testing.PeerRelation(
+        endpoint="peers",
+        local_app_data={
+            "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
+        },
+        peers_data={0: {}},
+    )
+    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
+
+    state_out = ctx.run(ctx.on.update_status(), state)
+
+    assert state_out.unit_status == ops.model.WaitingStatus(
+        "Waiting for leader to provide erlang cookie"
+    )
+
+
+def test_update_status_blocked_when_rabbit_not_running(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """Update status blocks once the charm is bootstrapped but RabbitMQ is down."""
+    peer = testing.PeerRelation(
+        endpoint="peers",
+        local_app_data={
+            "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
+            "erlang_cookie": "magicsecurity",
+        },
+        peers_data={0: {}},
+    )
+    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
+
+    with ctx(ctx.on.update_status(), state) as manager:
+        monkeypatch.setattr(
+            type(manager.charm),
+            "rabbit_running",
+            property(lambda self: False),
+        )
+        state_out = manager.run()
+
+    assert state_out.unit_status == ops.model.BlockedStatus(
+        "RabbitMQ not running"
+    )
+
+
+def test_update_status_warns_when_queues_are_undersized(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """Update status reports undersized queues in the active status message."""
+    peer = testing.PeerRelation(
+        endpoint="peers",
+        local_app_data={
+            "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
+            "erlang_cookie": "magicsecurity",
+        },
+        peers_data={0: {}},
+    )
+    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
+
+    with ctx(ctx.on.update_status(), state) as manager:
+        monkeypatch.setattr(
+            type(manager.charm),
+            "rabbit_running",
+            property(lambda self: True),
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_get_admin_api",
+            lambda *args, **kwargs: Mock(
+                list_quorum_queues=Mock(
+                    return_value=[{"name": "q1", "members": ["node1"]}]
+                )
+            ),
+        )
+        state_out = manager.run()
+
+    assert state_out.unit_status == ops.model.ActiveStatus(
+        "WARNING: 1 Queue(s) with insufficient members"
+    )
+
+
 def test_add_member_action_calls_admin_api(
     ctx, rabbitmq_container, networks, monkeypatch
 ):
@@ -293,6 +464,103 @@ def test_delete_member_action_calls_admin_api(
 
     admin_api.delete_member.assert_called_once_with(
         "rabbit@unit-1.rabbitmq-k8s-endpoints", "/", "test_queue"
+    )
+
+
+def test_ensure_queue_ha_action_reports_result(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """The ensure-queue-ha action reports the replication summary."""
+    peer = testing.PeerRelation(
+        endpoint="peers",
+        local_app_data={
+            "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
+            "erlang_cookie": "magicsecurity",
+        },
+        peers_data={0: {}},
+    )
+    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
+
+    with ctx(
+        ctx.on.action("ensure-queue-ha", params={"dry-run": True}),
+        state,
+    ) as manager:
+        monkeypatch.setattr(
+            type(manager.charm),
+            "rabbit_running",
+            property(lambda self: True),
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "ensure_queue_ha",
+            lambda dry_run=False: {
+                "undersized-queues": 2,
+                "replicated-queues": 0,
+            },
+        )
+        monkeypatch.setattr(
+            manager.charm, "_on_update_status", lambda event: None
+        )
+        manager.run()
+
+    assert ctx.action_results == {
+        "undersized-queues": 2,
+        "replicated-queues": 0,
+        "dry-run": True,
+    }
+
+
+def test_get_service_account_action_returns_credentials(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """The service-account action returns the generated connection details."""
+    peer = testing.PeerRelation(
+        endpoint="peers",
+        local_app_data={
+            "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
+            "erlang_cookie": "magicsecurity",
+            "svc-user": "svc-password",
+        },
+        peers_data={0: {}},
+    )
+    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
+
+    with ctx(
+        ctx.on.action(
+            "get-service-account",
+            params={"username": "svc-user", "vhost": "svc-vhost"},
+        ),
+        state,
+    ) as manager:
+        monkeypatch.setattr(
+            type(manager.charm),
+            "rabbit_running",
+            property(lambda self: True),
+        )
+        monkeypatch.setattr(
+            manager.charm, "does_vhost_exist", lambda vhost: True
+        )
+        monkeypatch.setattr(
+            manager.charm, "does_user_exist", lambda username: False
+        )
+        monkeypatch.setattr(
+            manager.charm, "create_user", lambda username: "svc-password"
+        )
+        monkeypatch.setattr(
+            manager.charm, "set_user_permissions", lambda username, vhost: None
+        )
+        manager.run()
+
+    assert ctx.action_results["username"] == "svc-user"
+    assert ctx.action_results["password"] == "svc-password"
+    assert ctx.action_results["vhost"] == "svc-vhost"
+    assert str(ctx.action_results["ingress-address"]) == "10.5.0.1"
+    assert ctx.action_results["port"] == 5672
+    assert (
+        ctx.action_results["url"]
+        == "rabbit://svc-user:svc-password@10.5.0.1:5672/svc-vhost"
     )
 
 

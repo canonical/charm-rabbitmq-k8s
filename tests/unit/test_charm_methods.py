@@ -18,14 +18,17 @@ from types import (
     SimpleNamespace,
 )
 from unittest.mock import (
+    MagicMock,
     Mock,
     call,
     patch,
 )
 
+import httpx
 import ops.model
 import ops.pebble
 import pytest
+import requests
 
 import charm
 
@@ -42,6 +45,14 @@ def _fake_charm(**kwargs):
         ),
         "_get_admin_api": Mock(),
         "min_replicas": lambda: 3,
+        "peers_bind_address": "10.10.1.1",
+        "get_hostname": Mock(return_value="rabbitmq-k8s-endpoints"),
+        "does_vhost_exist": Mock(return_value=True),
+        "create_vhost": Mock(),
+        "does_user_exist": Mock(return_value=True),
+        "create_user": Mock(return_value="new-password"),
+        "set_user_permissions": Mock(),
+        "_on_update_status": Mock(),
         "generate_nodename": lambda unit_name: charm.RabbitMQOperatorCharm.generate_nodename(
             SimpleNamespace(app=SimpleNamespace(name="rabbitmq-k8s")),
             unit_name,
@@ -49,6 +60,14 @@ def _fake_charm(**kwargs):
     }
     base.update(kwargs)
     return SimpleNamespace(**base)
+
+
+class FakeConnectionError(requests.exceptions.ConnectionError):
+    """Connection error carrying an errno for charm logging paths."""
+
+    def __init__(self, message: str, errno: int = 111):
+        super().__init__(message)
+        self.errno = errno
 
 
 def test_get_queue_growth_selector():
@@ -606,3 +625,565 @@ def test_publish_relation_data_on_model_error():
     charm.RabbitMQOperatorCharm._publish_relation_data(fake)
 
     fake.get_hostname.assert_not_called()
+
+
+def test_on_peer_relation_connected_defers_when_rabbit_not_running():
+    """Peer relation setup waits until RabbitMQ is actually running."""
+    event = Mock(defer=Mock())
+    fake = _fake_charm(_rabbitmq_running=Mock(return_value=False))
+
+    charm.RabbitMQOperatorCharm._on_peer_relation_connected(fake, event)
+
+    event.defer.assert_called_once_with()
+
+
+def test_on_peer_relation_connected_sets_cookie_and_initializes_user():
+    """Leaders publish the cookie and initialize the operator user."""
+    event = Mock(defer=Mock())
+    container = Mock()
+    cookie_file = Mock(read=Mock(return_value="magiccookie\n"))
+    container.pull.return_value = MagicMock()
+    container.pull.return_value.__enter__.return_value = cookie_file
+    container.pull.return_value.__exit__.return_value = None
+    peers = SimpleNamespace(
+        erlang_cookie=None,
+        operator_user_created=None,
+        set_erlang_cookie=Mock(),
+    )
+    unit = Mock()
+    unit.is_leader.return_value = True
+    unit.get_container.return_value = container
+    fake = _fake_charm(
+        _rabbitmq_running=Mock(return_value=True),
+        peers=peers,
+        unit=unit,
+        _initialize_operator_user=Mock(),
+        _on_update_status=Mock(),
+    )
+
+    charm.RabbitMQOperatorCharm._on_peer_relation_connected(fake, event)
+
+    peers.set_erlang_cookie.assert_called_once_with("magiccookie")
+    fake._initialize_operator_user.assert_called_once_with()
+    fake._on_update_status.assert_called_once_with(event)
+
+
+def test_on_peer_relation_ready_defers_until_unit_in_cluster():
+    """Peer-ready waits until the joining unit is visible in the cluster."""
+    event = SimpleNamespace(nodename="rabbitmq-k8s/1", defer=Mock())
+    fake = _fake_charm(
+        _rabbitmq_running=Mock(return_value=True),
+        peers=SimpleNamespace(operator_user_created="rmqadmin"),
+        unit_in_cluster=Mock(return_value=False),
+    )
+
+    charm.RabbitMQOperatorCharm._on_peer_relation_ready(fake, event)
+
+    event.defer.assert_called_once_with()
+
+
+def test_on_peer_relation_ready_leader_rebalances_when_ready():
+    """Leaders grow queues and rebalance once a peer is ready."""
+    event = SimpleNamespace(nodename="rabbitmq-k8s/1", defer=Mock())
+    admin_api = Mock()
+    unit = Mock()
+    unit.is_leader.return_value = True
+    fake = _fake_charm(
+        _rabbitmq_running=Mock(return_value=True),
+        peers=SimpleNamespace(operator_user_created="rmqadmin"),
+        unit=unit,
+        unit_in_cluster=Mock(return_value=True),
+        grow_queues_onto_unit=Mock(),
+        _get_admin_api=Mock(return_value=admin_api),
+        _on_update_status=Mock(),
+    )
+
+    charm.RabbitMQOperatorCharm._on_peer_relation_ready(fake, event)
+
+    fake.grow_queues_onto_unit.assert_called_once_with("rabbitmq-k8s/1")
+    admin_api.rebalance_queues.assert_called_once_with()
+    fake._on_update_status.assert_called_once_with(event)
+
+
+def test_on_gone_away_amqp_clients_non_leader_noop():
+    """Non-leaders do not delete AMQP users on relation removal."""
+    relation = Mock()
+    event = SimpleNamespace(relation=relation)
+    unit = Mock()
+    unit.is_leader.return_value = False
+    fake = _fake_charm(unit=unit)
+
+    charm.RabbitMQOperatorCharm._on_gone_away_amqp_clients(fake, event)
+
+    fake._get_admin_api.assert_not_called()
+
+
+def test_on_gone_away_amqp_clients_leader_deletes_user():
+    """Leaders clean up the user and peer password on AMQP relation removal."""
+    relation = Mock()
+    event = SimpleNamespace(relation=relation)
+    admin_api = Mock()
+    peers = SimpleNamespace(delete_user=Mock())
+    unit = Mock()
+    unit.is_leader.return_value = True
+    fake = _fake_charm(
+        unit=unit,
+        _get_admin_api=Mock(return_value=admin_api),
+        amqp_provider=SimpleNamespace(username=Mock(return_value="svc-user")),
+        does_user_exist=Mock(return_value=True),
+        peers=peers,
+    )
+
+    charm.RabbitMQOperatorCharm._on_gone_away_amqp_clients(fake, event)
+
+    admin_api.delete_user.assert_called_once_with("svc-user")
+    peers.delete_user.assert_called_once_with("svc-user")
+
+
+def test_does_user_exist_false_on_404():
+    """User existence returns False when the API reports a 404."""
+    admin_api = Mock()
+    error = requests.exceptions.HTTPError("missing user")
+    error.response = SimpleNamespace(status_code=404)
+    admin_api.get_user.side_effect = error
+    fake = _fake_charm(_get_admin_api=Mock(return_value=admin_api))
+
+    assert not charm.RabbitMQOperatorCharm.does_user_exist(fake, "svc-user")
+
+
+def test_does_vhost_exist_false_on_404():
+    """Vhost existence returns False when the API reports a 404."""
+    admin_api = Mock()
+    error = requests.exceptions.HTTPError("missing vhost")
+    error.response = SimpleNamespace(status_code=404)
+    admin_api.get_vhost.side_effect = error
+    fake = _fake_charm(_get_admin_api=Mock(return_value=admin_api))
+
+    assert not charm.RabbitMQOperatorCharm.does_vhost_exist(fake, "/")
+
+
+def test_create_user_returns_generated_password():
+    """User creation returns the generated password."""
+    admin_api = Mock()
+    fake = _fake_charm(_get_admin_api=Mock(return_value=admin_api))
+
+    with patch("charm.pwgen.pwgen", return_value="generated-password"):
+        password = charm.RabbitMQOperatorCharm.create_user(fake, "svc-user")
+
+    assert password == "generated-password"
+    admin_api.create_user.assert_called_once_with(
+        "svc-user", "generated-password"
+    )
+
+
+def test_set_user_permissions_calls_api():
+    """Permission updates are delegated to the admin API."""
+    admin_api = Mock()
+    fake = _fake_charm(_get_admin_api=Mock(return_value=admin_api))
+
+    charm.RabbitMQOperatorCharm.set_user_permissions(fake, "svc-user", "/")
+
+    admin_api.create_user_permission.assert_called_once_with(
+        "svc-user", "/", configure=".*", write=".*", read=".*"
+    )
+
+
+def test_create_vhost_calls_api():
+    """Vhost creation is delegated to the admin API."""
+    admin_api = Mock()
+    fake = _fake_charm(_get_admin_api=Mock(return_value=admin_api))
+
+    charm.RabbitMQOperatorCharm.create_vhost(fake, "/svc")
+
+    admin_api.create_vhost.assert_called_once_with("/svc")
+
+
+def test_operator_password_sets_password_on_leader():
+    """The leader generates and stores the operator password when missing."""
+    peers = SimpleNamespace(
+        operator_password=None,
+        set_operator_password=Mock(),
+    )
+    unit = Mock()
+    unit.is_leader.return_value = True
+    fake = _fake_charm(unit=unit, peers=peers)
+
+    with patch("charm.pwgen.pwgen", return_value="generated-password"):
+        password = charm.RabbitMQOperatorCharm._operator_password.fget(fake)
+
+    assert password is None
+    peers.set_operator_password.assert_called_once_with("generated-password")
+
+
+def test_rabbit_running_uses_guest_before_operator_and_caches_version():
+    """Uses the guest fallback until the operator user exists."""
+    admin_api = Mock()
+    admin_api.overview.return_value = {"product_version": "3.12.1"}
+    fake = _fake_charm(
+        peers=SimpleNamespace(operator_user_created=None),
+        _get_admin_api=Mock(return_value=admin_api),
+        _stored=SimpleNamespace(rabbitmq_version=None),
+    )
+
+    assert charm.RabbitMQOperatorCharm.rabbit_running.fget(fake)
+    fake._get_admin_api.assert_called_once_with("guest", "guest")
+    assert fake._stored.rabbitmq_version == "3.12.1"
+
+
+def test_rabbit_running_returns_false_on_connection_error():
+    """Connection failures report RabbitMQ as down."""
+    fake = _fake_charm(
+        peers=SimpleNamespace(operator_user_created="rmqadmin"),
+        _get_admin_api=Mock(side_effect=FakeConnectionError("boom")),
+        _stored=SimpleNamespace(rabbitmq_version=None),
+    )
+
+    assert not charm.RabbitMQOperatorCharm.rabbit_running.fget(fake)
+
+
+def test_initialize_operator_user_creates_and_removes_guest():
+    """The operator bootstrap creates the admin user and removes guest."""
+    admin_api = Mock()
+    peers = SimpleNamespace(set_operator_user_created=Mock())
+    fake = _fake_charm(
+        peers=peers,
+        _get_admin_api=Mock(return_value=admin_api),
+    )
+    fake._operator_user = "operator"
+    fake._operator_password = "operator-password"
+
+    charm.RabbitMQOperatorCharm._initialize_operator_user(fake)
+
+    admin_api.create_user.assert_called_once_with(
+        "operator",
+        "operator-password",
+        tags=["administrator"],
+    )
+    admin_api.create_user_permission.assert_called_once_with(
+        "operator", vhost="/"
+    )
+    peers.set_operator_user_created.assert_called_once_with("operator")
+    admin_api.delete_user.assert_called_once_with("guest")
+
+
+def test_create_amqp_credentials_defers_without_bind_address():
+    """AMQP credential creation waits for the peer bind address."""
+    relation = SimpleNamespace(data={object(): {}})
+    event = SimpleNamespace(relation=relation, defer=Mock())
+    fake = _fake_charm(peers_bind_address=None, app=next(iter(relation.data)))
+
+    charm.RabbitMQOperatorCharm.create_amqp_credentials(
+        fake, event, "svc-user", "svc-vhost", False
+    )
+
+    event.defer.assert_called_once_with()
+
+
+def test_create_amqp_credentials_success():
+    """AMQP credentials are created and published onto the relation."""
+    app = object()
+    relation = SimpleNamespace(data={app: {}})
+    event = SimpleNamespace(relation=relation, defer=Mock())
+    peers = SimpleNamespace(
+        store_password=Mock(),
+        retrieve_password=Mock(return_value="stored-password"),
+    )
+    fake = _fake_charm(app=app, peers=peers)
+    fake.does_vhost_exist.return_value = False
+    fake.does_user_exist.return_value = False
+
+    charm.RabbitMQOperatorCharm.create_amqp_credentials(
+        fake, event, "svc-user", "svc-vhost", True
+    )
+
+    fake.create_vhost.assert_called_once_with("svc-vhost")
+    fake.create_user.assert_called_once_with("svc-user")
+    peers.store_password.assert_called_once_with("svc-user", "new-password")
+    fake.set_user_permissions.assert_called_once_with("svc-user", "svc-vhost")
+    assert relation.data[app] == {
+        "password": "stored-password",
+        "hostname": "rabbitmq-k8s-endpoints",
+    }
+
+
+def test_create_amqp_credentials_defers_on_http_401():
+    """Unauthorized AMQP credential creation is deferred for later retry."""
+    app = object()
+    relation = SimpleNamespace(data={app: {}})
+    event = SimpleNamespace(relation=relation, defer=Mock())
+    error = requests.exceptions.HTTPError("unauthorized")
+    error.response = SimpleNamespace(status_code=401)
+    fake = _fake_charm(
+        app=app,
+        does_vhost_exist=Mock(side_effect=error),
+    )
+
+    charm.RabbitMQOperatorCharm.create_amqp_credentials(
+        fake, event, "svc-user", "svc-vhost", False
+    )
+
+    event.defer.assert_called_once_with()
+
+
+def test_get_service_account_fails_when_rabbit_unavailable():
+    """Service-account action fails if RabbitMQ and peer binding are both missing."""
+    event = Mock()
+    event.params = {"username": "svc-user", "vhost": "svc-vhost"}
+    fake = _fake_charm(
+        peers_bind_address=None,
+        peers=SimpleNamespace(retrieve_password=Mock()),
+    )
+    fake.rabbit_running = False
+
+    charm.RabbitMQOperatorCharm._get_service_account(fake, event)
+
+    event.fail.assert_called_once_with(
+        "RabbitMQ not running, unable to create account"
+    )
+
+
+def test_get_service_account_success():
+    """Service-account action returns connection details on success."""
+    event = Mock()
+    event.params = {"username": "svc-user", "vhost": "svc-vhost"}
+    peers = SimpleNamespace(
+        store_password=Mock(),
+        retrieve_password=Mock(return_value="svc-password"),
+    )
+    fake = _fake_charm(peers=peers)
+    fake.rabbit_running = True
+    fake.ingress_address = "10.5.0.1"
+    fake.rabbitmq_url = Mock(return_value="rabbit://svc-user:svc-password")
+    fake.does_vhost_exist.return_value = False
+    fake.does_user_exist.return_value = False
+
+    charm.RabbitMQOperatorCharm._get_service_account(fake, event)
+
+    event.set_results.assert_called_once_with(
+        {
+            "username": "svc-user",
+            "password": "svc-password",
+            "vhost": "svc-vhost",
+            "ingress-address": "10.5.0.1",
+            "port": 5672,
+            "url": "rabbit://svc-user:svc-password",
+        }
+    )
+
+
+def test_ensure_queue_ha_raises_without_enough_nodes():
+    """Queue HA fails when the cluster is too small for the configured replicas."""
+    admin_api = Mock()
+    admin_api.list_nodes.return_value = [{"name": "node1"}, {"name": "node2"}]
+    fake = _fake_charm(
+        get_undersized_queues=Mock(return_value=[{"name": "q1"}]),
+        _get_admin_api=Mock(return_value=admin_api),
+    )
+
+    with pytest.raises(charm.RabbitOperatorError):
+        charm.RabbitMQOperatorCharm.ensure_queue_ha(fake)
+
+
+def test_ensure_queue_ha_rebalances_when_replicated():
+    """Queue HA rebalances once replicas were added."""
+    admin_api = Mock()
+    admin_api.list_nodes.return_value = [
+        {"name": "node1"},
+        {"name": "node2"},
+        {"name": "node3"},
+    ]
+    undersized_queues = [{"name": "q1", "members": ["node1"], "vhost": "/"}]
+    fake = _fake_charm(
+        get_undersized_queues=Mock(return_value=undersized_queues),
+        _get_admin_api=Mock(return_value=admin_api),
+        _add_members_to_undersized_queues=Mock(return_value=["q1"]),
+    )
+
+    result = charm.RabbitMQOperatorCharm.ensure_queue_ha(fake)
+
+    assert result == {"undersized-queues": 1, "replicated-queues": 1}
+    admin_api.rebalance_queues.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    (
+        "leader",
+        "rabbit_running",
+        "operator_user_created",
+        "manage_queues",
+        "message",
+    ),
+    [
+        (
+            False,
+            True,
+            "rmqadmin",
+            True,
+            "Not leader unit, unable to ensure queue HA",
+        ),
+        (
+            True,
+            False,
+            "rmqadmin",
+            True,
+            "RabbitMQ not running, unable to ensure queue HA",
+        ),
+        (
+            True,
+            True,
+            None,
+            True,
+            "Operator user not created, unable to ensure queue HA",
+        ),
+        (
+            True,
+            True,
+            "rmqadmin",
+            False,
+            "Queue management is disabled, unable to ensure queue HA",
+        ),
+    ],
+)
+def test_ensure_queue_ha_action_gate_failures(
+    leader, rabbit_running, operator_user_created, manage_queues, message
+):
+    """Queue HA action fails early for each gating condition."""
+    event = Mock()
+    event.params = {"dry-run": False}
+    unit = Mock()
+    unit.is_leader.return_value = leader
+    fake = _fake_charm(
+        unit=unit,
+        peers=SimpleNamespace(operator_user_created=operator_user_created),
+        _manage_queues=Mock(return_value=manage_queues),
+    )
+    fake.rabbit_running = rabbit_running
+
+    charm.RabbitMQOperatorCharm._ensure_queue_ha_action(fake, event)
+
+    event.fail.assert_called_once_with(message)
+
+
+def test_ensure_queue_ha_action_success():
+    """Queue HA action returns the replication summary and updates status."""
+    event = Mock()
+    event.params = {"dry-run": True}
+    unit = Mock()
+    unit.is_leader.return_value = True
+    fake = _fake_charm(
+        unit=unit,
+        peers=SimpleNamespace(operator_user_created="rmqadmin"),
+        _manage_queues=Mock(return_value=True),
+        ensure_queue_ha=Mock(
+            return_value={
+                "undersized-queues": 2,
+                "replicated-queues": 1,
+            }
+        ),
+        _on_update_status=Mock(),
+    )
+    fake.rabbit_running = True
+
+    charm.RabbitMQOperatorCharm._ensure_queue_ha_action(fake, event)
+
+    event.set_results.assert_called_once_with(
+        {
+            "undersized-queues": 2,
+            "replicated-queues": 1,
+            "dry-run": True,
+        }
+    )
+    fake._on_update_status.assert_called_once_with(event)
+
+
+def test_get_hostname_prefers_loadbalancer_when_requested():
+    """External connectivity prefers the load-balancer IP when available."""
+    fake = _fake_charm(
+        hostname="rabbitmq-k8s-endpoints.model.svc.cluster.local",
+        _get_loadbalancer_ip=Mock(return_value="203.0.113.10"),
+    )
+
+    hostname = charm.RabbitMQOperatorCharm.get_hostname(
+        fake, external_connectivity=True
+    )
+
+    assert hostname == "203.0.113.10"
+
+
+def test_get_loadbalancer_ip_returns_none_on_apierror():
+    """Load-balancer lookup failures are handled gracefully."""
+
+    class _HashableCharm(SimpleNamespace):
+        __hash__ = object.__hash__
+
+    request = httpx.Request("GET", "https://kubernetes.invalid")
+    response = httpx.Response(
+        404,
+        request=request,
+        json={
+            "apiVersion": "v1",
+            "kind": "Status",
+            "status": "Failure",
+            "message": "not found",
+            "reason": "NotFound",
+            "code": 404,
+        },
+    )
+    fake = _HashableCharm(
+        **_fake_charm(
+            lightkube_client=SimpleNamespace(
+                get=Mock(
+                    side_effect=charm.ApiError(
+                        request=request, response=response
+                    )
+                )
+            ),
+            model=SimpleNamespace(name="test-model"),
+            _lb_name="rabbitmq-k8s-lb",
+        ).__dict__
+    )
+
+    result = charm.RabbitMQOperatorCharm._get_loadbalancer_ip(fake)
+
+    assert result is None
+
+
+def test_reconcile_lb_sets_blocked_on_invalid_annotations():
+    """Invalid load-balancer annotations block the unit."""
+    unit = Mock()
+    unit.is_leader.return_value = True
+    fake = _fake_charm(
+        unit=unit,
+        _annotations_valid=False,
+        _get_lb_resource_manager=Mock(
+            return_value=SimpleNamespace(reconcile=Mock())
+        ),
+    )
+
+    charm.RabbitMQOperatorCharm._reconcile_lb(fake, None)
+
+    assert unit.status == ops.model.BlockedStatus(
+        "Invalid config value 'loadbalancer_annotations'"
+    )
+    fake._get_lb_resource_manager.return_value.reconcile.assert_called_once_with(
+        []
+    )
+
+
+def test_reconcile_lb_reconciles_valid_service():
+    """Valid annotations produce a load-balancer reconciliation request."""
+    unit = Mock()
+    unit.is_leader.return_value = True
+    resource_manager = SimpleNamespace(reconcile=Mock())
+    service = Mock()
+    fake = _fake_charm(
+        unit=unit,
+        _annotations_valid=True,
+        _construct_lb=Mock(return_value=service),
+        _get_lb_resource_manager=Mock(return_value=resource_manager),
+        _lb_name="rabbitmq-k8s-lb",
+    )
+
+    charm.RabbitMQOperatorCharm._reconcile_lb(fake, None)
+
+    resource_manager.reconcile.assert_called_once_with([service])
