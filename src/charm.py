@@ -1991,6 +1991,12 @@ class RabbitMQOperatorCharm(CharmBase):
 
         :param event: The current event
         """
+        if not self.unit.is_leader():
+            msg = "Not leader unit, unable to create service account"
+            logger.error(msg)
+            event.fail(msg)
+            return
+
         if not self.rabbit_running and not self.peers_bind_address:
             msg = "RabbitMQ not running, unable to create account"
             logger.error(msg)

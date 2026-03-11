@@ -1749,6 +1749,20 @@ def test_get_service_account_fails_when_rabbit_unavailable():
     )
 
 
+def test_get_service_account_fails_on_non_leader():
+    """Service-account action is leader-only."""
+    event = Mock()
+    event.params = {"username": "svc-user", "vhost": "svc-vhost"}
+    fake = _fake_charm()
+    fake.unit.is_leader.return_value = False
+
+    charm.RabbitMQOperatorCharm._get_service_account(fake, event)
+
+    event.fail.assert_called_once_with(
+        "Not leader unit, unable to create service account"
+    )
+
+
 def test_get_service_account_success():
     """Service-account action returns connection details on success."""
     event = Mock()
@@ -1758,6 +1772,7 @@ def test_get_service_account_success():
         retrieve_password=Mock(return_value="svc-password"),
     )
     fake = _fake_charm(peers=peers)
+    fake.unit.is_leader.return_value = True
     fake.rabbit_running = True
     fake.ingress_address = "10.5.0.1"
     fake.rabbitmq_url = Mock(return_value="rabbit://svc-user:svc-password")

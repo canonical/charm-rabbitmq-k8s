@@ -20,6 +20,7 @@ from unittest.mock import (
 
 import ops.model
 import ops.pebble
+import pytest
 import requests
 from ops import (
     testing,
@@ -1092,6 +1093,37 @@ def test_get_service_account_action_returns_credentials(
         ctx.action_results["url"]
         == "rabbit://svc-user:svc-password@10.5.0.1:5672/svc-vhost"
     )
+
+
+def test_get_service_account_action_fails_on_non_leader(
+    ctx, rabbitmq_container, networks
+):
+    """The service-account action fails clearly on non-leader units."""
+    peer = testing.PeerRelation(
+        endpoint="peers",
+        local_app_data={
+            "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
+            "erlang_cookie": "magicsecurity",
+        },
+        local_unit_data={},
+    )
+    state = _state(
+        rabbitmq_container, networks, leader=False, relations=[peer]
+    )
+
+    with ctx(
+        ctx.on.action(
+            "get-service-account",
+            params={"username": "svc-user", "vhost": "svc-vhost"},
+        ),
+        state,
+    ) as manager:
+        with pytest.raises(
+            Exception,
+            match="Not leader unit, unable to create service account",
+        ):
+            manager.run()
 
 
 def test_recreate_operator_user_action_returns_credentials(
