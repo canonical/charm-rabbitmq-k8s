@@ -2104,6 +2104,15 @@ def test_ensure_queue_ha_action_success():
     fake._on_update_status.assert_called_once_with(event)
 
 
+def test_on_update_status_reconciles_without_event():
+    """Update-status should drive reconcile without a deferrable event object."""
+    fake = _fake_charm(_reconcile=Mock())
+
+    charm.RabbitMQOperatorCharm._on_update_status(fake, Mock())
+
+    fake._reconcile.assert_called_once_with(None)
+
+
 def test_get_hostname_prefers_loadbalancer_when_requested():
     """External connectivity prefers the load-balancer IP when available."""
     fake = _fake_charm(

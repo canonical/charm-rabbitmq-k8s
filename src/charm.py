@@ -371,7 +371,7 @@ class RabbitMQOperatorCharm(CharmBase):
     def _noop_amqp_credentials_callback(self, *args, **kwargs) -> None:
         """Disable callback-style AMQP provisioning in favor of reconciliation."""
 
-    def _reconcile(self, event: EventBase) -> None:
+    def _reconcile(self, event: EventBase | None) -> None:
         """Reconcile charm state from the current model and workload."""
         if (
             isinstance(event, PebbleCustomNoticeEvent)
