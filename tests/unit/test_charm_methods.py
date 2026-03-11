@@ -1303,6 +1303,28 @@ def test_rabbitmq_data_pvc_capacity_bytes_missing_pod_raises():
         charm.RabbitMQOperatorCharm._rabbitmq_data_pvc_capacity_bytes(fake)
 
 
+def test_rabbitmq_data_pvc_capacity_bytes_config_error_raises():
+    """Missing Kubernetes client config is surfaced as a charm error."""
+
+    class FakeCharm(SimpleNamespace):
+        @property
+        def lightkube_client(self):
+            raise charm.ConfigError(
+                "Configuration file ~/.kube/config not found"
+            )
+
+    fake = FakeCharm(
+        unit=SimpleNamespace(name="rabbitmq-k8s/0"),
+        model=SimpleNamespace(name="test-model"),
+    )
+
+    with pytest.raises(
+        charm.RabbitOperatorError,
+        match="Failed to configure Kubernetes client",
+    ):
+        charm.RabbitMQOperatorCharm._rabbitmq_data_pvc_capacity_bytes(fake)
+
+
 def test_rabbitmq_data_pvc_capacity_bytes_missing_volume_raises():
     """Missing rabbitmq-data volumes are surfaced as charm errors."""
     container = SimpleNamespace(
@@ -1445,6 +1467,31 @@ def test_resolved_disk_free_limit_bytes_rejects_values_larger_than_pvc():
 
     with pytest.raises(charm.RabbitOperatorError):
         charm.RabbitMQOperatorCharm.resolved_disk_free_limit_bytes.fget(fake)
+
+
+def test_configuration_error_returns_disk_limit_resolution_message():
+    """Status collection should block on disk-limit resolution errors, not crash."""
+
+    class FakeCharm(SimpleNamespace):
+        @property
+        def cluster_partition_handling(self):
+            return "pause_minority"
+
+        @property
+        def resolved_disk_free_limit_bytes(self):
+            raise charm.RabbitOperatorError(
+                "Failed to configure Kubernetes client for rabbitmq-data PVC lookup"
+            )
+
+    fake = FakeCharm(
+        unit=SimpleNamespace(is_leader=lambda: False),
+        _annotations_valid=True,
+    )
+
+    assert (
+        charm.RabbitMQOperatorCharm._configuration_error(fake)
+        == "Failed to configure Kubernetes client for rabbitmq-data PVC lookup"
+    )
 
 
 def test_render_safety_check_checks_listener_and_honours_protection_flag():

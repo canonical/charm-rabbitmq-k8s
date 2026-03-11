@@ -66,6 +66,7 @@ from lightkube.core.client import (
 )
 from lightkube.core.exceptions import (
     ApiError,
+    ConfigError,
 )
 from lightkube.models.core_v1 import (
     ServicePort,
@@ -1371,6 +1372,10 @@ class RabbitMQOperatorCharm(CharmBase):
             pod = self.lightkube_client.get(
                 Pod, name=pod_name, namespace=self.model.name
             )
+        except ConfigError as e:
+            raise RabbitOperatorError(
+                "Failed to configure Kubernetes client for rabbitmq-data PVC lookup"
+            ) from e
         except ApiError as e:
             raise RabbitOperatorError(
                 f"Failed to fetch pod {pod_name} for rabbitmq-data PVC lookup"
@@ -1384,6 +1389,10 @@ class RabbitMQOperatorCharm(CharmBase):
                 name=claim_name,
                 namespace=self.model.name,
             )
+        except ConfigError as e:
+            raise RabbitOperatorError(
+                "Failed to configure Kubernetes client for rabbitmq-data PVC lookup"
+            ) from e
         except ApiError as e:
             raise RabbitOperatorError(
                 f"Failed to fetch PersistentVolumeClaim {claim_name}"
