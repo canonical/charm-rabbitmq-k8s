@@ -173,6 +173,10 @@ def test_rabbitmq_pebble_ready(ctx, rabbitmq_container, networks, monkeypatch):
         "ready",
     }
     assert (
+        container.plan.to_dict()["checks"]["alive"]["exec"]["command"]
+        == charm.RABBITMQ_ALIVE_CHECK_PATH
+    )
+    assert (
         container.service_statuses[charm.RABBITMQ_SERVICE]
         == ops.pebble.ServiceStatus.ACTIVE
     )

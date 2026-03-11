@@ -33,7 +33,8 @@ RABBITMQ_CONTAINER = "rabbitmq"
 RABBITMQ_FILLER_PATH = "/var/lib/rabbitmq/.functional-fill"
 RABBITMQ_DATA_DIR = "/var/lib/rabbitmq"
 RABBITMQ_TIMER_NOTICE = "rabbitmq.local/timer"
-RABBITMQ_STOP_LOOP_PID = "/tmp/rabbitmq-stop-loop.pid"
+
+_RABBITMQ_STOP_PROCESSES: dict[tuple[str, str], subprocess.Popen] = {}
 
 
 def status_payload(juju: jubilant.Juju) -> dict:
@@ -559,32 +560,43 @@ def rabbitmqctl_start_app(juju: jubilant.Juju, unit_name: str) -> None:
 
 
 def hold_rabbitmq_service_stopped(juju: jubilant.Juju, unit_name: str) -> None:
-    """Keep the RabbitMQ beam process down until released."""
-    command = (
-        f"rm -f {RABBITMQ_STOP_LOOP_PID}; "
-        "nohup sh -c "
-        + shlex.quote(
-            "while true; do "
-            "/charm/bin/pebble stop rabbitmq || true; "
-            "pkill -x beam.smp || true; "
-            "sleep 1; "
-            "done"
-        )
-        + f" >/tmp/rabbitmq-stop-loop.log 2>&1 & echo $! > {RABBITMQ_STOP_LOOP_PID}"
+    """Keep the RabbitMQ unit unavailable by repeatedly deleting its pod."""
+    key = (model_name(juju), unit_name)
+    process = _RABBITMQ_STOP_PROCESSES.get(key)
+    if process and process.poll() is None:
+        return
+
+    _RABBITMQ_STOP_PROCESSES[key] = subprocess.Popen(  # nosec B603
+        [
+            "bash",
+            "-lc",
+            (
+                f"while true; do "
+                f"{shlex.quote(kubectl())} delete pod "
+                f"{shlex.quote(pod_name_for_unit(unit_name))} "
+                f"-n {shlex.quote(model_name(juju))} "
+                "--ignore-not-found=true --grace-period=0 --force "
+                ">/dev/null 2>&1 || true; "
+                "sleep 5; "
+                "done"
+            ),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
-    juju.ssh(unit_name, "sh", "-c", command, container=RABBITMQ_CONTAINER)
 
 
 def release_rabbitmq_service_stop(juju: jubilant.Juju, unit_name: str) -> None:
-    """Stop holding the RabbitMQ service down and start it again."""
-    command = (
-        f"if [ -f {RABBITMQ_STOP_LOOP_PID} ]; then "
-        f"kill $(cat {RABBITMQ_STOP_LOOP_PID}) || true; "
-        f"rm -f {RABBITMQ_STOP_LOOP_PID}; "
-        "fi; "
-        "/charm/bin/pebble start rabbitmq || true"
-    )
-    juju.ssh(unit_name, "sh", "-c", command, container=RABBITMQ_CONTAINER)
+    """Stop holding the RabbitMQ unit down and let Kubernetes recreate it."""
+    key = (model_name(juju), unit_name)
+    process = _RABBITMQ_STOP_PROCESSES.pop(key, None)
+    if process and process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=10)
 
 
 def rabbitmq_service_state(juju: jubilant.Juju, unit_name: str) -> str:

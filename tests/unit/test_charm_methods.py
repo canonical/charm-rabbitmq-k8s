@@ -958,12 +958,14 @@ def test_reconcile_running_broker_state_skips_api_before_operator_user_exists():
     fake = _fake_charm(
         _rabbitmq_running=Mock(return_value=True),
         peers=SimpleNamespace(operator_user_created=None),
+        _forget_stale_cluster_nodes=Mock(),
         _refresh_rabbitmq_version=Mock(),
         _ensure_cluster_name=Mock(),
     )
 
     charm.RabbitMQOperatorCharm._reconcile_running_broker_state(fake)
 
+    fake._forget_stale_cluster_nodes.assert_not_called()
     fake._refresh_rabbitmq_version.assert_not_called()
     fake._ensure_cluster_name.assert_not_called()
 
@@ -973,14 +975,108 @@ def test_reconcile_running_broker_state_refreshes_api_state_after_operator_user(
     fake = _fake_charm(
         _rabbitmq_running=Mock(return_value=True),
         peers=SimpleNamespace(operator_user_created="rmqadmin"),
+        _operator_user_recovery_required=Mock(return_value=False),
+        _forget_stale_cluster_nodes=Mock(),
         _refresh_rabbitmq_version=Mock(),
         _ensure_cluster_name=Mock(),
     )
 
     charm.RabbitMQOperatorCharm._reconcile_running_broker_state(fake)
 
+    fake._forget_stale_cluster_nodes.assert_called_once_with()
     fake._refresh_rabbitmq_version.assert_called_once_with()
     fake._ensure_cluster_name.assert_called_once_with()
+
+
+def test_reconcile_operator_user_recovers_missing_peer_flag():
+    """Leader should republish operator-user-created if auth already works."""
+    peers = SimpleNamespace(
+        operator_user_created=None,
+        set_operator_user_created=Mock(),
+    )
+    fake = _fake_charm(
+        unit=SimpleNamespace(is_leader=lambda: True),
+        peers=peers,
+        _rabbitmq_running=Mock(return_value=True),
+        _recover_operator_user_peer_flag=Mock(return_value=True),
+        _initialize_operator_user=Mock(),
+    )
+
+    assert charm.RabbitMQOperatorCharm._reconcile_operator_user(fake)
+
+    peers.set_operator_user_created.assert_called_once_with("operator")
+    fake._initialize_operator_user.assert_not_called()
+
+
+def test_forget_stale_cluster_nodes_removes_absent_non_running_members():
+    """Leader reconciliation should forget old disk nodes after scale-down."""
+    cluster_status = {
+        "disk_nodes": [
+            "rabbit@rabbitmq-k8s-0.rabbitmq-k8s-endpoints",
+            "rabbit@rabbitmq-k8s-1.rabbitmq-k8s-endpoints",
+            "rabbit@rabbitmq-k8s-2.rabbitmq-k8s-endpoints",
+        ],
+        "running_nodes": ["rabbit@rabbitmq-k8s-0.rabbitmq-k8s-endpoints"],
+    }
+    container = Mock()
+    container.exec.side_effect = [
+        Mock(wait_output=Mock(return_value=(json.dumps(cluster_status), ""))),
+        Mock(wait_output=Mock(return_value=("", ""))),
+        Mock(wait_output=Mock(return_value=("", ""))),
+    ]
+    fake = _fake_charm(
+        unit=SimpleNamespace(
+            is_leader=lambda: True,
+            name="rabbitmq-k8s/0",
+            get_container=Mock(return_value=container),
+        ),
+        peers=SimpleNamespace(peers_rel=SimpleNamespace(units=[])),
+        app=SimpleNamespace(
+            name="rabbitmq-k8s",
+            units=[SimpleNamespace(name="rabbitmq-k8s/0")],
+        ),
+        generate_nodename=Mock(
+            side_effect=lambda unit: (
+                f"rabbit@{unit.replace('/', '-')}.rabbitmq-k8s-endpoints"
+            )
+        ),
+    )
+
+    charm.RabbitMQOperatorCharm._forget_stale_cluster_nodes(fake)
+
+    container.exec.assert_has_calls(
+        [
+            call(
+                ["rabbitmqctl", "cluster_status", "--formatter=json"],
+                timeout=30,
+            ),
+            call(
+                [
+                    "rabbitmqctl",
+                    "forget_cluster_node",
+                    "rabbit@rabbitmq-k8s-1.rabbitmq-k8s-endpoints",
+                ],
+                timeout=5 * 60,
+            ),
+            call(
+                [
+                    "rabbitmqctl",
+                    "forget_cluster_node",
+                    "rabbit@rabbitmq-k8s-2.rabbitmq-k8s-endpoints",
+                ],
+                timeout=5 * 60,
+            ),
+        ]
+    )
+
+
+def test_forget_stale_cluster_nodes_skips_non_leader():
+    """Only the leader should perform stale cluster node cleanup."""
+    fake = _fake_charm(unit=SimpleNamespace(is_leader=lambda: False))
+
+    charm.RabbitMQOperatorCharm._forget_stale_cluster_nodes(fake)
+
+    assert not hasattr(fake.unit, "get_container")
 
 
 def test_ensure_workload_services_starts_only_required_services():
@@ -1095,6 +1191,9 @@ def test_render_rabbitmq_conf_uses_safer_defaults():
     rendered_conf = push_text_file.call_args.args[2]
     assert "cluster_partition_handling = pause_minority" in rendered_conf
     assert "disk_free_limit.absolute = 107374182" in rendered_conf
+    assert (
+        "cluster_formation.k8s.host = kubernetes.default.svc" in rendered_conf
+    )
 
 
 def test_render_rabbitmq_conf_skips_push_when_unchanged():
@@ -1367,6 +1466,26 @@ def test_render_safety_check_checks_listener_and_honours_protection_flag():
         in script
     )
     assert 'if [ "true" = "true" ]; then' in script
+
+
+def test_render_alive_check_allows_bounded_startup_grace():
+    """The alive script should tolerate broker bootstrap for a bounded period."""
+    fake = _fake_charm()
+
+    script = charm.RabbitMQOperatorCharm._render_template(
+        fake,
+        "rabbitmq-alive-check.sh.j2",
+        startup_grace_seconds=charm.RABBITMQ_STARTUP_GRACE_SECONDS,
+        safety_reason_not_running=charm.SAFETY_REASON_NOT_RUNNING,
+    )
+
+    assert "rabbitmq-diagnostics check_running" in script
+    assert "pgrep -u rabbitmq -f 'beam.smp'" in script
+    assert (
+        f'[ "$beam_age" -lt "{charm.RABBITMQ_STARTUP_GRACE_SECONDS}" ]'
+        in script
+    )
+    assert charm.SAFETY_REASON_NOT_RUNNING in script
 
 
 def test_evaluate_broker_safety_detects_local_alarms():

@@ -19,6 +19,7 @@
 
 import collections
 import functools
+import http.client
 import json
 import logging
 import re
@@ -133,8 +134,10 @@ RABBITMQ_PROMETHEUS_PORT = 15692
 RABBITMQ_PROTECTOR_MARKER = (
     f"{RABBITMQ_DATA_DIR}/.rabbitmq-protect-members-suspended"
 )
+RABBITMQ_ALIVE_CHECK_PATH = "/usr/bin/rabbitmq-alive-check"
 RABBITMQ_SAFETY_CHECK_PATH = "/usr/bin/rabbitmq-safety-check"
 HEALTH_CHECK_INTERVAL = "10s"
+RABBITMQ_STARTUP_GRACE_SECONDS = 180
 SAFETY_REASON_NOT_RUNNING = "RabbitMQ not running"
 SAFETY_REASON_LOCAL_ALARMS = "Local alarms active"
 SAFETY_REASON_CLUSTER_STATUS = "Cluster status unavailable"
@@ -454,8 +457,53 @@ class RabbitMQOperatorCharm(CharmBase):
         if self._operator_user_recovery_required():
             return
 
+        self._forget_stale_cluster_nodes()
         self._refresh_rabbitmq_version()
         self._ensure_cluster_name()
+
+    def _forget_stale_cluster_nodes(self) -> None:
+        """Forget non-running cluster members that are no longer in peer data."""
+        if not self.unit.is_leader() or self.peers.peers_rel is None:
+            return
+
+        container = self.unit.get_container(RABBITMQ_CONTAINER)
+        try:
+            process = container.exec(
+                ["rabbitmqctl", "cluster_status", "--formatter=json"],
+                timeout=30,
+            )
+            output, _ = process.wait_output()
+            cluster_status = json.loads(output)
+        except (ExecError, ModelError, json.JSONDecodeError):
+            return
+
+        expected_nodes = {
+            self.generate_nodename(unit_name)
+            for unit_name in {
+                self.unit.name,
+                *(unit.name for unit in self.peers.peers_rel.units),
+            }
+        }
+        running_nodes = set(cluster_status.get("running_nodes", []))
+        stale_nodes = [
+            node
+            for node in cluster_status.get("disk_nodes", [])
+            if node not in expected_nodes and node not in running_nodes
+        ]
+        for node in stale_nodes:
+            try:
+                process = container.exec(
+                    ["rabbitmqctl", "forget_cluster_node", node],
+                    timeout=5 * 60,
+                )
+                process.wait_output()
+            except ExecError as exc:
+                if "not in the cluster" in exc.stderr:
+                    logger.warning("Cluster node %s already absent", node)
+                    continue
+                logger.warning(
+                    "Unable to forget stale cluster node %s: %s", node, exc
+                )
 
     def _ensure_broker_running(self, event: EventBase | None = None) -> bool:
         """Ensure the local broker is running, starting it when possible."""
@@ -478,12 +526,27 @@ class RabbitMQOperatorCharm(CharmBase):
 
     def _reconcile_operator_user(self, event: EventBase | None = None) -> bool:
         """Ensure the leader has bootstrapped the operator user."""
-        if not self.unit.is_leader() or self.peers.operator_user_created:
+        if not self.unit.is_leader():
+            return True
+
+        if self.peers.operator_user_created:
             return True
 
         if not self._rabbitmq_running():
             return False
 
+        if self._recover_operator_user_peer_flag():
+            self.peers.set_operator_user_created(self._operator_user)
+            return True
+
+        return self._bootstrap_operator_user(event)
+
+    def _recover_operator_user_peer_flag(self) -> bool:
+        """Recover missing peer metadata if the operator user already works."""
+        return self._operator_user_auth_valid()
+
+    def _bootstrap_operator_user(self, event: EventBase | None = None) -> bool:
+        """Create the operator user and defer on transient bootstrap races."""
         try:
             self._initialize_operator_user()
         except requests.exceptions.HTTPError as e:
@@ -700,7 +763,7 @@ class RabbitMQOperatorCharm(CharmBase):
                     "override": "replace",
                     "level": "alive",
                     "period": HEALTH_CHECK_INTERVAL,
-                    "exec": {"command": "rabbitmq-diagnostics check_running"},
+                    "exec": {"command": RABBITMQ_ALIVE_CHECK_PATH},
                 },
                 "ready": {
                     "override": "replace",
@@ -736,16 +799,47 @@ class RabbitMQOperatorCharm(CharmBase):
             logger.warning(
                 "Ignoring transient notifier replan failure: %s", exc
             )
+        except http.client.RemoteDisconnected as exc:
+            logger.warning(
+                "Ignoring transient Pebble disconnect during replan: %s", exc
+            )
         return True
 
     def _render_and_push_workload_scripts(self) -> set[str]:
         """Render and push workload scripts, returning affected services."""
         changed_services = set()
+        self._render_and_push_alive_check()
         if self._render_and_push_pebble_notifier():
             changed_services.add(NOTIFIER_SERVICE)
         if self._render_and_push_safety_check():
             changed_services.add(NOTIFIER_SERVICE)
         return changed_services
+
+    def _render_and_push_alive_check(self) -> bool:
+        """Render the workload alive-check script."""
+        container = self.unit.get_container(RABBITMQ_CONTAINER)
+        script = self._render_template(
+            "rabbitmq-alive-check.sh.j2",
+            startup_grace_seconds=RABBITMQ_STARTUP_GRACE_SECONDS,
+            safety_reason_not_running=SAFETY_REASON_NOT_RUNNING,
+        )
+        try:
+            with container.pull(RABBITMQ_ALIVE_CHECK_PATH) as stream:
+                content = stream.read()
+        except PathError:
+            content = None
+        if content == script:
+            logger.debug("Alive-check script unchanged, skipping push")
+            return False
+        return self._push_text_file(
+            container,
+            RABBITMQ_ALIVE_CHECK_PATH,
+            script,
+            description="alive-check script",
+            permissions=0o755,
+            user=RABBITMQ_USER,
+            group=RABBITMQ_GROUP,
+        )
 
     def _ensure_workload_services(
         self,

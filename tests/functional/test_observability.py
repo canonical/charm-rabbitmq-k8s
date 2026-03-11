@@ -31,7 +31,6 @@ from .helpers import (
     wait_for_metrics_endpoint_data,
     wait_for_observability_integrations,
     wait_for_prometheus_query_result,
-    wait_for_rabbitmq_service_state,
 )
 
 
@@ -127,7 +126,6 @@ def test_rabbitmq_node_down_alert_fires_and_clears(
     unit_name = f"{rabbitmq_with_cos}/0"
 
     hold_rabbitmq_service_stopped(juju, unit_name)
-    wait_for_rabbitmq_service_state(juju, unit_name, state="inactive")
     wait_for_prometheus_query_result(
         juju, f'up{{juju_application="{rabbitmq_with_cos}"}} == 0'
     )
