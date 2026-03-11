@@ -41,7 +41,6 @@ from typing import (
 import ops
 import pwgen
 import requests
-import tenacity
 from charms.grafana_k8s.v0.grafana_dashboard import (
     GrafanaDashboardProvider,
 )
@@ -348,72 +347,89 @@ class RabbitMQOperatorCharm(CharmBase):
 
     def _on_config_changed(self, event: EventBase) -> None:
         """Update configuration for RabbitMQ."""
-        # Ensure rabbitmq container is up and pebble is ready
+        if not self._ensure_broker_running(event):
+            return
+        self._on_update_status(event)
+        self._reconcile_lb(None)
+
+    def _workload_reconcile_prerequisites(
+        self, event: EventBase | None = None
+    ) -> bool:
+        """Check whether enough state is present to reconcile the workload."""
         if not self._pebble_ready():
-            event.defer()
-            return
+            if event is not None:
+                event.defer()
+            return False
 
-        # Ensure that erlang cookie is consistent across units
         if not self.unit.is_leader() and not self.peers.erlang_cookie:
-            event.defer()
-            return
+            if event is not None:
+                event.defer()
+            return False
 
-        # Ensure operator user is created
-        if not self.unit.is_leader() and not self.peers.operator_user_created:
-            event.defer()
-            return
-
-        # Wait for the peers binding address to be ready before configuring
-        # the rabbit environment. This is due to rabbitmq-env.conf needing
-        # the unit address for peering.
         if self.peers_bind_address is None:
             logger.debug("Waiting for binding address on peers interface")
-            event.defer()
-            return
+            if event is not None:
+                event.defer()
+            return False
 
-        # Change ownership of /var/lib/rabbitmq
         if not self._set_ownership_on_data_dir():
-            # Waiting for rabbitmq-data-storage-attached event
-            self._on_update_status(event)
-            event.defer()
-            return
+            if event is not None:
+                self._on_update_status(event)
+                event.defer()
+            return False
 
-        # Render and push configuration files
+        return True
+
+    def _reconcile_workload(self, event: EventBase | None = None) -> bool:
+        """Render config, refresh Pebble layer, and ensure services are running."""
+        if not self._workload_reconcile_prerequisites(event):
+            return False
+
         try:
             self._render_and_push_config_files()
         except RabbitOperatorError as e:
             self.unit.status = BlockedStatus(str(e))
-            return
+            return False
 
-        # Render and push notifier script
         changed_services = self._render_and_push_workload_scripts()
-
-        # Ensure erlang cookie is consistent
         self._ensure_erlang_cookie()
 
-        # Get the rabbitmq container so we can configure/manipulate it
         container = self.unit.get_container(RABBITMQ_CONTAINER)
-
-        # Add initial Pebble config layer using the Pebble API
         container.add_layer("rabbitmq", self._rabbitmq_layer(), combine=True)
-
-        # Autostart any services that were defined with startup: enabled
         self._ensure_workload_services(container, changed_services)
+        return True
 
-        @tenacity.retry(
-            wait=tenacity.wait_exponential(multiplier=1, min=4, max=10)
-        )
-        def _check_rmq_running():
-            logging.info("Waiting for RabbitMQ to start")
-            if not self.rabbit_running:
-                raise tenacity.TryAgain()
-            else:
-                logging.info("RabbitMQ started")
+    def _reconcile_running_broker_state(self) -> None:
+        """Refresh broker-managed state that only exists once RabbitMQ is up."""
+        if not self._rabbitmq_running():
+            return
 
-        _check_rmq_running()
+        if not self.peers.operator_user_created:
+            return
+
+        self._refresh_rabbitmq_version()
         self._ensure_cluster_name()
-        self._on_update_status(event)
-        self._reconcile_lb(None)
+
+    def _ensure_broker_running(self, event: EventBase | None = None) -> bool:
+        """Ensure the local broker is running, starting it when possible."""
+        if self._rabbitmq_running():
+            self._reconcile_running_broker_state()
+            return True
+
+        if not self._reconcile_workload(event):
+            return False
+
+        if not self._rabbitmq_running():
+            if event is not None:
+                logger.debug(
+                    "RabbitMQ not running yet after reconciliation, deferring %s",
+                    type(event).__name__,
+                )
+                event.defer()
+            return False
+
+        self._reconcile_running_broker_state()
+        return True
 
     def _rabbitmq_layer(self) -> dict:
         """Pebble layer definition for RabbitMQ."""
@@ -523,9 +539,7 @@ class RabbitMQOperatorCharm(CharmBase):
         self, event: EventBase
     ) -> None:
         """Event handler on peers relation created."""
-        # Defer any peer relation setup until RMQ is actually running
-        if not self._rabbitmq_running():
-            event.defer()
+        if not self._ensure_broker_running(event):
             return
 
         if self.peers_bind_address is None:
@@ -644,8 +658,7 @@ class RabbitMQOperatorCharm(CharmBase):
 
     def _on_peer_relation_ready(self, event: EventBase) -> None:
         """Event handler on peers relation ready."""
-        if not self._rabbitmq_running():
-            event.defer()
+        if not self._ensure_broker_running(event):
             return
 
         if not self.peers.operator_user_created:
@@ -1487,6 +1500,9 @@ class RabbitMQOperatorCharm(CharmBase):
 
         Determine the state of the charm and set workload status.
         """
+        if self._pebble_ready() and not self._rabbitmq_running():
+            self._ensure_broker_running()
+
         if not self.peers.operator_user_created:
             self.unit.status = WaitingStatus(
                 "Waiting for leader to create operator user"
@@ -1563,17 +1579,12 @@ class RabbitMQOperatorCharm(CharmBase):
         # TODO TLS Support. Existing interfaces set ssl_port and ssl_ca
         logging.debug("Setting amqp connection information.")
 
-        # Need to have the peers binding address to be available. Rabbit
-        # units will need this in order to properly start and peer, so make
-        # sure this is available before attempting to create any credentials
-        if self.peers_bind_address is None:
-            logger.debug("Waiting for peers bind address")
-            event.defer()
-            return
-
         # NOTE: fast exit if credentials are already on the relation
         if event.relation.data[self.app].get("password"):
             logging.debug(f"Credentials already provided for {username}")
+            return
+
+        if not self._ensure_broker_running(event):
             return
         try:
             if not self.does_vhost_exist(vhost):

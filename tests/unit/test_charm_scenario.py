@@ -80,6 +80,24 @@ def _patch_config_changed_for_success(
         "resolved_disk_free_limit_bytes",
         property(lambda self: 536870912),
     )
+    monkeypatch.setattr(
+        charm_instance,
+        "_refresh_rabbitmq_version",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        charm_instance,
+        "_ensure_broker_running",
+        lambda event=None: (
+            charm_instance._reconcile_workload(event),
+            (
+                charm_instance._reconcile_running_broker_state()
+                if charm_instance.peers.operator_user_created
+                else None
+            ),
+            True,
+        )[-1],
+    )
 
 
 def test_get_operator_info_action(ctx, rabbitmq_container, networks):
@@ -188,14 +206,15 @@ def test_upgrade_charm_reconciles_and_autostarts(
     assert state_out.deferred == []
 
 
-def test_config_changed_defers_without_operator_user(
-    ctx, rabbitmq_container, networks
+def test_config_changed_proceeds_without_operator_user(
+    ctx, rabbitmq_container, networks, monkeypatch
 ):
-    """A non-leader defers config-changed until the operator user exists."""
+    """Non-leaders should still reconcile startup without operator-user state."""
     peer = testing.PeerRelation(
         endpoint="peers",
         local_app_data={
             "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
             "erlang_cookie": "magicsecurity",
         },
         local_unit_data={},
@@ -204,10 +223,11 @@ def test_config_changed_defers_without_operator_user(
         rabbitmq_container, networks, leader=False, relations=[peer]
     )
 
-    state_out = ctx.run(ctx.on.config_changed(), state)
+    with ctx(ctx.on.config_changed(), state) as manager:
+        _patch_config_changed_for_success(monkeypatch, manager.charm)
+        state_out = manager.run()
 
-    assert len(state_out.deferred) == 1
-    assert state_out.deferred[0].observer == "_on_config_changed"
+    assert state_out.deferred == []
 
 
 def test_config_changed_proceeds_for_leader_without_operator_user(
@@ -218,6 +238,7 @@ def test_config_changed_proceeds_for_leader_without_operator_user(
         endpoint="peers",
         local_app_data={
             "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
             "erlang_cookie": "magicsecurity",
         },
         local_unit_data={},
@@ -239,6 +260,7 @@ def test_config_changed_leader_updates_cluster_name(
         endpoint="peers",
         local_app_data={
             "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
             "erlang_cookie": "magicsecurity",
         },
         local_unit_data={},
@@ -475,13 +497,27 @@ def test_config_changed_defers_without_peers_bind_address(
 
 
 def test_update_status_waiting_without_operator_user(
-    ctx, rabbitmq_container, networks
+    ctx, rabbitmq_container, networks, monkeypatch
 ):
-    """Update status waits until the leader bootstraps the operator user."""
-    state = _state(rabbitmq_container, networks, leader=True)
+    """Update-status can retry startup before reporting operator-user wait."""
+    peer = testing.PeerRelation(
+        endpoint="peers",
+        local_app_data={"erlang_cookie": "magicsecurity"},
+        local_unit_data={},
+    )
+    state = _state(
+        rabbitmq_container, networks, leader=False, relations=[peer]
+    )
 
-    state_out = ctx.run(ctx.on.update_status(), state)
+    with ctx(ctx.on.update_status(), state) as manager:
+        ensure_running = Mock(return_value=True)
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: False)
+        monkeypatch.setattr(
+            manager.charm, "_ensure_broker_running", ensure_running
+        )
+        state_out = manager.run()
 
+    ensure_running.assert_called_once_with()
     assert state_out.unit_status == ops.model.WaitingStatus(
         "Waiting for leader to create operator user"
     )

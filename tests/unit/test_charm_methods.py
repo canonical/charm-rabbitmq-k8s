@@ -107,6 +107,10 @@ def _fake_charm(**kwargs):
         "does_user_exist": Mock(return_value=True),
         "create_user": Mock(return_value="new-password"),
         "set_user_permissions": Mock(),
+        "_rabbitmq_running": Mock(return_value=True),
+        "_reconcile_workload": Mock(return_value=True),
+        "_reconcile_running_broker_state": Mock(),
+        "_ensure_broker_running": Mock(return_value=True),
         "_on_update_status": Mock(),
         "generate_nodename": lambda unit_name: charm.RabbitMQOperatorCharm.generate_nodename(
             SimpleNamespace(app=SimpleNamespace(name="rabbitmq-k8s")),
@@ -701,13 +705,20 @@ def test_publish_relation_data_on_model_error():
     fake.get_hostname.assert_not_called()
 
 
-def test_on_peer_relation_connected_defers_when_rabbit_not_running():
-    """Peer relation setup waits until RabbitMQ is actually running."""
+def test_on_peer_relation_connected_attempts_recovery_before_deferring():
+    """Peer relation setup should try local startup recovery first."""
     event = Mock(defer=Mock())
-    fake = _fake_charm(_rabbitmq_running=Mock(return_value=False))
+
+    def recover(current_event):
+        current_event.defer()
+        return False
+
+    recover = Mock(side_effect=recover)
+    fake = _fake_charm(_ensure_broker_running=recover)
 
     charm.RabbitMQOperatorCharm._on_peer_relation_connected(fake, event)
 
+    recover.assert_called_once_with(event)
     event.defer.assert_called_once_with()
 
 
@@ -746,13 +757,29 @@ def test_on_peer_relation_ready_defers_until_unit_in_cluster():
     """Peer-ready waits until the joining unit is visible in the cluster."""
     event = SimpleNamespace(nodename="rabbitmq-k8s/1", defer=Mock())
     fake = _fake_charm(
-        _rabbitmq_running=Mock(return_value=True),
         peers=SimpleNamespace(operator_user_created="rmqadmin"),
         unit_in_cluster=Mock(return_value=False),
     )
 
     charm.RabbitMQOperatorCharm._on_peer_relation_ready(fake, event)
 
+    event.defer.assert_called_once_with()
+
+
+def test_on_peer_relation_ready_attempts_recovery_before_deferring():
+    """Peer-ready should try local startup recovery before deferring."""
+    event = SimpleNamespace(nodename="rabbitmq-k8s/1", defer=Mock())
+
+    def recover(current_event):
+        current_event.defer()
+        return False
+
+    recover = Mock(side_effect=recover)
+    fake = _fake_charm(_ensure_broker_running=recover)
+
+    charm.RabbitMQOperatorCharm._on_peer_relation_ready(fake, event)
+
+    recover.assert_called_once_with(event)
     event.defer.assert_called_once_with()
 
 
@@ -763,7 +790,6 @@ def test_on_peer_relation_ready_leader_rebalances_when_ready():
     unit = Mock()
     unit.is_leader.return_value = True
     fake = _fake_charm(
-        _rabbitmq_running=Mock(return_value=True),
         peers=SimpleNamespace(operator_user_created="rmqadmin"),
         unit=unit,
         unit_in_cluster=Mock(return_value=True),
@@ -938,6 +964,66 @@ def test_rabbit_running_returns_false_when_diagnostics_reports_down():
 
     assert not charm.RabbitMQOperatorCharm.rabbit_running.fget(fake)
     fake._refresh_rabbitmq_version.assert_not_called()
+
+
+def test_ensure_broker_running_recovers_and_defers_when_broker_stays_down():
+    """Startup recovery defers the current event if RabbitMQ is still down."""
+    event = Mock(defer=Mock())
+    fake = _fake_charm(
+        _rabbitmq_running=Mock(side_effect=[False, False]),
+        _reconcile_workload=Mock(return_value=True),
+        _reconcile_running_broker_state=Mock(),
+    )
+
+    assert not charm.RabbitMQOperatorCharm._ensure_broker_running(fake, event)
+    fake._reconcile_workload.assert_called_once_with(event)
+    fake._reconcile_running_broker_state.assert_not_called()
+    event.defer.assert_called_once_with()
+
+
+def test_ensure_broker_running_reconciles_broker_state_after_recovery():
+    """Startup recovery runs post-start reconciliation once RabbitMQ comes up."""
+    event = Mock(defer=Mock())
+    fake = _fake_charm(
+        _rabbitmq_running=Mock(side_effect=[False, True]),
+        _reconcile_workload=Mock(return_value=True),
+        _reconcile_running_broker_state=Mock(),
+    )
+
+    assert charm.RabbitMQOperatorCharm._ensure_broker_running(fake, event)
+    fake._reconcile_workload.assert_called_once_with(event)
+    fake._reconcile_running_broker_state.assert_called_once_with()
+    event.defer.assert_not_called()
+
+
+def test_reconcile_running_broker_state_skips_api_before_operator_user_exists():
+    """Post-start reconciliation must not hit the admin API before operator bootstrap."""
+    fake = _fake_charm(
+        _rabbitmq_running=Mock(return_value=True),
+        peers=SimpleNamespace(operator_user_created=None),
+        _refresh_rabbitmq_version=Mock(),
+        _ensure_cluster_name=Mock(),
+    )
+
+    charm.RabbitMQOperatorCharm._reconcile_running_broker_state(fake)
+
+    fake._refresh_rabbitmq_version.assert_not_called()
+    fake._ensure_cluster_name.assert_not_called()
+
+
+def test_reconcile_running_broker_state_refreshes_api_state_after_operator_user():
+    """Post-start reconciliation refreshes API-backed state once bootstrap is complete."""
+    fake = _fake_charm(
+        _rabbitmq_running=Mock(return_value=True),
+        peers=SimpleNamespace(operator_user_created="rmqadmin"),
+        _refresh_rabbitmq_version=Mock(),
+        _ensure_cluster_name=Mock(),
+    )
+
+    charm.RabbitMQOperatorCharm._reconcile_running_broker_state(fake)
+
+    fake._refresh_rabbitmq_version.assert_called_once_with()
+    fake._ensure_cluster_name.assert_called_once_with()
 
 
 @pytest.mark.parametrize(
@@ -1314,17 +1400,40 @@ def test_initialize_operator_user_creates_and_removes_guest():
     admin_api.delete_user.assert_called_once_with("guest")
 
 
-def test_create_amqp_credentials_defers_without_bind_address():
-    """AMQP credential creation waits for the peer bind address."""
-    relation = SimpleNamespace(data={object(): {}})
+def test_create_amqp_credentials_attempts_recovery_before_deferring():
+    """AMQP credential creation should try startup recovery first."""
+    app = object()
+    relation = SimpleNamespace(data={app: {}})
     event = SimpleNamespace(relation=relation, defer=Mock())
-    fake = _fake_charm(peers_bind_address=None, app=next(iter(relation.data)))
+
+    def recover(current_event):
+        current_event.defer()
+        return False
+
+    recover = Mock(side_effect=recover)
+    fake = _fake_charm(app=app, _ensure_broker_running=recover)
 
     charm.RabbitMQOperatorCharm.create_amqp_credentials(
         fake, event, "svc-user", "svc-vhost", False
     )
 
+    recover.assert_called_once_with(event)
     event.defer.assert_called_once_with()
+
+
+def test_create_amqp_credentials_fast_exit_skips_recovery():
+    """Existing AMQP credentials should not trigger startup recovery."""
+    app = object()
+    relation = SimpleNamespace(data={app: {"password": "stored-password"}})
+    event = SimpleNamespace(relation=relation, defer=Mock())
+    fake = _fake_charm(app=app)
+
+    charm.RabbitMQOperatorCharm.create_amqp_credentials(
+        fake, event, "svc-user", "svc-vhost", False
+    )
+
+    fake._ensure_broker_running.assert_not_called()
+    event.defer.assert_not_called()
 
 
 def test_create_amqp_credentials_success():
@@ -1344,6 +1453,7 @@ def test_create_amqp_credentials_success():
         fake, event, "svc-user", "svc-vhost", True
     )
 
+    fake._ensure_broker_running.assert_called_once_with(event)
     fake.create_vhost.assert_called_once_with("svc-vhost")
     fake.create_user.assert_called_once_with("svc-user")
     peers.store_password.assert_called_once_with("svc-user", "new-password")
@@ -1370,6 +1480,7 @@ def test_create_amqp_credentials_defers_on_http_401():
         fake, event, "svc-user", "svc-vhost", False
     )
 
+    fake._ensure_broker_running.assert_called_once_with(event)
     event.defer.assert_called_once_with()
 
 
