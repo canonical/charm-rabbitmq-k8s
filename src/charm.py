@@ -111,6 +111,7 @@ RABBITMQ_CONTAINER = "rabbitmq"
 RABBITMQ_SERVICE = "rabbitmq"
 RABBITMQ_USER = "rabbitmq"
 RABBITMQ_GROUP = "rabbitmq"
+RABBITMQ_STORAGE_NAME = "rabbitmq-data"
 RABBITMQ_DATA_DIR = "/var/lib/rabbitmq"
 RABBITMQ_COOKIE_PATH = "/var/lib/rabbitmq/.erlang.cookie"
 RABBITMQ_MNESIA_DIR = "/var/lib/rabbitmq/mnesia"
@@ -1062,22 +1063,7 @@ class RabbitMQOperatorCharm(CharmBase):
                 f"Failed to fetch pod {pod_name} for rabbitmq-data PVC lookup"
             ) from e
 
-        volumes = getattr(getattr(pod, "spec", None), "volumes", None) or []
-        volume = next(
-            (v for v in volumes if getattr(v, "name", "") == "rabbitmq-data"),
-            None,
-        )
-        if volume is None:
-            raise RabbitOperatorError(
-                "Failed to resolve rabbitmq-data volume from current pod"
-            )
-
-        pvc_source = getattr(volume, "persistentVolumeClaim", None)
-        claim_name = getattr(pvc_source, "claimName", None)
-        if not claim_name:
-            raise RabbitOperatorError(
-                "Failed to resolve rabbitmq-data PersistentVolumeClaim name"
-            )
+        claim_name = self._rabbitmq_data_pvc_name(pod)
 
         try:
             pvc = self.lightkube_client.get(
@@ -1104,6 +1090,60 @@ class RabbitMQOperatorCharm(CharmBase):
             raise RabbitOperatorError(
                 f"PersistentVolumeClaim {claim_name} has invalid storage capacity {storage}"
             ) from e
+
+    def _rabbitmq_data_pvc_name(self, pod: Pod) -> str:
+        """Resolve the claim name mounted at the RabbitMQ data directory."""
+        container_specs = (
+            getattr(getattr(pod, "spec", None), "containers", []) or []
+        )
+        rabbitmq_container = next(
+            (
+                c
+                for c in container_specs
+                if getattr(c, "name", "") == RABBITMQ_CONTAINER
+            ),
+            None,
+        )
+        if rabbitmq_container is None:
+            raise RabbitOperatorError(
+                f"Failed to resolve {RABBITMQ_CONTAINER} container from current pod"
+            )
+
+        volume_mounts = getattr(rabbitmq_container, "volumeMounts", []) or []
+        data_mount = next(
+            (
+                mount
+                for mount in volume_mounts
+                if getattr(mount, "mountPath", "") == RABBITMQ_DATA_DIR
+            ),
+            None,
+        )
+        if data_mount is None:
+            raise RabbitOperatorError(
+                f"Failed to resolve {RABBITMQ_DATA_DIR} mount from current pod"
+            )
+
+        volumes = getattr(getattr(pod, "spec", None), "volumes", None) or []
+        volume = next(
+            (
+                v
+                for v in volumes
+                if getattr(v, "name", "") == getattr(data_mount, "name", "")
+            ),
+            None,
+        )
+        if volume is None:
+            raise RabbitOperatorError(
+                f"Failed to resolve {RABBITMQ_STORAGE_NAME} volume from current pod"
+            )
+
+        pvc_source = getattr(volume, "persistentVolumeClaim", None)
+        claim_name = getattr(pvc_source, "claimName", None)
+        if not claim_name:
+            raise RabbitOperatorError(
+                f"Failed to resolve {RABBITMQ_STORAGE_NAME} PersistentVolumeClaim name"
+            )
+        return claim_name
 
     def _refresh_rabbitmq_version(self) -> None:
         """Refresh the cached RabbitMQ version when the management API is ready."""

@@ -97,6 +97,9 @@ def _fake_charm(**kwargs):
         "protect_members": True,
         "resolved_disk_free_limit_bytes": 536870912,
         "_rabbitmq_data_pvc_capacity_bytes": Mock(return_value=1073741824),
+        "_rabbitmq_data_pvc_name": lambda pod: charm.RabbitMQOperatorCharm._rabbitmq_data_pvc_name(  # noqa: E501
+            SimpleNamespace(), pod
+        ),
         "_bytes_from_string": lambda value: charm.RabbitMQOperatorCharm._bytes_from_string(  # noqa: E501
             SimpleNamespace(), value
         ),
@@ -1127,7 +1130,18 @@ def test_rabbitmq_data_pvc_capacity_bytes_missing_pod_raises():
 
 def test_rabbitmq_data_pvc_capacity_bytes_missing_volume_raises():
     """Missing rabbitmq-data volumes are surfaced as charm errors."""
-    pod = SimpleNamespace(spec=SimpleNamespace(volumes=[]))
+    container = SimpleNamespace(
+        name=charm.RABBITMQ_CONTAINER,
+        volumeMounts=[
+            SimpleNamespace(
+                name="rabbitmq-k8s-rabbitmq-data-e1790691",
+                mountPath=charm.RABBITMQ_DATA_DIR,
+            )
+        ],
+    )
+    pod = SimpleNamespace(
+        spec=SimpleNamespace(containers=[container], volumes=[])
+    )
     fake = _fake_charm(
         unit=SimpleNamespace(name="rabbitmq-k8s/0"),
         model=SimpleNamespace(name="test-model"),
@@ -1140,11 +1154,23 @@ def test_rabbitmq_data_pvc_capacity_bytes_missing_volume_raises():
 
 def test_rabbitmq_data_pvc_capacity_bytes_missing_pvc_raises():
     """Missing PVC lookups are surfaced as charm errors."""
+    volume_name = "rabbitmq-k8s-rabbitmq-data-e1790691"
+    container = SimpleNamespace(
+        name=charm.RABBITMQ_CONTAINER,
+        volumeMounts=[
+            SimpleNamespace(
+                name=volume_name,
+                mountPath=charm.RABBITMQ_DATA_DIR,
+            )
+        ],
+    )
     volume = SimpleNamespace(
-        name="rabbitmq-data",
+        name=volume_name,
         persistentVolumeClaim=SimpleNamespace(claimName="pvc-rabbitmq-data"),
     )
-    pod = SimpleNamespace(spec=SimpleNamespace(volumes=[volume]))
+    pod = SimpleNamespace(
+        spec=SimpleNamespace(containers=[container], volumes=[volume])
+    )
     request = httpx.Request("GET", "https://kubernetes.invalid")
     response = httpx.Response(
         404,
@@ -1169,6 +1195,25 @@ def test_rabbitmq_data_pvc_capacity_bytes_missing_pvc_raises():
                 ]
             )
         ),
+    )
+
+    with pytest.raises(charm.RabbitOperatorError):
+        charm.RabbitMQOperatorCharm._rabbitmq_data_pvc_capacity_bytes(fake)
+
+
+def test_rabbitmq_data_pvc_capacity_bytes_missing_mount_raises():
+    """Missing broker data mounts are surfaced as charm errors."""
+    container = SimpleNamespace(
+        name=charm.RABBITMQ_CONTAINER,
+        volumeMounts=[],
+    )
+    pod = SimpleNamespace(
+        spec=SimpleNamespace(containers=[container], volumes=[])
+    )
+    fake = _fake_charm(
+        unit=SimpleNamespace(name="rabbitmq-k8s/0"),
+        model=SimpleNamespace(name="test-model"),
+        lightkube_client=SimpleNamespace(get=Mock(return_value=pod)),
     )
 
     with pytest.raises(charm.RabbitOperatorError):
