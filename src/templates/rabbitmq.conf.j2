@@ -1,0 +1,26 @@
+# allowing remote connections for default user is highly discouraged
+# as it dramatically decreases the security of the system. Delete the user
+# instead and create a new one with generated secure credentials.
+loopback_users = {{ loopback_users }}
+
+# enable k8s clustering
+cluster_formation.peer_discovery_backend = k8s
+
+# SSL access to K8S API
+cluster_formation.k8s.host = kubernetes.default.svc.cluster.local
+cluster_formation.k8s.port = 443
+cluster_formation.k8s.scheme = https
+cluster_formation.k8s.service_name = {{ app_name }}-endpoints
+cluster_formation.k8s.address_type = hostname
+cluster_formation.k8s.hostname_suffix = .{{ app_name }}-endpoints
+
+# Cluster cleanup and autoheal
+cluster_formation.node_cleanup.interval = 30
+cluster_formation.node_cleanup.only_log_warning = true
+cluster_partition_handling = {{ cluster_partition_handling }}
+
+queue_master_locator = min-masters
+
+# Log to console for pod logging
+log.console = true
+log.file = false
