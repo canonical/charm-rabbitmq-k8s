@@ -14,6 +14,7 @@
 
 """Mock-driven unit tests for RabbitMQOperatorCharm helpers."""
 
+import json
 from pathlib import (
     Path,
 )
@@ -58,6 +59,13 @@ def _fake_charm(**kwargs):
         ),
         "_get_admin_api": Mock(),
         "min_replicas": lambda: 3,
+        "config": {
+            "cluster-partition-handling": "pause_minority",
+            "protect-members": True,
+            "minimum-replicas": 3,
+        },
+        "cluster_partition_handling": "pause_minority",
+        "protect_members": True,
         "peers_bind_address": "10.10.1.1",
         "get_hostname": Mock(return_value="rabbitmq-k8s-endpoints"),
         "does_vhost_exist": Mock(return_value=True),
@@ -69,6 +77,10 @@ def _fake_charm(**kwargs):
         "generate_nodename": lambda unit_name: charm.RabbitMQOperatorCharm.generate_nodename(
             SimpleNamespace(app=SimpleNamespace(name="rabbitmq-k8s")),
             unit_name,
+        ),
+        "_pebble_ready": lambda: True,
+        "_render_template": lambda template_name, **context: charm.RabbitMQOperatorCharm._render_template(
+            SimpleNamespace(), template_name, **context
         ),
     }
     base.update(kwargs)
@@ -376,7 +388,10 @@ def test_set_ownership_on_data_dir_not_mounted():
     container.exec.side_effect = ops.pebble.ExecError(
         ["mountpoint"], 1, "", "not a mountpoint"
     )
-    fake = _fake_charm(unit=Mock(get_container=Mock(return_value=container)))
+    fake = _fake_charm(
+        unit=Mock(get_container=Mock(return_value=container)),
+        _rabbitmq_running=Mock(return_value=True),
+    )
 
     result = charm.RabbitMQOperatorCharm._set_ownership_on_data_dir(fake)
 
@@ -389,7 +404,10 @@ def test_set_ownership_on_data_dir_not_mounted():
 def test_set_ownership_on_data_dir_ensure_ownership_fails():
     """Data-dir ownership stops on the first ownership failure."""
     container = Mock()
-    fake = _fake_charm(unit=Mock(get_container=Mock(return_value=container)))
+    fake = _fake_charm(
+        unit=Mock(get_container=Mock(return_value=container)),
+        _rabbitmq_running=Mock(return_value=True),
+    )
     fake._ensure_ownership = Mock(return_value=False)
 
     result = charm.RabbitMQOperatorCharm._set_ownership_on_data_dir(fake)
@@ -407,7 +425,10 @@ def test_set_ownership_on_data_dir_no_mnesia_dir():
     """The mnesia directory is created when it does not exist."""
     container = Mock()
     container.list_files.return_value = []
-    fake = _fake_charm(unit=Mock(get_container=Mock(return_value=container)))
+    fake = _fake_charm(
+        unit=Mock(get_container=Mock(return_value=container)),
+        _rabbitmq_running=Mock(return_value=True),
+    )
     fake._ensure_ownership = Mock(return_value=True)
 
     result = charm.RabbitMQOperatorCharm._set_ownership_on_data_dir(fake)
@@ -425,7 +446,10 @@ def test_set_ownership_on_data_dir_mnesia_exists():
     """Both data and mnesia ownership are enforced when mnesia exists."""
     container = Mock()
     container.list_files.return_value = [Mock()]
-    fake = _fake_charm(unit=Mock(get_container=Mock(return_value=container)))
+    fake = _fake_charm(
+        unit=Mock(get_container=Mock(return_value=container)),
+        _rabbitmq_running=Mock(return_value=True),
+    )
     fake._ensure_ownership = Mock(return_value=True)
 
     result = charm.RabbitMQOperatorCharm._set_ownership_on_data_dir(fake)
@@ -453,7 +477,10 @@ def test_set_ownership_on_data_dir_mnesia_ownership_fails():
     """A mnesia ownership failure returns False."""
     container = Mock()
     container.list_files.return_value = [Mock()]
-    fake = _fake_charm(unit=Mock(get_container=Mock(return_value=container)))
+    fake = _fake_charm(
+        unit=Mock(get_container=Mock(return_value=container)),
+        _rabbitmq_running=Mock(return_value=True),
+    )
     fake._ensure_ownership = Mock(side_effect=[True, False])
 
     result = charm.RabbitMQOperatorCharm._set_ownership_on_data_dir(fake)
@@ -828,30 +855,216 @@ def test_operator_password_sets_password_on_leader():
     peers.set_operator_password.assert_called_once_with("generated-password")
 
 
-def test_rabbit_running_uses_guest_before_operator_and_caches_version():
-    """Uses the guest fallback until the operator user exists."""
-    admin_api = Mock()
-    admin_api.overview.return_value = {"product_version": "3.12.1"}
+def test_rabbitmq_running_uses_diagnostics_instead_of_pebble_state():
+    """Broker liveness depends on rabbitmq-diagnostics, not Pebble service metadata."""
+    process = Mock(wait_output=Mock(return_value=("", "")))
+    container = Mock(exec=Mock(return_value=process))
     fake = _fake_charm(
-        peers=SimpleNamespace(operator_user_created=None),
-        _get_admin_api=Mock(return_value=admin_api),
-        _stored=SimpleNamespace(rabbitmq_version=None),
+        unit=Mock(get_container=Mock(return_value=container)),
+        _rabbitmq_running=Mock(return_value=True),
+    )
+
+    assert charm.RabbitMQOperatorCharm._rabbitmq_running(fake)
+    container.exec.assert_called_once_with(
+        ["rabbitmq-diagnostics", "check_running"], timeout=30
+    )
+
+
+def test_rabbitmq_running_returns_false_when_diagnostics_fails():
+    """Diagnostics failures report RabbitMQ as down even if the container is up."""
+    container = Mock()
+    container.exec.side_effect = ops.pebble.ExecError(
+        ["rabbitmq-diagnostics", "check_running"], 1, "", "broker stopped"
+    )
+    fake = _fake_charm(
+        unit=Mock(get_container=Mock(return_value=container)),
+        _rabbitmq_running=Mock(return_value=True),
+    )
+
+    assert not charm.RabbitMQOperatorCharm._rabbitmq_running(fake)
+
+
+def test_rabbit_running_caches_version_when_broker_is_running():
+    """The public running property refreshes version metadata opportunistically."""
+    fake = _fake_charm(
+        _rabbitmq_running=Mock(return_value=True),
+        _refresh_rabbitmq_version=Mock(),
     )
 
     assert charm.RabbitMQOperatorCharm.rabbit_running.fget(fake)
-    fake._get_admin_api.assert_called_once_with("guest", "guest")
-    assert fake._stored.rabbitmq_version == "3.12.1"
+    fake._refresh_rabbitmq_version.assert_called_once_with()
 
 
-def test_rabbit_running_returns_false_on_connection_error():
-    """Connection failures report RabbitMQ as down."""
+def test_rabbit_running_returns_false_when_diagnostics_reports_down():
+    """The public running property follows broker diagnostics."""
     fake = _fake_charm(
-        peers=SimpleNamespace(operator_user_created="rmqadmin"),
-        _get_admin_api=Mock(side_effect=FakeConnectionError("boom")),
-        _stored=SimpleNamespace(rabbitmq_version=None),
+        _rabbitmq_running=Mock(return_value=False),
+        _refresh_rabbitmq_version=Mock(),
     )
 
     assert not charm.RabbitMQOperatorCharm.rabbit_running.fget(fake)
+    fake._refresh_rabbitmq_version.assert_not_called()
+
+
+def test_render_rabbitmq_conf_uses_safer_defaults():
+    """The rendered broker config includes the new fail-closed defaults."""
+    container = Mock()
+    fake = _fake_charm(
+        unit=Mock(get_container=Mock(return_value=container)),
+        _rabbitmq_running=Mock(return_value=True),
+    )
+
+    charm.RabbitMQOperatorCharm._render_and_push_rabbitmq_conf(fake)
+
+    rendered_conf = container.push.call_args.args[1]
+    assert "cluster_partition_handling = pause_minority" in rendered_conf
+
+
+def test_render_safety_check_checks_listener_and_honours_protection_flag():
+    """The safety script checks AMQP listeners and only enforces fail-closed logic when enabled."""
+    fake = _fake_charm()
+
+    script = charm.RabbitMQOperatorCharm._render_template(
+        fake,
+        "rabbitmq-safety-check.sh.j2",
+        safety_reason_not_running=charm.SAFETY_REASON_NOT_RUNNING,
+        safety_reason_local_alarms=charm.SAFETY_REASON_LOCAL_ALARMS,
+        safety_reason_cluster_status=charm.SAFETY_REASON_CLUSTER_STATUS,
+        protect_members="true",
+        amqp_port=charm.RABBITMQ_SERVICE_PORT,
+    )
+
+    assert "listeners 2>/dev/null | grep -q ':5672'" in script
+    assert 'if [ "true" = "true" ]; then' in script
+
+
+def test_evaluate_broker_safety_detects_local_alarms():
+    """Safety evaluation is unsafe when local alarms are active."""
+    container = Mock()
+    container.exec.side_effect = [
+        ops.pebble.ExecError(
+            ["rabbitmq-diagnostics", "check_local_alarms"],
+            1,
+            "",
+            "memory alarm",
+        ),
+    ]
+    fake = _fake_charm(
+        unit=Mock(get_container=Mock(return_value=container)),
+        _rabbitmq_running=Mock(return_value=True),
+    )
+
+    safe, reason = charm.RabbitMQOperatorCharm._evaluate_broker_safety(fake)
+
+    assert not safe
+    assert reason == charm.SAFETY_REASON_LOCAL_ALARMS
+
+
+def test_evaluate_broker_safety_detects_cluster_status_failure():
+    """Safety evaluation is unsafe when cluster status cannot be fetched."""
+    container = Mock()
+    container.exec.side_effect = [
+        Mock(wait_output=Mock(return_value=("", ""))),
+        Mock(wait_output=Mock(return_value=("", ""))),
+        ops.pebble.ExecError(
+            ["rabbitmq-diagnostics", "cluster_status"],
+            1,
+            "",
+            "timeout",
+        ),
+    ]
+    fake = _fake_charm(
+        unit=Mock(get_container=Mock(return_value=container)),
+        _rabbitmq_running=Mock(return_value=True),
+    )
+
+    safe, reason = charm.RabbitMQOperatorCharm._evaluate_broker_safety(fake)
+
+    assert not safe
+    assert reason == charm.SAFETY_REASON_CLUSTER_STATUS
+
+
+def test_evaluate_broker_safety_detects_loss_of_majority():
+    """Safety evaluation is unsafe when the cluster loses majority."""
+    cluster_status = {
+        "disk_nodes": ["n1", "n2", "n3"],
+        "running_nodes": ["n1"],
+    }
+    container = Mock()
+    container.exec.side_effect = [
+        Mock(wait_output=Mock(return_value=("", ""))),
+        Mock(wait_output=Mock(return_value=(json.dumps(cluster_status), ""))),
+    ]
+    fake = _fake_charm(
+        unit=Mock(get_container=Mock(return_value=container)),
+        _rabbitmq_running=Mock(return_value=True),
+    )
+
+    safe, reason = charm.RabbitMQOperatorCharm._evaluate_broker_safety(fake)
+
+    assert not safe
+    assert reason == "Cluster lost majority (1/3 running disk nodes)"
+
+
+def test_reconcile_listener_protection_suspends_on_unsafe_transition():
+    """Unsafe units suspend listeners and create the charm marker."""
+    container = Mock()
+    container.exists.return_value = False
+    fake = _fake_charm(unit=Mock(get_container=Mock(return_value=container)))
+    fake._suspend_listeners = lambda current: charm.RabbitMQOperatorCharm._suspend_listeners(  # noqa: E501
+        fake, current
+    )
+
+    charm.RabbitMQOperatorCharm._reconcile_listener_protection(fake, False)
+
+    container.exec.assert_called_once_with(
+        ["rabbitmqctl", "suspend_listeners"], timeout=30
+    )
+    container.push.assert_called_once()
+
+
+def test_reconcile_listener_protection_resumes_only_with_charm_marker():
+    """Safe units only auto-resume listeners when the charm marker exists."""
+    container = Mock()
+    container.exists.return_value = False
+    fake = _fake_charm(unit=Mock(get_container=Mock(return_value=container)))
+    fake._resume_listeners = lambda current, context: charm.RabbitMQOperatorCharm._resume_listeners(  # noqa: E501
+        fake, current, context
+    )
+
+    charm.RabbitMQOperatorCharm._reconcile_listener_protection(fake, True)
+
+    container.exec.assert_not_called()
+
+    container.reset_mock()
+    container.exists.return_value = True
+    charm.RabbitMQOperatorCharm._reconcile_listener_protection(fake, True)
+
+    container.exec.assert_called_once_with(
+        ["rabbitmqctl", "resume_listeners"], timeout=30
+    )
+    container.remove_path.assert_called_once_with(
+        charm.RABBITMQ_PROTECTOR_MARKER
+    )
+
+
+def test_reconcile_listener_protection_skips_suspension_when_disabled():
+    """Protection disablement should not suspend listeners on unsafe states."""
+    container = Mock()
+    container.exists.return_value = False
+    fake = _fake_charm(
+        unit=Mock(get_container=Mock(return_value=container)),
+        config={
+            "cluster-partition-handling": "pause_minority",
+            "protect-members": False,
+            "minimum-replicas": 3,
+        },
+        protect_members=False,
+    )
+
+    charm.RabbitMQOperatorCharm._reconcile_listener_protection(fake, False)
+
+    container.exec.assert_not_called()
 
 
 def test_initialize_operator_user_creates_and_removes_guest():

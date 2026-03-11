@@ -64,6 +64,17 @@ def _patch_config_changed_for_success(
         "rabbit_running",
         property(lambda self: True),
     )
+    monkeypatch.setattr(charm_instance, "_rabbitmq_running", lambda: True)
+    monkeypatch.setattr(
+        charm_instance,
+        "_evaluate_broker_safety",
+        lambda: (True, "safe"),
+    )
+    monkeypatch.setattr(
+        charm_instance,
+        "_reconcile_listener_protection",
+        lambda safe: None,
+    )
 
 
 def test_get_operator_info_action(ctx, rabbitmq_container, networks):
@@ -131,6 +142,10 @@ def test_rabbitmq_pebble_ready(ctx, rabbitmq_container, networks, monkeypatch):
         "rabbitmq",
         "epmd",
         "notifier",
+    }
+    assert set(container.plan.to_dict()["checks"]) == {
+        "alive",
+        "ready",
     }
     assert (
         container.service_statuses[charm.RABBITMQ_SERVICE]
@@ -432,6 +447,17 @@ def test_update_status_active_when_relations_ready(
             "rabbit_running",
             property(lambda self: True),
         )
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: True)
+        monkeypatch.setattr(
+            manager.charm,
+            "_evaluate_broker_safety",
+            lambda: (True, "safe"),
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_reconcile_listener_protection",
+            lambda safe: None,
+        )
         monkeypatch.setattr(
             manager.charm,
             "_get_admin_api",
@@ -481,15 +507,89 @@ def test_update_status_blocked_when_rabbit_not_running(
     state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
 
     with ctx(ctx.on.update_status(), state) as manager:
-        monkeypatch.setattr(
-            type(manager.charm),
-            "rabbit_running",
-            property(lambda self: False),
-        )
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: False)
         state_out = manager.run()
 
     assert state_out.unit_status == ops.model.BlockedStatus(
         "RabbitMQ not running"
+    )
+
+
+def test_update_status_blocked_when_protection_mode_engaged(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """Unsafe-but-running units report protection mode."""
+    peer = testing.PeerRelation(
+        endpoint="peers",
+        local_app_data={
+            "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
+            "erlang_cookie": "magicsecurity",
+        },
+        local_unit_data={},
+    )
+    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
+
+    with ctx(ctx.on.update_status(), state) as manager:
+        reconcile = Mock()
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: True)
+        monkeypatch.setattr(
+            manager.charm,
+            "_evaluate_broker_safety",
+            lambda: (False, "Local alarms active"),
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_reconcile_listener_protection",
+            reconcile,
+        )
+        state_out = manager.run()
+
+    reconcile.assert_called_once_with(False)
+    assert state_out.unit_status == ops.model.BlockedStatus(
+        "Protection mode: Local alarms active"
+    )
+
+
+def test_update_status_warns_instead_of_blocking_when_protection_disabled(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """Unsafe units stay routable when automatic protection is disabled."""
+    peer = testing.PeerRelation(
+        endpoint="peers",
+        local_app_data={
+            "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
+            "erlang_cookie": "magicsecurity",
+        },
+        local_unit_data={},
+    )
+    state = testing.State(
+        leader=True,
+        relations=[peer],
+        containers=[rabbitmq_container],
+        networks=networks,
+        config={"protect-members": False},
+    )
+
+    with ctx(ctx.on.update_status(), state) as manager:
+        reconcile = Mock()
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: True)
+        monkeypatch.setattr(
+            manager.charm,
+            "_evaluate_broker_safety",
+            lambda: (False, "Local alarms active"),
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_reconcile_listener_protection",
+            reconcile,
+        )
+        state_out = manager.run()
+
+    reconcile.assert_called_once_with(False)
+    assert state_out.unit_status == ops.model.ActiveStatus(
+        "WARNING: protection disabled (Local alarms active)"
     )
 
 
@@ -513,6 +613,17 @@ def test_update_status_warns_when_queues_are_undersized(
             type(manager.charm),
             "rabbit_running",
             property(lambda self: True),
+        )
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: True)
+        monkeypatch.setattr(
+            manager.charm,
+            "_evaluate_broker_safety",
+            lambda: (True, "safe"),
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_reconcile_listener_protection",
+            lambda safe: None,
         )
         monkeypatch.setattr(
             manager.charm,
