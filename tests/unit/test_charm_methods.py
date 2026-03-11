@@ -1146,6 +1146,40 @@ def test_reconcile_workload_layer_replans_when_plan_drifts():
     container.replan.assert_called_once_with()
 
 
+def test_render_and_push_workload_scripts_only_restarts_notifier_for_notifier_changes():
+    """Only notifier script updates should mark the notifier service dirty."""
+    fake = _fake_charm(
+        _render_and_push_alive_check=Mock(return_value=True),
+        _render_and_push_pebble_notifier=Mock(return_value=False),
+        _render_and_push_safety_check=Mock(return_value=True),
+    )
+
+    changed_services = (
+        charm.RabbitMQOperatorCharm._render_and_push_workload_scripts(fake)
+    )
+
+    assert changed_services == set()
+
+    fake._render_and_push_alive_check.assert_called_once_with()
+    fake._render_and_push_pebble_notifier.assert_called_once_with()
+    fake._render_and_push_safety_check.assert_called_once_with()
+
+
+def test_render_and_push_workload_scripts_marks_notifier_when_notifier_changes():
+    """Notifier script drift should be surfaced as a notifier restart."""
+    fake = _fake_charm(
+        _render_and_push_alive_check=Mock(return_value=False),
+        _render_and_push_pebble_notifier=Mock(return_value=True),
+        _render_and_push_safety_check=Mock(return_value=False),
+    )
+
+    changed_services = (
+        charm.RabbitMQOperatorCharm._render_and_push_workload_scripts(fake)
+    )
+
+    assert changed_services == {charm.NOTIFIER_SERVICE}
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
@@ -1533,6 +1567,60 @@ def test_render_alive_check_allows_bounded_startup_grace():
         in script
     )
     assert charm.SAFETY_REASON_NOT_RUNNING in script
+
+
+def test_render_and_push_alive_check_delegates_to_push_text_file():
+    """Alive check pushes through the shared drift-detection helper."""
+    container = Mock()
+    fake = _fake_charm(
+        unit=Mock(get_container=Mock(return_value=container)),
+        _push_text_file=Mock(return_value=True),
+    )
+
+    changed = charm.RabbitMQOperatorCharm._render_and_push_alive_check(fake)
+
+    assert changed is True
+    fake._push_text_file.assert_called_once()
+    container.pull.assert_not_called()
+
+
+def test_render_and_push_safety_check_delegates_to_push_text_file():
+    """Safety check pushes through the shared drift-detection helper."""
+    container = Mock()
+    fake = _fake_charm(
+        unit=Mock(get_container=Mock(return_value=container)),
+        _push_text_file=Mock(return_value=True),
+    )
+
+    changed = charm.RabbitMQOperatorCharm._render_and_push_safety_check(fake)
+
+    assert changed is True
+    fake._push_text_file.assert_called_once()
+    container.pull.assert_not_called()
+
+
+def test_render_and_push_pebble_notifier_delegates_to_push_text_file():
+    """Notifier pushes through the shared drift-detection helper."""
+    container = Mock()
+    fake = _fake_charm(
+        unit=Mock(get_container=Mock(return_value=container)),
+        _push_text_file=Mock(return_value=True),
+        config={
+            "cluster-partition-handling": "pause_minority",
+            "disk-free-limit-bytes": "auto",
+            "protect-members": True,
+            "minimum-replicas": 3,
+            "auto-ha-frequency": 5,
+        },
+    )
+
+    changed = charm.RabbitMQOperatorCharm._render_and_push_pebble_notifier(
+        fake
+    )
+
+    assert changed is True
+    fake._push_text_file.assert_called_once()
+    container.pull.assert_not_called()
 
 
 def test_evaluate_broker_safety_detects_local_alarms():

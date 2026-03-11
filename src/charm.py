@@ -812,8 +812,7 @@ class RabbitMQOperatorCharm(CharmBase):
         self._render_and_push_alive_check()
         if self._render_and_push_pebble_notifier():
             changed_services.add(NOTIFIER_SERVICE)
-        if self._render_and_push_safety_check():
-            changed_services.add(NOTIFIER_SERVICE)
+        self._render_and_push_safety_check()
         return changed_services
 
     def _render_and_push_alive_check(self) -> bool:
@@ -824,14 +823,6 @@ class RabbitMQOperatorCharm(CharmBase):
             startup_grace_seconds=RABBITMQ_STARTUP_GRACE_SECONDS,
             safety_reason_not_running=SAFETY_REASON_NOT_RUNNING,
         )
-        try:
-            with container.pull(RABBITMQ_ALIVE_CHECK_PATH) as stream:
-                content = stream.read()
-        except PathError:
-            content = None
-        if content == script:
-            logger.debug("Alive-check script unchanged, skipping push")
-            return False
         return self._push_text_file(
             container,
             RABBITMQ_ALIVE_CHECK_PATH,
@@ -1825,14 +1816,6 @@ class RabbitMQOperatorCharm(CharmBase):
             protect_members=str(self.protect_members).lower(),
             amqp_port=RABBITMQ_SERVICE_PORT,
         )
-        try:
-            with container.pull(RABBITMQ_SAFETY_CHECK_PATH) as stream:
-                content = stream.read()
-        except PathError:
-            content = None
-        if content == script:
-            logger.debug("Safety-check script unchanged, skipping push")
-            return False
         return self._push_text_file(
             container,
             RABBITMQ_SAFETY_CHECK_PATH,
@@ -1857,14 +1840,6 @@ class RabbitMQOperatorCharm(CharmBase):
             auto_ha_frequency_seconds=auto_ha_frequency * 60,
             timer_notice=TIMER_NOTICE,
         )
-        try:
-            with container.pull("/usr/bin/notifier") as stream:
-                content = stream.read()
-        except PathError:
-            content = None
-        if content == notifier:
-            logger.debug("Notifier script unchanged, skipping push")
-            return False
         return self._push_text_file(
             container,
             "/usr/bin/notifier",
