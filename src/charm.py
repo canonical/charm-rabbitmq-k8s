@@ -99,6 +99,7 @@ from ops.model import (
     WaitingStatus,
 )
 from ops.pebble import (
+    ChangeError,
     ExecError,
     PathError,
 )
@@ -312,6 +313,12 @@ class RabbitMQOperatorCharm(CharmBase):
                         {"targets": [f"*:{RABBITMQ_PROMETHEUS_PORT}"]}
                     ]
                 }
+            ],
+            refresh_event=[
+                self.on[RABBITMQ_CONTAINER].pebble_ready,
+                self.on[METRICS_ENDPOINT_RELATION].relation_created,
+                self.on[METRICS_ENDPOINT_RELATION].relation_joined,
+                self.on[METRICS_ENDPOINT_RELATION].relation_changed,
             ],
         )
         self.grafana_dashboard_provider = GrafanaDashboardProvider(self)
@@ -637,6 +644,25 @@ class RabbitMQOperatorCharm(CharmBase):
 
         try:
             self.ensure_queue_ha()
+        except requests.exceptions.HTTPError as http_e:
+            if (
+                http_e.response is not None
+                and http_e.response.status_code == 401
+            ):
+                logger.warning(OPERATOR_USER_RECOVERY_MESSAGE)
+                if event is not None:
+                    event.defer()
+                    return False
+                return True
+            raise
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(
+                "RabbitMQ is not ready for queue reconcile, skipping. %s", e
+            )
+            if event is not None:
+                event.defer()
+                return False
+            return True
         except RabbitOperatorError as e:
             logger.debug("Queue HA reconcile skipped: %s", e)
         return True
@@ -702,7 +728,14 @@ class RabbitMQOperatorCharm(CharmBase):
             return False
 
         container.add_layer("rabbitmq", desired_layer, combine=True)
-        container.replan()
+        try:
+            container.replan()
+        except ChangeError as exc:
+            if f'Start service "{NOTIFIER_SERVICE}"' not in str(exc):
+                raise
+            logger.warning(
+                "Ignoring transient notifier replan failure: %s", exc
+            )
         return True
 
     def _render_and_push_workload_scripts(self) -> set[str]:

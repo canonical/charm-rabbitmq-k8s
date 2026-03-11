@@ -1632,6 +1632,26 @@ def test_reconcile_queue_membership_skips_when_operator_user_recovery_required()
     fake.ensure_queue_ha.assert_not_called()
 
 
+def test_reconcile_queue_membership_defers_on_unauthorized_auth():
+    """Queue reconciliation should defer instead of crashing on stale creds."""
+    event = Mock(defer=Mock())
+    response = Mock(status_code=401)
+    error = requests.exceptions.HTTPError(response=response)
+    fake = _fake_charm(
+        unit=SimpleNamespace(is_leader=lambda: True),
+        peers=SimpleNamespace(operator_user_created="operator"),
+        _manage_queues=Mock(return_value=True),
+        _rabbitmq_running=Mock(return_value=True),
+        _operator_user_recovery_required=Mock(return_value=False),
+        ensure_queue_ha=Mock(side_effect=error),
+    )
+
+    assert not charm.RabbitMQOperatorCharm._reconcile_queue_membership(
+        fake, event
+    )
+    event.defer.assert_called_once_with()
+
+
 def test_recreate_operator_user_action_blocks_when_not_leader():
     """The recovery action is leader-only."""
     event = Mock()

@@ -16,6 +16,7 @@ import jubilant
 
 from .helpers import (
     deploy_local,
+    leader_unit,
     run_action,
 )
 
@@ -34,11 +35,12 @@ def test_normal_operations(
     assert operator_info.results["operator-user"] == "operator"
     assert operator_info.results["operator-password"]
 
+    leader = leader_unit(juju, app_name)
     username = f"svc-{uuid.uuid4().hex[:8]}"
     vhost = f"vhost-{uuid.uuid4().hex[:8]}"
     service_account = run_action(
         juju,
-        f"{app_name}/0",
+        leader,
         "get-service-account",
         {"username": username, "vhost": vhost},
     )
@@ -50,7 +52,7 @@ def test_normal_operations(
 
     queue_ha = run_action(
         juju,
-        f"{app_name}/0",
+        leader,
         "ensure-queue-ha",
         {"dry-run": True},
     )
