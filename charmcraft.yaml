@@ -60,6 +60,10 @@ actions:
   get-operator-info:
     description: |
       Get information on the operator user for rabbitmq management.
+  recreate-operator-user:
+    description: |
+      Recreate the operator administrative user from the password stored in
+      peer application data.
   get-service-account:
     description: |
       Generate credentials and access for an external service.

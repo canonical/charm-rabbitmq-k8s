@@ -22,7 +22,6 @@ from types import (
     SimpleNamespace,
 )
 from unittest.mock import (
-    MagicMock,
     Mock,
     call,
     patch,
@@ -84,8 +83,12 @@ def _fake_charm(**kwargs):
             erlang_cookie=None,
             set_erlang_cookie=Mock(),
             operator_user_created=None,
+            operator_password="operator-password",
+            set_operator_user_created=Mock(),
         ),
         "_get_admin_api": Mock(),
+        "_operator_user": "operator",
+        "_operator_password": "operator-password",
         "min_replicas": lambda: 3,
         "config": {
             "cluster-partition-handling": "pause_minority",
@@ -100,6 +103,9 @@ def _fake_charm(**kwargs):
         "_rabbitmq_data_pvc_name": lambda pod: charm.RabbitMQOperatorCharm._rabbitmq_data_pvc_name(  # noqa: E501
             SimpleNamespace(), pod
         ),
+        "_push_text_file": lambda container, path, content, **kwargs: charm.RabbitMQOperatorCharm._push_text_file(  # noqa: E501
+            SimpleNamespace(), container, path, content, **kwargs
+        ),
         "_bytes_from_string": lambda value: charm.RabbitMQOperatorCharm._bytes_from_string(  # noqa: E501
             SimpleNamespace(), value
         ),
@@ -113,8 +119,12 @@ def _fake_charm(**kwargs):
         "_rabbitmq_running": Mock(return_value=True),
         "_reconcile_workload": Mock(return_value=True),
         "_reconcile_running_broker_state": Mock(),
+        "_reconcile": Mock(),
         "_ensure_broker_running": Mock(return_value=True),
+        "_ensure_relation_credentials": Mock(),
         "_on_update_status": Mock(),
+        "_operator_user_recovery_required": Mock(return_value=False),
+        "_manage_queues": Mock(return_value=True),
         "generate_nodename": lambda unit_name: charm.RabbitMQOperatorCharm.generate_nodename(
             SimpleNamespace(app=SimpleNamespace(name="rabbitmq-k8s")),
             unit_name,
@@ -709,138 +719,82 @@ def test_publish_relation_data_on_model_error():
 
 
 def test_on_peer_relation_connected_attempts_recovery_before_deferring():
-    """Peer relation setup should try local startup recovery first."""
+    """Peer relation setup delegates to the shared reconciler."""
     event = Mock(defer=Mock())
-
-    def recover(current_event):
-        current_event.defer()
-        return False
-
-    recover = Mock(side_effect=recover)
-    fake = _fake_charm(_ensure_broker_running=recover)
+    reconcile = Mock()
+    fake = _fake_charm(_reconcile=reconcile)
 
     charm.RabbitMQOperatorCharm._on_peer_relation_connected(fake, event)
 
-    recover.assert_called_once_with(event)
-    event.defer.assert_called_once_with()
+    reconcile.assert_called_once_with(event)
 
 
 def test_on_peer_relation_connected_sets_cookie_and_initializes_user():
-    """Leaders publish the cookie and initialize the operator user."""
+    """Peer relation wrapper does not bypass the holistic reconciler."""
     event = Mock(defer=Mock())
-    container = Mock()
-    cookie_file = Mock(read=Mock(return_value="magiccookie\n"))
-    container.pull.return_value = MagicMock()
-    container.pull.return_value.__enter__.return_value = cookie_file
-    container.pull.return_value.__exit__.return_value = None
-    peers = SimpleNamespace(
-        erlang_cookie=None,
-        operator_user_created=None,
-        set_erlang_cookie=Mock(),
-    )
-    unit = Mock()
-    unit.is_leader.return_value = True
-    unit.get_container.return_value = container
-    fake = _fake_charm(
-        _rabbitmq_running=Mock(return_value=True),
-        peers=peers,
-        unit=unit,
-        _initialize_operator_user=Mock(),
-        _on_update_status=Mock(),
-    )
+    reconcile = Mock()
+    fake = _fake_charm(_reconcile=reconcile)
 
     charm.RabbitMQOperatorCharm._on_peer_relation_connected(fake, event)
 
-    peers.set_erlang_cookie.assert_called_once_with("magiccookie")
-    fake._initialize_operator_user.assert_called_once_with()
-    fake._on_update_status.assert_called_once_with(event)
+    reconcile.assert_called_once_with(event)
 
 
 def test_on_peer_relation_ready_defers_until_unit_in_cluster():
-    """Peer-ready waits until the joining unit is visible in the cluster."""
+    """Peer-ready delegates to the shared reconciler."""
     event = SimpleNamespace(nodename="rabbitmq-k8s/1", defer=Mock())
-    fake = _fake_charm(
-        peers=SimpleNamespace(operator_user_created="rmqadmin"),
-        unit_in_cluster=Mock(return_value=False),
-    )
+    reconcile = Mock()
+    fake = _fake_charm(_reconcile=reconcile)
 
     charm.RabbitMQOperatorCharm._on_peer_relation_ready(fake, event)
 
-    event.defer.assert_called_once_with()
+    reconcile.assert_called_once_with(event)
 
 
 def test_on_peer_relation_ready_attempts_recovery_before_deferring():
-    """Peer-ready should try local startup recovery before deferring."""
+    """Peer-ready wrapper delegates to the shared reconciler."""
     event = SimpleNamespace(nodename="rabbitmq-k8s/1", defer=Mock())
-
-    def recover(current_event):
-        current_event.defer()
-        return False
-
-    recover = Mock(side_effect=recover)
-    fake = _fake_charm(_ensure_broker_running=recover)
+    reconcile = Mock()
+    fake = _fake_charm(_reconcile=reconcile)
 
     charm.RabbitMQOperatorCharm._on_peer_relation_ready(fake, event)
 
-    recover.assert_called_once_with(event)
-    event.defer.assert_called_once_with()
+    reconcile.assert_called_once_with(event)
 
 
 def test_on_peer_relation_ready_leader_rebalances_when_ready():
-    """Leaders grow queues and rebalance once a peer is ready."""
+    """Peer-ready wrapper delegates to the shared reconciler."""
     event = SimpleNamespace(nodename="rabbitmq-k8s/1", defer=Mock())
-    admin_api = Mock()
-    unit = Mock()
-    unit.is_leader.return_value = True
-    fake = _fake_charm(
-        peers=SimpleNamespace(operator_user_created="rmqadmin"),
-        unit=unit,
-        unit_in_cluster=Mock(return_value=True),
-        grow_queues_onto_unit=Mock(),
-        _get_admin_api=Mock(return_value=admin_api),
-        _on_update_status=Mock(),
-    )
+    reconcile = Mock()
+    fake = _fake_charm(_reconcile=reconcile)
 
     charm.RabbitMQOperatorCharm._on_peer_relation_ready(fake, event)
 
-    fake.grow_queues_onto_unit.assert_called_once_with("rabbitmq-k8s/1")
-    admin_api.rebalance_queues.assert_called_once_with()
-    fake._on_update_status.assert_called_once_with(event)
+    reconcile.assert_called_once_with(event)
 
 
 def test_on_gone_away_amqp_clients_non_leader_noop():
-    """Non-leaders do not delete AMQP users on relation removal."""
+    """AMQP relation-broken delegates to the shared reconciler."""
     relation = Mock()
     event = SimpleNamespace(relation=relation)
-    unit = Mock()
-    unit.is_leader.return_value = False
-    fake = _fake_charm(unit=unit)
+    reconcile = Mock()
+    fake = _fake_charm(_reconcile=reconcile)
 
     charm.RabbitMQOperatorCharm._on_gone_away_amqp_clients(fake, event)
 
-    fake._get_admin_api.assert_not_called()
+    reconcile.assert_called_once_with(event)
 
 
 def test_on_gone_away_amqp_clients_leader_deletes_user():
-    """Leaders clean up the user and peer password on AMQP relation removal."""
+    """AMQP relation-broken wrapper delegates to reconciliation."""
     relation = Mock()
     event = SimpleNamespace(relation=relation)
-    admin_api = Mock()
-    peers = SimpleNamespace(delete_user=Mock())
-    unit = Mock()
-    unit.is_leader.return_value = True
-    fake = _fake_charm(
-        unit=unit,
-        _get_admin_api=Mock(return_value=admin_api),
-        amqp_provider=SimpleNamespace(username=Mock(return_value="svc-user")),
-        does_user_exist=Mock(return_value=True),
-        peers=peers,
-    )
+    reconcile = Mock()
+    fake = _fake_charm(_reconcile=reconcile)
 
     charm.RabbitMQOperatorCharm._on_gone_away_amqp_clients(fake, event)
 
-    admin_api.delete_user.assert_called_once_with("svc-user")
-    peers.delete_user.assert_called_once_with("svc-user")
+    reconcile.assert_called_once_with(event)
 
 
 def test_does_user_exist_false_on_404():
@@ -985,7 +939,7 @@ def test_ensure_broker_running_recovers_and_defers_when_broker_stays_down():
 
 
 def test_ensure_broker_running_reconciles_broker_state_after_recovery():
-    """Startup recovery runs post-start reconciliation once RabbitMQ comes up."""
+    """Startup recovery ensures the local broker is started."""
     event = Mock(defer=Mock())
     fake = _fake_charm(
         _rabbitmq_running=Mock(side_effect=[False, True]),
@@ -995,7 +949,7 @@ def test_ensure_broker_running_reconciles_broker_state_after_recovery():
 
     assert charm.RabbitMQOperatorCharm._ensure_broker_running(fake, event)
     fake._reconcile_workload.assert_called_once_with(event)
-    fake._reconcile_running_broker_state.assert_called_once_with()
+    fake._reconcile_running_broker_state.assert_not_called()
     event.defer.assert_not_called()
 
 
@@ -1027,6 +981,73 @@ def test_reconcile_running_broker_state_refreshes_api_state_after_operator_user(
 
     fake._refresh_rabbitmq_version.assert_called_once_with()
     fake._ensure_cluster_name.assert_called_once_with()
+
+
+def test_ensure_workload_services_starts_only_required_services():
+    """Workload startup should only manage RabbitMQ-owned Pebble services."""
+    rabbitmq_service = Mock(is_running=Mock(return_value=False))
+    notifier_service = Mock(is_running=Mock(return_value=False))
+    container = Mock()
+    container.get_service.side_effect = lambda name: {
+        charm.RABBITMQ_SERVICE: rabbitmq_service,
+        charm.NOTIFIER_SERVICE: notifier_service,
+    }[name]
+
+    charm.RabbitMQOperatorCharm._ensure_workload_services(
+        _fake_charm(), container, set()
+    )
+
+    container.start.assert_has_calls(
+        [
+            call(charm.RABBITMQ_SERVICE),
+            call(charm.NOTIFIER_SERVICE),
+        ]
+    )
+    container.autostart.assert_not_called()
+
+
+def test_reconcile_workload_layer_skips_replan_when_plan_matches():
+    """Pebble should not be replanned when the current plan already matches."""
+    desired_layer = charm.RabbitMQOperatorCharm._rabbitmq_layer(
+        SimpleNamespace()
+    )
+    container = Mock()
+    container.get_plan.return_value.to_dict.return_value = {
+        "services": desired_layer["services"],
+        "checks": desired_layer["checks"],
+    }
+    fake = _fake_charm(_rabbitmq_layer=lambda: desired_layer)
+
+    changed = charm.RabbitMQOperatorCharm._reconcile_workload_layer(
+        fake, container
+    )
+
+    assert not changed
+    container.add_layer.assert_not_called()
+    container.replan.assert_not_called()
+
+
+def test_reconcile_workload_layer_replans_when_plan_drifts():
+    """Pebble should be replanned when desired state differs from the plan."""
+    desired_layer = charm.RabbitMQOperatorCharm._rabbitmq_layer(
+        SimpleNamespace()
+    )
+    container = Mock()
+    container.get_plan.return_value.to_dict.return_value = {
+        "services": {},
+        "checks": {},
+    }
+    fake = _fake_charm(_rabbitmq_layer=lambda: desired_layer)
+
+    changed = charm.RabbitMQOperatorCharm._reconcile_workload_layer(
+        fake, container
+    )
+
+    assert changed
+    container.add_layer.assert_called_once_with(
+        "rabbitmq", desired_layer, combine=True
+    )
+    container.replan.assert_called_once_with()
 
 
 @pytest.mark.parametrize(
@@ -1061,26 +1082,81 @@ def test_bytes_from_string_rejects_invalid_values():
 def test_render_rabbitmq_conf_uses_safer_defaults():
     """The rendered broker config includes the new fail-closed defaults."""
     container = Mock()
+    push_text_file = Mock(return_value=True)
     fake = _fake_charm(
         unit=Mock(get_container=Mock(return_value=container)),
         _rabbitmq_running=Mock(return_value=True),
         resolved_disk_free_limit_bytes=107374182,
+        _push_text_file=push_text_file,
     )
 
     charm.RabbitMQOperatorCharm._render_and_push_rabbitmq_conf(fake)
 
-    rendered_conf = container.push.call_args.args[1]
+    rendered_conf = push_text_file.call_args.args[2]
     assert "cluster_partition_handling = pause_minority" in rendered_conf
-    assert "disk_free_limit = 107374182" in rendered_conf
+    assert "disk_free_limit.absolute = 107374182" in rendered_conf
+
+
+def test_render_rabbitmq_conf_skips_push_when_unchanged():
+    """Broker config should not be rewritten when the content already matches."""
+    fake = _fake_charm(
+        resolved_disk_free_limit_bytes=107374182,
+    )
+    rabbitmq_conf = charm.RabbitMQOperatorCharm._render_template(
+        fake,
+        "rabbitmq.conf.j2",
+        loopback_users="none",
+        app_name=fake.app.name,
+        cluster_partition_handling=fake.cluster_partition_handling,
+        disk_free_limit_bytes=fake.resolved_disk_free_limit_bytes,
+    )
+    stream = Mock()
+    stream.read.return_value = rabbitmq_conf
+    stream.__enter__ = Mock(return_value=stream)
+    stream.__exit__ = Mock(return_value=None)
+    container = Mock()
+    container.pull.return_value = stream
+    fake.unit = Mock(get_container=Mock(return_value=container))
+
+    changed = charm.RabbitMQOperatorCharm._render_and_push_rabbitmq_conf(fake)
+
+    assert not changed
+    container.push.assert_not_called()
+
+
+def test_render_and_push_config_files_marks_rabbitmq_for_restart():
+    """Broker config drift should be surfaced as a RabbitMQ service change."""
+    fake = _fake_charm(
+        _render_and_push_enabled_plugins=Mock(return_value=True),
+        _render_and_push_rabbitmq_conf=Mock(return_value=False),
+        _render_and_push_rabbitmq_env=Mock(return_value=True),
+    )
+
+    changed_services = (
+        charm.RabbitMQOperatorCharm._render_and_push_config_files(fake)
+    )
+
+    assert changed_services == {charm.RABBITMQ_SERVICE}
 
 
 def test_rabbitmq_data_pvc_capacity_bytes():
     """The rabbitmq-data PVC capacity is resolved from the current unit pod."""
+    volume_name = "rabbitmq-k8s-rabbitmq-data-e1790691"
+    volume_mount = SimpleNamespace(
+        name=volume_name,
+        mountPath=charm.RABBITMQ_DATA_DIR,
+    )
+    container = SimpleNamespace(
+        name=charm.RABBITMQ_CONTAINER,
+        volumeMounts=[volume_mount],
+    )
     volume = SimpleNamespace(
-        name="rabbitmq-data",
+        name=volume_name,
         persistentVolumeClaim=SimpleNamespace(claimName="pvc-rabbitmq-data"),
     )
-    pod = SimpleNamespace(spec=SimpleNamespace(volumes=[volume]))
+    pod = SimpleNamespace(
+        spec=SimpleNamespace(containers=[container], volumes=[volume])
+    )
     pvc = SimpleNamespace(status=SimpleNamespace(capacity={"storage": "1Gi"}))
     lightkube_client = SimpleNamespace(get=Mock(side_effect=[pod, pvc]))
     fake = _fake_charm(
@@ -1286,7 +1362,10 @@ def test_render_safety_check_checks_listener_and_honours_protection_flag():
         amqp_port=charm.RABBITMQ_SERVICE_PORT,
     )
 
-    assert "listeners 2>/dev/null | grep -q ':5672'" in script
+    assert (
+        "listeners 2>/dev/null | grep -Eq '(^|[^0-9])port: 5672([^0-9]|$)'"
+        in script
+    )
     assert 'if [ "true" = "true" ]; then' in script
 
 
@@ -1445,6 +1524,141 @@ def test_initialize_operator_user_creates_and_removes_guest():
     admin_api.delete_user.assert_called_once_with("guest")
 
 
+def test_operator_user_auth_valid_detects_stale_credentials():
+    """Stale operator credentials are detected with rabbitmqctl."""
+    fake = _fake_charm(
+        _rabbitmq_running=Mock(return_value=True),
+        _run_rabbitmqctl=Mock(
+            side_effect=ops.pebble.ExecError(
+                ["rabbitmqctl", "authenticate_user"],
+                65,
+                "",
+                "invalid credentials",
+            )
+        ),
+    )
+
+    assert not charm.RabbitMQOperatorCharm._operator_user_auth_valid(fake)
+
+
+def test_operator_user_recovery_required_leader_only():
+    """Only the leader should report operator-user recovery drift."""
+    fake = _fake_charm(
+        unit=SimpleNamespace(is_leader=lambda: True),
+        peers=SimpleNamespace(
+            operator_user_created="operator",
+            operator_password="operator-password",
+            set_operator_user_created=Mock(),
+        ),
+        _operator_user_auth_valid=Mock(return_value=False),
+    )
+
+    assert charm.RabbitMQOperatorCharm._operator_user_recovery_required(fake)
+
+    follower = _fake_charm(
+        unit=SimpleNamespace(is_leader=lambda: False),
+        peers=SimpleNamespace(
+            operator_user_created="operator",
+            operator_password="operator-password",
+            set_operator_user_created=Mock(),
+        ),
+        _operator_user_auth_valid=Mock(return_value=False),
+    )
+
+    assert not charm.RabbitMQOperatorCharm._operator_user_recovery_required(
+        follower
+    )
+
+
+def test_recreate_operator_user_changes_password_when_user_exists():
+    """Recovery reuses the stored password when the user already exists."""
+    error = ops.pebble.ExecError(
+        ["rabbitmqctl", "add_user"],
+        70,
+        "",
+        "user_already_exists: operator already exists",
+    )
+    peers = SimpleNamespace(set_operator_user_created=Mock())
+    fake = _fake_charm(
+        peers=peers,
+        _run_rabbitmqctl=Mock(
+            side_effect=[
+                error,
+                ("", ""),
+                ("", ""),
+                ("", ""),
+                ("", ""),
+            ]
+        ),
+    )
+
+    charm.RabbitMQOperatorCharm._recreate_operator_user(fake)
+
+    fake._run_rabbitmqctl.assert_has_calls(
+        [
+            call("add_user", "operator", "operator-password"),
+            call("change_password", "operator", "operator-password"),
+            call("set_user_tags", "operator", "administrator"),
+            call(
+                "set_permissions",
+                "-p",
+                "/",
+                "operator",
+                ".*",
+                ".*",
+                ".*",
+            ),
+            call("delete_user", "guest"),
+        ]
+    )
+    peers.set_operator_user_created.assert_called_once_with("operator")
+
+
+def test_reconcile_queue_membership_skips_when_operator_user_recovery_required():
+    """Queue reconciliation should not crash while operator-user recovery is needed."""
+    fake = _fake_charm(
+        unit=SimpleNamespace(is_leader=lambda: True),
+        peers=SimpleNamespace(
+            operator_user_created="operator",
+            operator_password="operator-password",
+            set_operator_user_created=Mock(),
+        ),
+        _rabbitmq_running=Mock(return_value=True),
+        _operator_user_recovery_required=Mock(return_value=True),
+        ensure_queue_ha=Mock(),
+    )
+
+    assert charm.RabbitMQOperatorCharm._reconcile_queue_membership(fake)
+    fake.ensure_queue_ha.assert_not_called()
+
+
+def test_recreate_operator_user_action_blocks_when_not_leader():
+    """The recovery action is leader-only."""
+    event = Mock()
+    fake = _fake_charm(unit=SimpleNamespace(is_leader=lambda: False))
+
+    charm.RabbitMQOperatorCharm._on_recreate_operator_user_action(fake, event)
+
+    event.fail.assert_called_once_with(
+        "Not leader unit, unable to recreate operator user"
+    )
+
+
+def test_recreate_operator_user_action_succeeds():
+    """The recovery action recreates the stored operator user."""
+    event = Mock()
+    fake = _fake_charm(
+        unit=SimpleNamespace(is_leader=lambda: True),
+        _rabbitmq_running=Mock(return_value=True),
+        _recreate_operator_user=Mock(),
+    )
+
+    charm.RabbitMQOperatorCharm._on_recreate_operator_user_action(fake, event)
+
+    fake._recreate_operator_user.assert_called_once_with()
+    event.set_results.assert_called_once_with({"operator-user": "operator"})
+
+
 def test_create_amqp_credentials_attempts_recovery_before_deferring():
     """AMQP credential creation should try startup recovery first."""
     app = object()
@@ -1486,27 +1700,16 @@ def test_create_amqp_credentials_success():
     app = object()
     relation = SimpleNamespace(data={app: {}})
     event = SimpleNamespace(relation=relation, defer=Mock())
-    peers = SimpleNamespace(
-        store_password=Mock(),
-        retrieve_password=Mock(return_value="stored-password"),
-    )
-    fake = _fake_charm(app=app, peers=peers)
-    fake.does_vhost_exist.return_value = False
-    fake.does_user_exist.return_value = False
+    fake = _fake_charm(app=app)
 
     charm.RabbitMQOperatorCharm.create_amqp_credentials(
         fake, event, "svc-user", "svc-vhost", True
     )
 
     fake._ensure_broker_running.assert_called_once_with(event)
-    fake.create_vhost.assert_called_once_with("svc-vhost")
-    fake.create_user.assert_called_once_with("svc-user")
-    peers.store_password.assert_called_once_with("svc-user", "new-password")
-    fake.set_user_permissions.assert_called_once_with("svc-user", "svc-vhost")
-    assert relation.data[app] == {
-        "password": "stored-password",
-        "hostname": "rabbitmq-k8s-endpoints",
-    }
+    fake._ensure_relation_credentials.assert_called_once_with(
+        relation, "svc-user", "svc-vhost", True
+    )
 
 
 def test_create_amqp_credentials_defers_on_http_401():
@@ -1518,7 +1721,7 @@ def test_create_amqp_credentials_defers_on_http_401():
     error.response = SimpleNamespace(status_code=401)
     fake = _fake_charm(
         app=app,
-        does_vhost_exist=Mock(side_effect=error),
+        _ensure_relation_credentials=Mock(side_effect=error),
     )
 
     charm.RabbitMQOperatorCharm.create_amqp_credentials(
@@ -1753,25 +1956,19 @@ def test_get_loadbalancer_ip_returns_none_on_apierror():
 
 
 def test_reconcile_lb_sets_blocked_on_invalid_annotations():
-    """Invalid load-balancer annotations block the unit."""
+    """Invalid load-balancer annotations reconcile an empty desired state."""
     unit = Mock()
     unit.is_leader.return_value = True
+    manager = SimpleNamespace(reconcile=Mock())
     fake = _fake_charm(
         unit=unit,
         _annotations_valid=False,
-        _get_lb_resource_manager=Mock(
-            return_value=SimpleNamespace(reconcile=Mock())
-        ),
+        _get_lb_resource_manager=Mock(return_value=manager),
     )
 
     charm.RabbitMQOperatorCharm._reconcile_lb(fake, None)
 
-    assert unit.status == ops.model.BlockedStatus(
-        "Invalid config value 'loadbalancer_annotations'"
-    )
-    fake._get_lb_resource_manager.return_value.reconcile.assert_called_once_with(
-        []
-    )
+    manager.reconcile.assert_called_once_with([])
 
 
 def test_reconcile_lb_reconciles_valid_service():
