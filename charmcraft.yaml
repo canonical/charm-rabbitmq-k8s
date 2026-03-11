@@ -21,6 +21,18 @@ config:
       default: 30
       description: Frequency in minutes to check for queues that need HA members added
       type: int
+    cluster-partition-handling:
+      default: pause_minority
+      description: |
+        Strategy for RabbitMQ network partitions. Allowed values are
+        pause_minority, autoheal, and ignore.
+      type: string
+    protect-members:
+      default: true
+      description: |
+        Refuse new client traffic automatically when the unit is running but no
+        longer considered safe to serve.
+      type: boolean
     loadbalancer_annotations:
       description: |
         A comma-separated list of annotations to apply to the LoadBalancer service.

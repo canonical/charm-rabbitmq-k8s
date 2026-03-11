@@ -1,0 +1,7 @@
+#!/bin/bash
+while true; do
+    echo "Next event at $(date -d '+{{ auto_ha_frequency_minutes }} minutes')"
+    sleep {{ auto_ha_frequency_seconds }}
+    echo "Notifying operator of timer event"
+    /charm/bin/pebble notify {{ timer_notice }}
+done
