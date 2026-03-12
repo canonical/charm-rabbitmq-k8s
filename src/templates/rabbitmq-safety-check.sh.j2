@@ -1,0 +1,66 @@
+#!/bin/bash
+set -u
+
+compact_json() {
+    tr -d '\n'
+}
+
+extract_array() {
+    local payload="$1"
+    local key="$2"
+    printf '%s' "$payload" | sed -n "s/.*\\\"$key\\\":\\[\\([^]]*\\)\\].*/\\1/p"
+}
+
+count_entries() {
+    local value="$1"
+    if [ -z "$value" ]; then
+        echo 0
+        return
+    fi
+    printf '%s' "$value" | grep -o '"[^"]*"' | wc -l
+}
+
+if ! rabbitmq-diagnostics check_running >/dev/null 2>&1; then
+    echo "{{ safety_reason_not_running }}"
+    exit 1
+fi
+
+if ! rabbitmq-diagnostics listeners 2>/dev/null | grep -Eq '(^|[^0-9])port: {{ amqp_port }}([^0-9]|$)'; then
+    echo "AMQP listener unavailable"
+    exit 1
+fi
+
+if [ "{{ protect_members }}" = "true" ]; then
+    if ! rabbitmq-diagnostics check_local_alarms >/dev/null 2>&1; then
+        echo "{{ safety_reason_local_alarms }}"
+        exit 1
+    fi
+
+    cluster_status_json="$(rabbitmq-diagnostics cluster_status --formatter=json 2>/dev/null)" || {
+        echo "{{ safety_reason_cluster_status }}"
+        exit 1
+    }
+
+    cluster_status_json="$(printf '%s' "$cluster_status_json" | compact_json)"
+    if ! printf '%s' "$cluster_status_json" | grep -q '"running_nodes":\['; then
+        echo "{{ safety_reason_cluster_status }}"
+        exit 1
+    fi
+    if ! printf '%s' "$cluster_status_json" | grep -q '"disk_nodes":\['; then
+        echo "{{ safety_reason_cluster_status }}"
+        exit 1
+    fi
+
+    running_nodes="$(extract_array "$cluster_status_json" "running_nodes")"
+    disk_nodes="$(extract_array "$cluster_status_json" "disk_nodes")"
+    running_count="$(count_entries "$running_nodes")"
+    disk_count="$(count_entries "$disk_nodes")"
+    majority=$((disk_count / 2 + 1))
+
+    if [ "$running_count" -lt "$majority" ]; then
+        echo "Cluster lost majority ($running_count/$disk_count running disk nodes)"
+        exit 1
+    fi
+fi
+
+echo safe

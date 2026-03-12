@@ -19,13 +19,17 @@
 
 import collections
 import functools
+import http.client
+import json
 import logging
 import re
 import secrets
-import textwrap
 from ipaddress import (
     IPv4Address,
     IPv6Address,
+)
+from pathlib import (
+    Path,
 )
 from typing import (
     Dict,
@@ -38,7 +42,6 @@ from typing import (
 import ops
 import pwgen
 import requests
-import tenacity
 from charms.grafana_k8s.v0.grafana_dashboard import (
     GrafanaDashboardProvider,
 )
@@ -54,11 +57,16 @@ from charms.rabbitmq_k8s.v0.rabbitmq import (
 from charms.traefik_k8s.v1.ingress import (
     IngressPerAppRequirer,
 )
+from jinja2 import (
+    Environment,
+    FileSystemLoader,
+)
 from lightkube.core.client import (
     Client,
 )
 from lightkube.core.exceptions import (
     ApiError,
+    ConfigError,
 )
 from lightkube.models.core_v1 import (
     ServicePort,
@@ -68,6 +76,8 @@ from lightkube.models.meta_v1 import (
     ObjectMeta,
 )
 from lightkube.resources.core_v1 import (
+    PersistentVolumeClaim,
+    Pod,
     Service,
 )
 from lightkube_extensions.batch import (
@@ -77,6 +87,7 @@ from lightkube_extensions.batch import (
 from ops.charm import (
     ActionEvent,
     CharmBase,
+    CollectStatusEvent,
     PebbleCustomNoticeEvent,
 )
 from ops.framework import (
@@ -90,6 +101,7 @@ from ops.model import (
     WaitingStatus,
 )
 from ops.pebble import (
+    ChangeError,
     ExecError,
     PathError,
 )
@@ -103,6 +115,7 @@ RABBITMQ_CONTAINER = "rabbitmq"
 RABBITMQ_SERVICE = "rabbitmq"
 RABBITMQ_USER = "rabbitmq"
 RABBITMQ_GROUP = "rabbitmq"
+RABBITMQ_STORAGE_NAME = "rabbitmq-data"
 RABBITMQ_DATA_DIR = "/var/lib/rabbitmq"
 RABBITMQ_COOKIE_PATH = "/var/lib/rabbitmq/.erlang.cookie"
 RABBITMQ_MNESIA_DIR = "/var/lib/rabbitmq/mnesia"
@@ -112,7 +125,6 @@ SELECTOR_NONE = "none"
 SELECTOR_EVEN = "even"
 SELECTOR_INDIVIDUAL = "individual"
 
-EPMD_SERVICE = "epmd"
 NOTIFIER_SERVICE = "notifier"
 TIMER_NOTICE = "rabbitmq.local/timer"
 
@@ -120,8 +132,45 @@ LB_LABEL = "rabbitmq-loadbalancer"
 RABBITMQ_SERVICE_PORT = 5672
 RABBITMQ_MANAGEMENT_PORT = 15672
 RABBITMQ_PROMETHEUS_PORT = 15692
+RABBITMQ_PROTECTOR_MARKER = (
+    f"{RABBITMQ_DATA_DIR}/.rabbitmq-protect-members-suspended"
+)
+RABBITMQ_ALIVE_CHECK_PATH = "/usr/bin/rabbitmq-alive-check"
+RABBITMQ_SAFETY_CHECK_PATH = "/usr/bin/rabbitmq-safety-check"
+HEALTH_CHECK_INTERVAL = "10s"
+RABBITMQ_STARTUP_GRACE_SECONDS = 180
+SAFETY_REASON_NOT_RUNNING = "RabbitMQ not running"
+SAFETY_REASON_LOCAL_ALARMS = "Local alarms active"
+SAFETY_REASON_CLUSTER_STATUS = "Cluster status unavailable"
+OPERATOR_USER_RECOVERY_MESSAGE = (
+    "Operator user missing or invalid in RabbitMQ; "
+    "run recreate-operator-user action"
+)
 
 AMQP_RELATION = "amqp"
+METRICS_ENDPOINT_RELATION = "metrics-endpoint"
+VALID_CLUSTER_PARTITION_HANDLING = {
+    "pause_minority",
+    "autoheal",
+    "ignore",
+}
+BYTE_SUFFIXES = {
+    "K": 1000,
+    "KB": 1000,
+    "KI": 1024,
+    "M": 1000**2,
+    "MB": 1000**2,
+    "MI": 1024**2,
+    "G": 1000**3,
+    "GB": 1000**3,
+    "GI": 1024**3,
+    "T": 1000**4,
+    "TB": 1000**4,
+    "TI": 1024**4,
+    "P": 1000**5,
+    "PB": 1000**5,
+    "PI": 1024**5,
+}
 
 # Regex for Kubernetes annotation values:
 # - Allows alphanumeric characters, dots (.), dashes (-), and underscores (_)
@@ -154,6 +203,13 @@ DNS1123_SUBDOMAIN_PATTERN = re.compile(
 # - Example invalid: ".annotation", "annotation.", "-annotation", "annotation@key"
 QUALIFIED_NAME_PATTERN = re.compile(
     r"^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$"
+)
+
+TEMPLATES_DIR = Path(__file__).parent / "templates"
+TEMPLATE_ENV = Environment(
+    loader=FileSystemLoader(TEMPLATES_DIR),
+    autoescape=False,
+    keep_trailing_newline=True,
 )
 
 
@@ -189,16 +245,18 @@ class RabbitMQOperatorCharm(CharmBase):
         # NOTE(jamespage): This should become part of what Juju
         # does at some point in time.
         self.framework.observe(self.on.install, self._reconcile_lb)
+        self.framework.observe(self.on.rabbitmq_pebble_ready, self._reconcile)
+        self.framework.observe(self.on.upgrade_charm, self._reconcile)
+        self.framework.observe(self.on.config_changed, self._reconcile)
         self.framework.observe(
-            self.on.rabbitmq_pebble_ready, self._on_config_changed
-        )
-        self.framework.observe(self.on.config_changed, self._on_config_changed)
-        self.framework.observe(self.on.config_changed, self._reconcile_lb)
-        self.framework.observe(
-            self.on.rabbitmq_data_storage_attached, self._on_config_changed
+            self.on.rabbitmq_data_storage_attached, self._reconcile
         )
         self.framework.observe(
             self.on.get_operator_info_action, self._on_get_operator_info_action
+        )
+        self.framework.observe(
+            self.on.recreate_operator_user_action,
+            self._on_recreate_operator_user_action,
         )
         self.framework.observe(
             self.on.add_member_action, self._on_add_member_action
@@ -207,17 +265,20 @@ class RabbitMQOperatorCharm(CharmBase):
             self.on.delete_member_action, self._on_delete_member_action
         )
         self.framework.observe(self.on.update_status, self._on_update_status)
+        self.framework.observe(
+            self.on.collect_unit_status, self._on_collect_unit_status
+        )
         # Peers
         self.peers = interface_rabbitmq_peers.RabbitMQOperatorPeers(
             self, "peers"
         )
         self.framework.observe(
-            self.peers.on.connected,
-            self._on_peer_relation_connected,
+            self.on["peers"].relation_created,
+            self._reconcile,
         )
         self.framework.observe(
-            self.peers.on.ready,
-            self._on_peer_relation_ready,
+            self.on["peers"].relation_changed,
+            self._reconcile,
         )
         self.framework.observe(
             self.peers.on.leaving,
@@ -225,15 +286,19 @@ class RabbitMQOperatorCharm(CharmBase):
         )
         # AMQP Provides
         self.amqp_provider = RabbitMQProvides(
-            self, AMQP_RELATION, self.create_amqp_credentials
+            self, AMQP_RELATION, self._noop_amqp_credentials_callback
         )
         self.framework.observe(
-            self.amqp_provider.on.ready_amqp_clients,
-            self._on_ready_amqp_clients,
+            self.on[AMQP_RELATION].relation_joined,
+            self._reconcile,
         )
         self.framework.observe(
-            self.amqp_provider.on.gone_away_amqp_clients,
-            self._on_gone_away_amqp_clients,
+            self.on[AMQP_RELATION].relation_changed,
+            self._reconcile,
+        )
+        self.framework.observe(
+            self.on[AMQP_RELATION].relation_broken,
+            self._reconcile,
         )
         self.framework.observe(self.on.remove, self._on_remove)
 
@@ -252,6 +317,12 @@ class RabbitMQOperatorCharm(CharmBase):
                         {"targets": [f"*:{RABBITMQ_PROMETHEUS_PORT}"]}
                     ]
                 }
+            ],
+            refresh_event=[
+                self.on[RABBITMQ_CONTAINER].pebble_ready,
+                self.on[METRICS_ENDPOINT_RELATION].relation_created,
+                self.on[METRICS_ENDPOINT_RELATION].relation_joined,
+                self.on[METRICS_ENDPOINT_RELATION].relation_changed,
             ],
         )
         self.grafana_dashboard_provider = GrafanaDashboardProvider(self)
@@ -283,90 +354,382 @@ class RabbitMQOperatorCharm(CharmBase):
         return self.unit.get_container(RABBITMQ_CONTAINER).can_connect()
 
     def _rabbitmq_running(self) -> bool:
-        """Check whether RabbitMQ service is running."""
-        if self._pebble_ready():
-            try:
-                return (
-                    self.unit.get_container(RABBITMQ_CONTAINER)
-                    .get_service(RABBITMQ_SERVICE)
-                    .is_running()
-                )
-            except ModelError:
-                return False
-        return False
-
-    def _on_config_changed(self, event: EventBase) -> None:
-        """Update configuration for RabbitMQ."""
-        # Ensure rabbitmq container is up and pebble is ready
+        """Check whether the broker is actually running."""
         if not self._pebble_ready():
-            event.defer()
+            return False
+
+        container = self.unit.get_container(RABBITMQ_CONTAINER)
+        try:
+            process = container.exec(
+                ["rabbitmq-diagnostics", "check_running"], timeout=30
+            )
+            process.wait_output()
+        except (ExecError, ModelError):
+            return False
+        return True
+
+    def _noop_amqp_credentials_callback(self, *args, **kwargs) -> None:
+        """Disable callback-style AMQP provisioning in favor of reconciliation."""
+
+    def _reconcile(self, event: EventBase | None) -> None:
+        """Reconcile charm state from the current model and workload."""
+        if (
+            isinstance(event, PebbleCustomNoticeEvent)
+            and event.notice.key != TIMER_NOTICE
+        ):
             return
 
-        # Ensure that erlang cookie is consistent across units
+        self._reconcile_lb(None)
+
+        if not self._ensure_broker_running(event):
+            return
+
+        if not self._reconcile_operator_user(event):
+            return
+
+        self._reconcile_running_broker_state()
+
+        if not self._reconcile_amqp_relations(event):
+            return
+
+        self._cleanup_stale_amqp_users()
+
+        if not self._reconcile_queue_membership(event):
+            return
+
+        self._publish_relation_data()
+
+    def _workload_reconcile_prerequisites(
+        self, event: EventBase | None = None
+    ) -> bool:
+        """Check whether enough state is present to reconcile the workload."""
+        if not self._pebble_ready():
+            if event is not None:
+                event.defer()
+            return False
+
         if not self.unit.is_leader() and not self.peers.erlang_cookie:
-            event.defer()
-            return
+            if event is not None:
+                event.defer()
+            return False
 
-        # Ensure operator user is created
-        if not self.unit.is_leader() and not self.peers.operator_user_created:
-            event.defer()
-            return
-
-        # Wait for the peers binding address to be ready before configuring
-        # the rabbit environment. This is due to rabbitmq-env.conf needing
-        # the unit address for peering.
         if self.peers_bind_address is None:
             logger.debug("Waiting for binding address on peers interface")
-            event.defer()
-            return
+            if event is not None:
+                event.defer()
+            return False
 
-        # Change ownership of /var/lib/rabbitmq
         if not self._set_ownership_on_data_dir():
-            # Waiting for rabbitmq-data-storage-attached event
-            self._on_update_status(event)
-            event.defer()
-            return
+            if event is not None:
+                event.defer()
+            return False
 
-        # Render and push configuration files
-        self._render_and_push_config_files()
+        return True
 
-        # Render and push notifier script
-        notifier_changed = self._render_and_push_pebble_notifier()
+    def _reconcile_workload(self, event: EventBase | None = None) -> bool:
+        """Render config, refresh Pebble layer, and ensure services are running."""
+        if not self._workload_reconcile_prerequisites(event):
+            return False
 
-        # Ensure erlang cookie is consistent
+        try:
+            changed_services = self._render_and_push_config_files()
+        except RabbitOperatorError as e:
+            logger.error("Unable to render workload configuration: %s", e)
+            return False
+
+        changed_services.update(self._render_and_push_workload_scripts())
         self._ensure_erlang_cookie()
 
-        # Get the rabbitmq container so we can configure/manipulate it
         container = self.unit.get_container(RABBITMQ_CONTAINER)
-
-        # Add initial Pebble config layer using the Pebble API
-        container.add_layer("rabbitmq", self._rabbitmq_layer(), combine=True)
-
-        # Autostart any services that were defined with startup: enabled
-        if not container.get_service(RABBITMQ_SERVICE).is_running():
-            logging.info("Autostarting rabbitmq")
-            container.autostart()
-        else:
-            logging.debug("RabbitMQ service is running")
-
-        # If the notifier script has changed, restart the notifier service
-        if notifier_changed:
-            container.restart(NOTIFIER_SERVICE)
-
-        @tenacity.retry(
-            wait=tenacity.wait_exponential(multiplier=1, min=4, max=10)
+        layer_changed = self._reconcile_workload_layer(container)
+        self._ensure_workload_services(
+            container, changed_services, layer_changed=layer_changed
         )
-        def _check_rmq_running():
-            logging.info("Waiting for RabbitMQ to start")
-            if not self.rabbit_running:
-                raise tenacity.TryAgain()
-            else:
-                logging.info("RabbitMQ started")
+        return True
 
-        _check_rmq_running()
+    def _reconcile_running_broker_state(self) -> None:
+        """Refresh broker-managed state that only exists once RabbitMQ is up."""
+        if not self._rabbitmq_running():
+            return
+
+        if not self.peers.operator_user_created:
+            return
+
+        if self._operator_user_recovery_required():
+            return
+
+        self._forget_stale_cluster_nodes()
+        self._refresh_rabbitmq_version()
         self._ensure_cluster_name()
-        self._on_update_status(event)
-        self._reconcile_lb(None)
+
+    def _forget_stale_cluster_nodes(self) -> None:
+        """Forget non-running cluster members that are no longer in peer data."""
+        if not self.unit.is_leader() or self.peers.peers_rel is None:
+            return
+
+        container = self.unit.get_container(RABBITMQ_CONTAINER)
+        try:
+            process = container.exec(
+                ["rabbitmqctl", "cluster_status", "--formatter=json"],
+                timeout=30,
+            )
+            output, _ = process.wait_output()
+            cluster_status = json.loads(output)
+        except (ExecError, ModelError, json.JSONDecodeError):
+            return
+
+        expected_nodes = {
+            self.generate_nodename(unit_name)
+            for unit_name in {
+                self.unit.name,
+                *(unit.name for unit in self.peers.peers_rel.units),
+            }
+        }
+        running_nodes = set(cluster_status.get("running_nodes", []))
+        stale_nodes = [
+            node
+            for node in cluster_status.get("disk_nodes", [])
+            if node not in expected_nodes and node not in running_nodes
+        ]
+        for node in stale_nodes:
+            try:
+                process = container.exec(
+                    ["rabbitmqctl", "forget_cluster_node", node],
+                    timeout=5 * 60,
+                )
+                process.wait_output()
+            except ExecError as exc:
+                if "not in the cluster" in exc.stderr:
+                    logger.warning("Cluster node %s already absent", node)
+                    continue
+                logger.warning(
+                    "Unable to forget stale cluster node %s: %s", node, exc
+                )
+
+    def _ensure_broker_running(self, event: EventBase | None = None) -> bool:
+        """Ensure the local broker is running, starting it when possible."""
+        if self._rabbitmq_running():
+            return True
+
+        if not self._reconcile_workload(event):
+            return False
+
+        if not self._rabbitmq_running():
+            if event is not None:
+                logger.debug(
+                    "RabbitMQ not running yet after reconciliation, deferring %s",
+                    type(event).__name__,
+                )
+                event.defer()
+            return False
+
+        return True
+
+    def _reconcile_operator_user(self, event: EventBase | None = None) -> bool:
+        """Ensure the leader has bootstrapped the operator user."""
+        if not self.unit.is_leader():
+            return True
+
+        if self.peers.operator_user_created:
+            return True
+
+        if not self._rabbitmq_running():
+            return False
+
+        if self._recover_operator_user_peer_flag():
+            self.peers.set_operator_user_created(self._operator_user)
+            return True
+
+        return self._bootstrap_operator_user(event)
+
+    def _recover_operator_user_peer_flag(self) -> bool:
+        """Recover missing peer metadata if the operator user already works."""
+        return self._operator_user_auth_valid()
+
+    def _bootstrap_operator_user(self, event: EventBase | None = None) -> bool:
+        """Create the operator user and defer on transient bootstrap races."""
+        try:
+            self._initialize_operator_user()
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 401:
+                logger.warning("RabbitMQ auth not ready, deferring bootstrap")
+                if event is not None:
+                    event.defer()
+                return False
+            raise
+        except requests.exceptions.ConnectionError as e:
+            logger.warning("RabbitMQ not ready. Deferring. %s", e)
+            if event is not None:
+                event.defer()
+            return False
+        return True
+
+    def _requested_amqp_relations(
+        self,
+    ) -> list[tuple[ops.Relation, str, str, bool]]:
+        """Return AMQP relations that have requested credentials."""
+        relations = []
+        for relation in self.model.relations[AMQP_RELATION]:
+            if not relation.active:
+                continue
+            username = self.amqp_provider.username(relation)
+            vhost = self.amqp_provider.vhost(relation)
+            if not username or not vhost:
+                continue
+            relations.append(
+                (
+                    relation,
+                    username,
+                    vhost,
+                    self.amqp_provider.external_connectivity(relation),
+                )
+            )
+        return relations
+
+    def _ensure_relation_credentials(
+        self,
+        relation: ops.Relation,
+        username: str,
+        vhost: str,
+        external_connectivity: bool,
+    ) -> None:
+        """Ensure the AMQP relation has credentials and hostname."""
+        if not relation.data[self.app].get("password"):
+            if not self.does_vhost_exist(vhost):
+                self.create_vhost(vhost)
+            if not self.does_user_exist(username):
+                password = self.create_user(username)
+                self.peers.store_password(username, password)
+            password = self.peers.retrieve_password(username)
+            self.set_user_permissions(username, vhost)
+            relation.data[self.app]["password"] = password
+
+        relation.data[self.app]["hostname"] = self.get_hostname(
+            external_connectivity
+        )
+
+    def _reconcile_amqp_relations(
+        self, event: EventBase | None = None
+    ) -> bool:
+        """Ensure all active AMQP relations have the desired server state."""
+        if (
+            not self.unit.is_leader()
+            or not self.peers.operator_user_created
+            or not self._rabbitmq_running()
+        ):
+            return True
+
+        if self._operator_user_recovery_required():
+            logger.warning(OPERATOR_USER_RECOVERY_MESSAGE)
+            return True
+
+        for (
+            relation,
+            username,
+            vhost,
+            external_connectivity,
+        ) in self._requested_amqp_relations():
+            try:
+                self._ensure_relation_credentials(
+                    relation, username, vhost, external_connectivity
+                )
+            except requests.exceptions.HTTPError as http_e:
+                if (
+                    http_e.response is not None
+                    and http_e.response.status_code == 401
+                ):
+                    logger.warning(
+                        "RabbitMQ auth not ready for relation %s, deferring",
+                        relation.id,
+                    )
+                    if event is not None:
+                        event.defer()
+                    return False
+                raise
+            except requests.exceptions.ConnectionError as e:
+                logger.warning("RabbitMQ is not ready, deferring. %s", e)
+                if event is not None:
+                    event.defer()
+                return False
+        return True
+
+    def _stored_amqp_usernames(self) -> set[str]:
+        """Return usernames with passwords persisted in peer app data."""
+        if not self.peers.peers_rel:
+            return set()
+
+        reserved = {
+            interface_rabbitmq_peers.RabbitMQOperatorPeers.OPERATOR_PASSWORD,
+            interface_rabbitmq_peers.RabbitMQOperatorPeers.OPERATOR_USER_CREATED,
+            interface_rabbitmq_peers.RabbitMQOperatorPeers.ERLANG_COOKIE,
+        }
+        app_data = self.peers.peers_rel.data[self.peers.peers_rel.app]
+        return {key for key in app_data if key not in reserved}
+
+    def _cleanup_stale_amqp_users(self) -> None:
+        """Remove users that are no longer requested by any active AMQP relation."""
+        if (
+            not self.unit.is_leader()
+            or not self.peers.operator_user_created
+            or not self._rabbitmq_running()
+        ):
+            return
+
+        if self._operator_user_recovery_required():
+            logger.warning(OPERATOR_USER_RECOVERY_MESSAGE)
+            return
+
+        active_usernames = {
+            username for _, username, _, _ in self._requested_amqp_relations()
+        }
+        api = self._get_admin_api()
+        for username in self._stored_amqp_usernames():
+            if username in active_usernames:
+                continue
+            if self.does_user_exist(username):
+                api.delete_user(username)
+            self.peers.delete_user(username)
+
+    def _reconcile_queue_membership(
+        self, event: EventBase | None = None
+    ) -> bool:
+        """Ensure queue membership matches the current cluster topology."""
+        if (
+            not self.unit.is_leader()
+            or not self._manage_queues()
+            or not self.peers.operator_user_created
+            or not self._rabbitmq_running()
+        ):
+            return True
+
+        if self._operator_user_recovery_required():
+            logger.warning(OPERATOR_USER_RECOVERY_MESSAGE)
+            return True
+
+        try:
+            self.ensure_queue_ha()
+        except requests.exceptions.HTTPError as http_e:
+            if (
+                http_e.response is not None
+                and http_e.response.status_code == 401
+            ):
+                logger.warning(OPERATOR_USER_RECOVERY_MESSAGE)
+                if event is not None:
+                    event.defer()
+                    return False
+                return True
+            raise
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(
+                "RabbitMQ is not ready for queue reconcile, skipping. %s", e
+            )
+            if event is not None:
+                event.defer()
+                return False
+            return True
+        except RabbitOperatorError as e:
+            logger.debug("Queue HA reconcile skipped: %s", e)
+        return True
 
     def _rabbitmq_layer(self) -> dict:
         """Pebble layer definition for RabbitMQ."""
@@ -385,15 +748,6 @@ class RabbitMQOperatorCharm(CharmBase):
                     "startup": "enabled",
                     "user": RABBITMQ_USER,
                     "group": RABBITMQ_GROUP,
-                    "requires": [EPMD_SERVICE],
-                },
-                EPMD_SERVICE: {
-                    "override": "replace",
-                    "summary": "Erlang EPM service",
-                    "command": "epmd -d",
-                    "startup": "enabled",
-                    "user": RABBITMQ_USER,
-                    "group": RABBITMQ_GROUP,
                 },
                 NOTIFIER_SERVICE: {
                     "override": "replace",
@@ -405,7 +759,115 @@ class RabbitMQOperatorCharm(CharmBase):
                     "requires": [RABBITMQ_SERVICE],
                 },
             },
+            "checks": {
+                "alive": {
+                    "override": "replace",
+                    "level": "alive",
+                    "period": HEALTH_CHECK_INTERVAL,
+                    "exec": {"command": RABBITMQ_ALIVE_CHECK_PATH},
+                },
+                "ready": {
+                    "override": "replace",
+                    "level": "ready",
+                    "period": HEALTH_CHECK_INTERVAL,
+                    "exec": {"command": RABBITMQ_SAFETY_CHECK_PATH},
+                },
+            },
         }
+
+    def _reconcile_workload_layer(self, container: ops.Container) -> bool:
+        """Apply the desired Pebble layer only when it has drifted."""
+        desired_layer = self._rabbitmq_layer()
+        current_plan = container.get_plan().to_dict()
+        current_layer = {
+            "services": current_plan.get("services", {}),
+            "checks": current_plan.get("checks", {}),
+        }
+        desired_subset = {
+            "services": desired_layer.get("services", {}),
+            "checks": desired_layer.get("checks", {}),
+        }
+        if current_layer == desired_subset:
+            logger.debug("Pebble layer unchanged, skipping replan")
+            return False
+
+        container.add_layer("rabbitmq", desired_layer, combine=True)
+        try:
+            container.replan()
+        except ChangeError as exc:
+            if f'Start service "{NOTIFIER_SERVICE}"' not in str(exc):
+                raise
+            logger.warning(
+                "Ignoring transient notifier replan failure: %s", exc
+            )
+        except http.client.RemoteDisconnected as exc:
+            logger.warning(
+                "Ignoring transient Pebble disconnect during replan: %s", exc
+            )
+        return True
+
+    def _render_and_push_workload_scripts(self) -> set[str]:
+        """Render and push workload scripts, returning affected services."""
+        changed_services = set()
+        self._render_and_push_alive_check()
+        if self._render_and_push_pebble_notifier():
+            changed_services.add(NOTIFIER_SERVICE)
+        self._render_and_push_safety_check()
+        return changed_services
+
+    def _render_and_push_alive_check(self) -> bool:
+        """Render the workload alive-check script."""
+        container = self.unit.get_container(RABBITMQ_CONTAINER)
+        script = self._render_template(
+            "rabbitmq-alive-check.sh.j2",
+            startup_grace_seconds=RABBITMQ_STARTUP_GRACE_SECONDS,
+            safety_reason_not_running=SAFETY_REASON_NOT_RUNNING,
+        )
+        return self._push_text_file(
+            container,
+            RABBITMQ_ALIVE_CHECK_PATH,
+            script,
+            description="alive-check script",
+            permissions=0o755,
+            user=RABBITMQ_USER,
+            group=RABBITMQ_GROUP,
+        )
+
+    def _ensure_workload_services(
+        self,
+        container: ops.Container,
+        changed_services: set[str],
+        *,
+        layer_changed: bool = False,
+    ) -> None:
+        """Ensure Pebble services are started and restarted when needed."""
+        started_services = set()
+
+        if (
+            not layer_changed
+            and not container.get_service(RABBITMQ_SERVICE).is_running()
+        ):
+            logging.info("Autostarting rabbitmq")
+            container.start(RABBITMQ_SERVICE)
+            started_services.add(RABBITMQ_SERVICE)
+            for service_name in (NOTIFIER_SERVICE,):
+                container.start(service_name)
+                started_services.add(service_name)
+        elif not layer_changed:
+            logging.debug("RabbitMQ service is running")
+            for service_name in (NOTIFIER_SERVICE,):
+                if not container.get_service(service_name).is_running():
+                    container.start(service_name)
+                    started_services.add(service_name)
+
+        for service_name in changed_services - started_services:
+            if layer_changed and service_name == RABBITMQ_SERVICE:
+                continue
+            service = container.get_service(service_name)
+            if service.is_running():
+                container.restart(service_name)
+            elif not layer_changed:
+                container.start(service_name)
 
     def _on_peer_relation_leaving(  # noqa: C901
         self, event: EventBase
@@ -436,55 +898,8 @@ class RabbitMQOperatorCharm(CharmBase):
     def _on_peer_relation_connected(  # noqa: C901
         self, event: EventBase
     ) -> None:
-        """Event handler on peers relation created."""
-        # Defer any peer relation setup until RMQ is actually running
-        if not self._rabbitmq_running():
-            event.defer()
-            return
-
-        if self.peers_bind_address is None:
-            event.defer()
-            return
-
-        logging.info("Peer relation instantiated.")
-
-        if not self.peers.erlang_cookie and self.unit.is_leader():
-            logging.debug("Providing erlang cookie to cluster")
-            container = self.unit.get_container(RABBITMQ_CONTAINER)
-            try:
-                with container.pull(RABBITMQ_COOKIE_PATH) as cfile:
-                    erlang_cookie = cfile.read().rstrip()
-                self.peers.set_erlang_cookie(erlang_cookie)
-            except PathError:
-                logging.debug(
-                    "RabbitMQ not started, deferring cookie provision"
-                )
-                event.defer()
-
-        if not self.peers.operator_user_created and self.unit.is_leader():
-            logging.debug(
-                "Attempting to initialize from on peers relation created."
-            )
-            # Generate the operator user/password
-            try:
-                self._initialize_operator_user()
-                logging.debug("Operator user initialized.")
-            except requests.exceptions.HTTPError as e:
-                if e.errno == 401:
-                    logging.error("Authorization failed")
-                    raise e
-            except requests.exceptions.ConnectionError as e:
-                if "Caused by NewConnectionError" in e.__str__():
-                    logging.warning(
-                        "RabbitMQ is not ready. Deferring. {}".format(
-                            e.__str__()
-                        )
-                    )
-                    event.defer()
-                else:
-                    raise e
-
-        self._on_update_status(event)
+        """Compatibility wrapper for peer relation create/change reconciliation."""
+        self._reconcile(event)
 
     def get_queue_growth_selector(self, min_q_len: int, max_q_len: int):
         """Select a queue growth strategy.
@@ -557,25 +972,8 @@ class RabbitMQOperatorCharm(CharmBase):
             logging.error(f"Unknown selectore type {selector}")
 
     def _on_peer_relation_ready(self, event: EventBase) -> None:
-        """Event handler on peers relation ready."""
-        if not self._rabbitmq_running():
-            event.defer()
-            return
-
-        if not self.peers.operator_user_created:
-            event.defer()
-            return
-
-        if not self.unit_in_cluster(event.nodename):
-            logging.debug(f"{event.nodename} is not in cluster yet.")
-            event.defer()
-            return
-
-        if self.unit.is_leader():
-            self.grow_queues_onto_unit(event.nodename)
-            api = self._get_admin_api()
-            api.rebalance_queues()
-        self._on_update_status(event)
+        """Compatibility wrapper for peer relation create/change reconciliation."""
+        self._reconcile(event)
 
     def _on_add_member_action(self, event) -> None:
         """Handle add_member charm action."""
@@ -598,44 +996,18 @@ class RabbitMQOperatorCharm(CharmBase):
         self._on_update_status(event)
 
     def _on_ready_amqp_clients(self, event) -> None:
-        """Event handler on AMQP clients ready."""
-        self._on_update_status(event)
+        """Compatibility wrapper for AMQP relation reconciliation."""
+        self._reconcile(event)
 
     def _on_gone_away_amqp_clients(
         self, event: ops.RelationBrokenEvent
     ) -> None:
-        """Event handler on AMQP clients goneaway."""
-        if not self.unit.is_leader():
-            logging.debug("Not a leader unit, nothing to do")
-            return
-
-        api = self._get_admin_api()
-        username = self.amqp_provider.username(event.relation)
-        if username and self.does_user_exist(username):
-            api.delete_user(username)
-
-        self.peers.delete_user(username)
+        """Compatibility wrapper for AMQP relation reconciliation."""
+        self._reconcile(event)
 
     def _on_pebble_custom_notice(self, event: PebbleCustomNoticeEvent):
-        """Handle pebble custom notice event."""
-        if event.notice.key == TIMER_NOTICE:
-            if not self.unit.is_leader():
-                logger.debug("Not a leader unit, nothing to do")
-                return
-            if not self._manage_queues():
-                logger.debug("Queue management disabled, nothing to do")
-                return
-            if not self.rabbit_running:
-                logger.debug("RabbitMQ not running, deferring")
-                event.defer()
-                return
-            if not self.peers.operator_user_created:
-                logger.debug("Operator user not created, deferring")
-                event.defer()
-                return
-            self.ensure_queue_ha()
-            self._on_update_status(event)
-            return
+        """Handle the periodic notice by reconciling desired state."""
+        self._reconcile(event)
 
     @property
     def peers_bind_address(self) -> str:
@@ -845,20 +1217,11 @@ class RabbitMQOperatorCharm(CharmBase):
 
     @property
     def rabbit_running(self) -> bool:
-        """Check whether RabbitMQ is running by accessing its API."""
-        try:
-            if self.peers.operator_user_created:
-                # Use operator once created
-                api = self._get_admin_api()
-            else:
-                # Fallback to guest user during early charm lifecycle
-                api = self._get_admin_api("guest", "guest")
-            # Cache product version from overview check for later use
-            overview = api.overview()
-            self._stored.rabbitmq_version = overview.get("product_version")
-        except requests.exceptions.ConnectionError:
-            return False
-        return True
+        """Check whether RabbitMQ is running by probing the broker."""
+        running = self._rabbitmq_running()
+        if running:
+            self._refresh_rabbitmq_version()
+        return running
 
     def _ensure_cluster_name(self) -> None:
         """Ensure a stable cluster name is configured for this deployment."""
@@ -899,6 +1262,316 @@ class RabbitMQOperatorCharm(CharmBase):
             url=self._rabbitmq_mgmt_url, auth=(username, password)
         )
 
+    def _run_rabbitmqctl(
+        self, *args: str, timeout: int = 30
+    ) -> tuple[str, str]:
+        """Run a rabbitmqctl command in the workload container."""
+        container = self.unit.get_container(RABBITMQ_CONTAINER)
+        process = container.exec(["rabbitmqctl", *args], timeout=timeout)
+        return process.wait_output()
+
+    def _operator_user_auth_valid(self) -> bool:
+        """Whether the stored operator credentials are valid on the broker."""
+        if not self._operator_password:
+            return False
+        if not self._rabbitmq_running():
+            return False
+
+        try:
+            self._run_rabbitmqctl(
+                "authenticate_user",
+                self._operator_user,
+                self._operator_password,
+            )
+        except (ExecError, ModelError):
+            return False
+        return True
+
+    def _operator_user_recovery_required(self) -> bool:
+        """Whether the leader needs manual operator-user recovery."""
+        if not self.unit.is_leader():
+            return False
+        if not self.peers.operator_user_created:
+            return False
+        return not self._operator_user_auth_valid()
+
+    @property
+    def cluster_partition_handling(self) -> str:
+        """Cluster partition handling policy."""
+        value = self.config["cluster-partition-handling"]
+        if value not in VALID_CLUSTER_PARTITION_HANDLING:
+            raise RabbitOperatorError(
+                "cluster-partition-handling must be one of "
+                + ", ".join(sorted(VALID_CLUSTER_PARTITION_HANDLING))
+            )
+        return value
+
+    @property
+    def protect_members(self) -> bool:
+        """Whether fail-closed protection is enabled."""
+        return bool(self.config["protect-members"])
+
+    @property
+    def resolved_disk_free_limit_bytes(self) -> int:
+        """Return the numeric RabbitMQ disk free limit."""
+        configured = str(self.config["disk-free-limit-bytes"]).strip()
+        pvc_capacity = self._rabbitmq_data_pvc_capacity_bytes()
+        try:
+            parsed = self._bytes_from_string(configured)
+        except ValueError as e:
+            raise RabbitOperatorError(
+                f"Invalid disk-free-limit-bytes value: {configured}"
+            ) from e
+
+        if parsed == "auto":
+            resolved = int(pvc_capacity * 0.10)
+        else:
+            resolved = parsed
+
+        if resolved <= 0:
+            raise RabbitOperatorError(
+                "disk-free-limit-bytes must resolve to a value greater than 0"
+            )
+        if resolved > pvc_capacity:
+            raise RabbitOperatorError(
+                "disk-free-limit-bytes exceeds bound rabbitmq-data PVC capacity"
+            )
+        return resolved
+
+    def _bytes_from_string(self, value: str) -> int | str:
+        """Parse a raw byte value or human-readable size string."""
+        normalized = value.strip()
+        if normalized.lower() == "auto":
+            return "auto"
+        if normalized.isdigit():
+            return int(normalized)
+
+        match = re.fullmatch(
+            r"(?i)\s*(\d+)\s*([kmgtp](?:i|b)?)\s*", normalized
+        )
+        if not match:
+            raise ValueError(f"Unsupported size value: {value}")
+
+        amount = int(match.group(1))
+        suffix = match.group(2).upper()
+        return amount * BYTE_SUFFIXES[suffix]
+
+    def _rabbitmq_data_pvc_capacity_bytes(self) -> int:
+        """Resolve the bound rabbitmq-data PVC storage capacity in bytes."""
+        pod_name = self.unit.name.replace("/", "-")
+        try:
+            pod = self.lightkube_client.get(
+                Pod, name=pod_name, namespace=self.model.name
+            )
+        except ConfigError as e:
+            raise RabbitOperatorError(
+                "Failed to configure Kubernetes client for rabbitmq-data PVC lookup"
+            ) from e
+        except ApiError as e:
+            raise RabbitOperatorError(
+                f"Failed to fetch pod {pod_name} for rabbitmq-data PVC lookup"
+            ) from e
+
+        claim_name = self._rabbitmq_data_pvc_name(pod)
+
+        try:
+            pvc = self.lightkube_client.get(
+                PersistentVolumeClaim,
+                name=claim_name,
+                namespace=self.model.name,
+            )
+        except ConfigError as e:
+            raise RabbitOperatorError(
+                "Failed to configure Kubernetes client for rabbitmq-data PVC lookup"
+            ) from e
+        except ApiError as e:
+            raise RabbitOperatorError(
+                f"Failed to fetch PersistentVolumeClaim {claim_name}"
+            ) from e
+
+        storage = getattr(getattr(pvc, "status", None), "capacity", {}).get(
+            "storage"
+        )
+        if not storage:
+            raise RabbitOperatorError(
+                f"PersistentVolumeClaim {claim_name} has no storage capacity"
+            )
+
+        try:
+            return self._bytes_from_string(str(storage))
+        except ValueError as e:
+            raise RabbitOperatorError(
+                f"PersistentVolumeClaim {claim_name} has invalid storage capacity {storage}"
+            ) from e
+
+    def _rabbitmq_data_pvc_name(self, pod: Pod) -> str:
+        """Resolve the claim name mounted at the RabbitMQ data directory."""
+        container_specs = (
+            getattr(getattr(pod, "spec", None), "containers", []) or []
+        )
+        rabbitmq_container = next(
+            (
+                c
+                for c in container_specs
+                if getattr(c, "name", "") == RABBITMQ_CONTAINER
+            ),
+            None,
+        )
+        if rabbitmq_container is None:
+            raise RabbitOperatorError(
+                f"Failed to resolve {RABBITMQ_CONTAINER} container from current pod"
+            )
+
+        volume_mounts = getattr(rabbitmq_container, "volumeMounts", []) or []
+        data_mount = next(
+            (
+                mount
+                for mount in volume_mounts
+                if getattr(mount, "mountPath", "") == RABBITMQ_DATA_DIR
+            ),
+            None,
+        )
+        if data_mount is None:
+            raise RabbitOperatorError(
+                f"Failed to resolve {RABBITMQ_DATA_DIR} mount from current pod"
+            )
+
+        volumes = getattr(getattr(pod, "spec", None), "volumes", None) or []
+        volume = next(
+            (
+                v
+                for v in volumes
+                if getattr(v, "name", "") == getattr(data_mount, "name", "")
+            ),
+            None,
+        )
+        if volume is None:
+            raise RabbitOperatorError(
+                f"Failed to resolve {RABBITMQ_STORAGE_NAME} volume from current pod"
+            )
+
+        pvc_source = getattr(volume, "persistentVolumeClaim", None)
+        claim_name = getattr(pvc_source, "claimName", None)
+        if not claim_name:
+            raise RabbitOperatorError(
+                f"Failed to resolve {RABBITMQ_STORAGE_NAME} PersistentVolumeClaim name"
+            )
+        return claim_name
+
+    def _refresh_rabbitmq_version(self) -> None:
+        """Refresh the cached RabbitMQ version when the management API is ready."""
+        try:
+            if self.peers.operator_user_created:
+                api = self._get_admin_api()
+            else:
+                api = self._get_admin_api("guest", "guest")
+            overview = api.overview()
+        except (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.HTTPError,
+        ):
+            return
+        self._stored.rabbitmq_version = overview.get("product_version")
+
+    def _evaluate_broker_safety(self) -> tuple[bool, str]:
+        """Determine whether the unit is safe to keep accepting traffic."""
+        if not self._rabbitmq_running():
+            return False, SAFETY_REASON_NOT_RUNNING
+
+        container = self.unit.get_container(RABBITMQ_CONTAINER)
+
+        try:
+            process = container.exec(
+                ["rabbitmq-diagnostics", "check_local_alarms"], timeout=30
+            )
+            process.wait_output()
+        except (ExecError, ModelError):
+            return False, SAFETY_REASON_LOCAL_ALARMS
+
+        try:
+            process = container.exec(
+                [
+                    "rabbitmq-diagnostics",
+                    "cluster_status",
+                    "--formatter=json",
+                ],
+                timeout=30,
+            )
+            output, _ = process.wait_output()
+            cluster_status = json.loads(output)
+        except (ExecError, ModelError, json.JSONDecodeError):
+            return False, SAFETY_REASON_CLUSTER_STATUS
+
+        disk_nodes = cluster_status.get("disk_nodes", [])
+        running_nodes = cluster_status.get("running_nodes", [])
+        majority = len(disk_nodes) // 2 + 1
+        if len(running_nodes) < majority:
+            return (
+                False,
+                "Cluster lost majority "
+                f"({len(running_nodes)}/{len(disk_nodes)} running disk nodes)",
+            )
+        return True, "safe"
+
+    def _reconcile_listener_protection(self, safe: bool) -> None:
+        """Suspend or resume listeners based on safety state."""
+        if not self._pebble_ready():
+            return
+
+        container = self.unit.get_container(RABBITMQ_CONTAINER)
+        marker_exists = container.exists(RABBITMQ_PROTECTOR_MARKER)
+        protect_members = self.protect_members
+
+        if safe:
+            if not marker_exists:
+                return
+            self._resume_listeners(container, "after safety recovered")
+            return
+
+        if not protect_members:
+            if marker_exists:
+                self._resume_listeners(container, "while disabling protection")
+            return
+
+        if marker_exists:
+            return
+
+        self._suspend_listeners(container)
+
+    def _resume_listeners(
+        self, container: ops.Container, context: str
+    ) -> None:
+        """Resume listeners and clear the charm marker."""
+        try:
+            container.exec(
+                ["rabbitmqctl", "resume_listeners"], timeout=30
+            ).wait_output()
+            container.remove_path(RABBITMQ_PROTECTOR_MARKER)
+        except (ExecError, PathError):
+            logger.warning(
+                "Failed to resume listeners %s", context, exc_info=True
+            )
+
+    def _suspend_listeners(self, container: ops.Container) -> None:
+        """Suspend listeners and write the charm marker."""
+        try:
+            container.exec(
+                ["rabbitmqctl", "suspend_listeners"], timeout=30
+            ).wait_output()
+            container.push(
+                RABBITMQ_PROTECTOR_MARKER,
+                "suspended-by-charm\n",
+                user=RABBITMQ_USER,
+                group=RABBITMQ_GROUP,
+                permissions=0o640,
+                make_dirs=True,
+            )
+        except ExecError:
+            logger.warning(
+                "Failed to suspend listeners while entering protection mode",
+                exc_info=True,
+            )
+
     def _initialize_operator_user(self) -> None:
         """Initialize the operator administrative user.
 
@@ -926,6 +1599,47 @@ class RabbitMQOperatorCharm(CharmBase):
         # We do not want to leave a known user/pass available
         logging.warning("Deleting the guest user.")
         api.delete_user("guest")
+
+    def _recreate_operator_user(self) -> None:
+        """Recreate the operator administrative user from peer data."""
+        password = self._operator_password
+        if not password:
+            raise RabbitOperatorError("Operator password not available")
+
+        try:
+            self._run_rabbitmqctl("add_user", self._operator_user, password)
+        except ExecError as e:
+            output = f"{e.stdout}\n{e.stderr}".lower()
+            if "already exists" not in output:
+                raise RabbitOperatorError(
+                    f"Failed to add operator user: {e.stderr or e.stdout}"
+                ) from e
+            self._run_rabbitmqctl(
+                "change_password", self._operator_user, password
+            )
+
+        self._run_rabbitmqctl(
+            "set_user_tags", self._operator_user, "administrator"
+        )
+        self._run_rabbitmqctl(
+            "set_permissions",
+            "-p",
+            "/",
+            self._operator_user,
+            ".*",
+            ".*",
+            ".*",
+        )
+        try:
+            self._run_rabbitmqctl("delete_user", "guest")
+        except ExecError as e:
+            output = f"{e.stdout}\n{e.stderr}".lower()
+            if "does not exist" not in output and "no_such_user" not in output:
+                raise RabbitOperatorError(
+                    f"Failed to delete guest user: {e.stderr or e.stdout}"
+                ) from e
+
+        self.peers.set_operator_user_created(self._operator_user)
 
     def _ensure_ownership(
         self, container: ops.Container, path: str, user: str, group: str
@@ -1017,17 +1731,46 @@ class RabbitMQOperatorCharm(CharmBase):
             # relation is present.
             self.peers.set_erlang_cookie(cookie)
 
-    def _render_and_push_config_files(self) -> None:
+    def _render_and_push_config_files(self) -> set[str]:
         """Render and push configuration files.
 
         Allow calling one utility function to render and push all required
         files. Calls specific render and push methods.
         """
-        self._render_and_push_enabled_plugins()
-        self._render_and_push_rabbitmq_conf()
-        self._render_and_push_rabbitmq_env()
+        changed_services = set()
+        if self._render_and_push_enabled_plugins():
+            changed_services.add(RABBITMQ_SERVICE)
+        if self._render_and_push_rabbitmq_conf():
+            changed_services.add(RABBITMQ_SERVICE)
+        if self._render_and_push_rabbitmq_env():
+            changed_services.add(RABBITMQ_SERVICE)
+        return changed_services
 
-    def _render_and_push_enabled_plugins(self) -> None:
+    def _push_text_file(
+        self,
+        container: ops.Container,
+        path: str,
+        content: str,
+        *,
+        description: str,
+        **kwargs,
+    ) -> bool:
+        """Push a workload file only when its content has changed."""
+        try:
+            with container.pull(path) as stream:
+                current_content = stream.read()
+        except PathError:
+            current_content = None
+
+        if current_content == content:
+            logger.debug("%s unchanged, skipping push", description)
+            return False
+
+        logger.info("Pushing new %s", description)
+        container.push(path, content, make_dirs=True, **kwargs)
+        return True
+
+    def _render_and_push_enabled_plugins(self) -> bool:
         """Render and push enabled plugins config.
 
         Render enabled plugins and push to the workload container.
@@ -1035,51 +1778,52 @@ class RabbitMQOperatorCharm(CharmBase):
         container = self.unit.get_container(RABBITMQ_CONTAINER)
         enabled_plugins = ",".join(self._stored.enabled_plugins)
         enabled_plugins_template = f"[{enabled_plugins}]."
-        logger.info("Pushing new enabled_plugins")
-        container.push(
+        return self._push_text_file(
+            container,
             "/etc/rabbitmq/enabled_plugins",
             enabled_plugins_template,
-            make_dirs=True,
+            description="enabled_plugins",
         )
 
-    def _render_and_push_rabbitmq_conf(self) -> None:
+    def _render_and_push_rabbitmq_conf(self) -> bool:
         """Render and push rabbitmq conf.
 
         Render rabbitmq conf and push to the workload container.
         """
         container = self.unit.get_container(RABBITMQ_CONTAINER)
-        loopback_users = "none"
-        rabbitmq_conf = f"""
-# allowing remote connections for default user is highly discouraged
-# as it dramatically decreases the security of the system. Delete the user
-# instead and create a new one with generated secure credentials.
-loopback_users = {loopback_users}
+        rabbitmq_conf = self._render_template(
+            "rabbitmq.conf.j2",
+            loopback_users="none",
+            app_name=self.app.name,
+            cluster_partition_handling=self.cluster_partition_handling,
+            disk_free_limit_bytes=self.resolved_disk_free_limit_bytes,
+        )
+        return self._push_text_file(
+            container,
+            "/etc/rabbitmq/rabbitmq.conf",
+            rabbitmq_conf,
+            description="rabbitmq.conf",
+        )
 
-# enable k8s clustering
-cluster_formation.peer_discovery_backend = k8s
-
-# SSL access to K8S API
-cluster_formation.k8s.host = kubernetes.default.svc.cluster.local
-cluster_formation.k8s.port = 443
-cluster_formation.k8s.scheme = https
-cluster_formation.k8s.service_name = {self.app.name}-endpoints
-cluster_formation.k8s.address_type = hostname
-cluster_formation.k8s.hostname_suffix = .{self.app.name}-endpoints
-
-# Cluster cleanup and autoheal
-cluster_formation.node_cleanup.interval = 30
-cluster_formation.node_cleanup.only_log_warning = true
-cluster_partition_handling = autoheal
-
-queue_master_locator = min-masters
-
-# Log to console for pod logging
-log.console = true
-log.file = false
-"""
-        logger.info("Pushing new rabbitmq.conf")
-        container.push(
-            "/etc/rabbitmq/rabbitmq.conf", rabbitmq_conf, make_dirs=True
+    def _render_and_push_safety_check(self) -> bool:
+        """Render the workload safety-check script."""
+        container = self.unit.get_container(RABBITMQ_CONTAINER)
+        script = self._render_template(
+            "rabbitmq-safety-check.sh.j2",
+            safety_reason_not_running=SAFETY_REASON_NOT_RUNNING,
+            safety_reason_local_alarms=SAFETY_REASON_LOCAL_ALARMS,
+            safety_reason_cluster_status=SAFETY_REASON_CLUSTER_STATUS,
+            protect_members=str(self.protect_members).lower(),
+            amqp_port=RABBITMQ_SERVICE_PORT,
+        )
+        return self._push_text_file(
+            container,
+            RABBITMQ_SAFETY_CHECK_PATH,
+            script,
+            description="safety-check script",
+            permissions=0o755,
+            user=RABBITMQ_USER,
+            group=RABBITMQ_GROUP,
         )
 
     def _render_and_push_pebble_notifier(self) -> bool:
@@ -1090,27 +1834,19 @@ log.file = false
             logger.error(msg)
             raise RabbitOperatorError(msg)
         container = self.unit.get_container(RABBITMQ_CONTAINER)
-        notifier = textwrap.dedent(f"""#!/bin/bash
-            while true; do
-                echo "Next event at $(date -d '+{auto_ha_frequency} minutes')"
-                sleep {auto_ha_frequency * 60}
-                echo "Notifying operator of timer event"
-                /charm/bin/pebble notify {TIMER_NOTICE}
-            done
-            """)
-        try:
-            with container.pull("/usr/bin/notifier") as stream:
-                content = stream.read()
-        except PathError:
-            content = None
-        if content == notifier:
-            logger.debug("Notifier script unchanged, skipping push")
-            return False
-        logger.info("Pushing new notifier script")
-        container.push(
-            "/usr/bin/notifier", notifier, make_dirs=True, permissions=0o755
+        notifier = self._render_template(
+            "notifier.sh.j2",
+            auto_ha_frequency_minutes=auto_ha_frequency,
+            auto_ha_frequency_seconds=auto_ha_frequency * 60,
+            timer_notice=TIMER_NOTICE,
         )
-        return True
+        return self._push_text_file(
+            container,
+            "/usr/bin/notifier",
+            notifier,
+            description="notifier script",
+            permissions=0o755,
+        )
 
     def generate_nodename(self, unit_name) -> str:
         """K8S DNS nodename for local unit."""
@@ -1123,19 +1859,26 @@ log.file = false
         """K8S DNS nodename for local unit."""
         return self.generate_nodename(self.unit.name)
 
-    def _render_and_push_rabbitmq_env(self) -> None:
+    def _render_and_push_rabbitmq_env(self) -> bool:
         """Render and push rabbitmq-env conf.
 
         Render rabbitmq-env conf and push to the workload container.
         """
         container = self.unit.get_container(RABBITMQ_CONTAINER)
-        rabbitmq_env = f"""
-# Sane configuration defaults for running under K8S
-NODENAME={self.nodename}
-USE_LONGNAME=true
-"""
-        logger.info("Pushing new rabbitmq-env.conf")
-        container.push("/etc/rabbitmq/rabbitmq-env.conf", rabbitmq_env)
+        rabbitmq_env = self._render_template(
+            "rabbitmq-env.conf.j2", nodename=self.nodename
+        )
+        return self._push_text_file(
+            container,
+            "/etc/rabbitmq/rabbitmq-env.conf",
+            rabbitmq_env,
+            description="rabbitmq-env.conf",
+        )
+
+    def _render_template(self, template_name: str, **context) -> str:
+        """Render a Jinja template from src/templates."""
+        template = TEMPLATE_ENV.get_template(template_name)
+        return template.render(**context)
 
     def _on_get_operator_info_action(self, event) -> None:
         """Action to get operator user and password information.
@@ -1148,6 +1891,33 @@ USE_LONGNAME=true
             "operator-password": self._operator_password,
         }
         event.set_results(data)
+
+    def _on_recreate_operator_user_action(self, event: ActionEvent) -> None:
+        """Action to recreate the operator user from peer application data."""
+        if not self.unit.is_leader():
+            event.fail("Not leader unit, unable to recreate operator user")
+            return
+
+        if not self._rabbitmq_running():
+            event.fail(
+                "RabbitMQ not running, unable to recreate operator user"
+            )
+            return
+
+        if not self._operator_password:
+            event.fail("Operator password not available")
+            return
+
+        try:
+            self._recreate_operator_user()
+        except RabbitOperatorError as e:
+            event.fail(str(e))
+            return
+        except (ExecError, ModelError) as e:
+            event.fail(str(e))
+            return
+
+        event.set_results({"operator-user": self._operator_user})
 
     def _manage_queues(self) -> bool:
         """Whether the charm should manage queue membership."""
@@ -1167,43 +1937,93 @@ USE_LONGNAME=true
         ]
         return undersized_queues
 
-    def _on_update_status(self, event) -> None:
-        """Update status.
+    def _on_update_status(self, _) -> None:
+        """Periodic status hook triggers reconciliation without deferral."""
+        self._reconcile(None)
 
-        Determine the state of the charm and set workload status.
-        """
+    def _configuration_error(self) -> str | None:
+        """Return a blocking configuration error, if any."""
+        if self.unit.is_leader() and not self._annotations_valid:
+            return "Invalid config value 'loadbalancer_annotations'"
+
+        try:
+            self.cluster_partition_handling
+            self.resolved_disk_free_limit_bytes
+        except RabbitOperatorError as e:
+            return str(e)
+        return None
+
+    def _undersized_queue_count(self) -> int:
+        """Return the number of undersized queues, or 0 if not applicable."""
+        if (
+            not self.unit.is_leader()
+            or not self._manage_queues()
+            or not self.peers.operator_user_created
+            or not self._rabbitmq_running()
+        ):
+            return 0
+        return len(self.get_undersized_queues())
+
+    def _on_collect_unit_status(self, event: CollectStatusEvent) -> None:
+        """Collect unit status from current state rather than event deltas."""
+        if error := self._configuration_error():
+            event.add_status(BlockedStatus(error))
+            return
+
+        if not self.unit.is_leader() and not self.peers.erlang_cookie:
+            event.add_status(
+                WaitingStatus("Waiting for leader to provide erlang cookie")
+            )
+            return
+
         if not self.peers.operator_user_created:
-            self.unit.status = WaitingStatus(
-                "Waiting for leader to create operator user"
+            event.add_status(
+                WaitingStatus("Waiting for leader to create operator user")
             )
             return
 
-        if not self.peers.erlang_cookie:
-            self.unit.status = WaitingStatus(
-                "Waiting for leader to provide erlang cookie"
-            )
+        if not self._rabbitmq_running():
+            event.add_status(BlockedStatus(SAFETY_REASON_NOT_RUNNING))
             return
 
-        if not self.rabbit_running:
-            self.unit.status = BlockedStatus("RabbitMQ not running")
+        if self._operator_user_recovery_required():
+            event.add_status(BlockedStatus(OPERATOR_USER_RECOVERY_MESSAGE))
             return
 
+        safe, reason = self._evaluate_broker_safety()
+        self._reconcile_listener_protection(safe)
         if self._stored.rabbitmq_version:
             self.unit.set_workload_version(self._stored.rabbitmq_version)
 
-        if self.unit.is_leader() and self._manage_queues():
-            undersized_queues = self.get_undersized_queues()
-            if undersized_queues:
-                self.unit.status = ActiveStatus(
-                    f"WARNING: {len(undersized_queues)} Queue(s) with insufficient members"
+        if not safe:
+            event.add_status(self._unsafe_status(reason))
+            return
+
+        undersized_queues = self._undersized_queue_count()
+        if undersized_queues:
+            event.add_status(
+                ActiveStatus(
+                    f"WARNING: {undersized_queues} Queue(s) with insufficient members"
                 )
-                return
+            )
+            return
 
-        # We don't have a better way than relying on
-        # update status to catch loadbalancer changes
-        self._publish_relation_data()
+        event.add_status(ActiveStatus())
 
-        self.unit.status = ActiveStatus()
+    def _validate_disk_free_limit(self) -> bool:
+        """Validate that disk-free-limit-bytes resolves cleanly."""
+        try:
+            self.resolved_disk_free_limit_bytes
+        except RabbitOperatorError as e:
+            logger.debug("Disk free limit is not yet valid: %s", e)
+            return False
+        return True
+
+    def _unsafe_status(self, reason: str):
+        """Return unit status for an unsafe broker state."""
+        if self.protect_members:
+            return BlockedStatus(f"Protection mode: {reason}")
+        return ActiveStatus(f"WARNING: protection disabled ({reason})")
 
     def create_amqp_credentials(
         self,
@@ -1221,29 +2041,19 @@ USE_LONGNAME=true
         # TODO TLS Support. Existing interfaces set ssl_port and ssl_ca
         logging.debug("Setting amqp connection information.")
 
-        # Need to have the peers binding address to be available. Rabbit
-        # units will need this in order to properly start and peer, so make
-        # sure this is available before attempting to create any credentials
-        if self.peers_bind_address is None:
-            logger.debug("Waiting for peers bind address")
-            event.defer()
-            return
-
         # NOTE: fast exit if credentials are already on the relation
         if event.relation.data[self.app].get("password"):
             logging.debug(f"Credentials already provided for {username}")
             return
+
+        if not self._ensure_broker_running(event):
+            return
         try:
-            if not self.does_vhost_exist(vhost):
-                self.create_vhost(vhost)
-            if not self.does_user_exist(username):
-                password = self.create_user(username)
-                self.peers.store_password(username, password)
-            password = self.peers.retrieve_password(username)
-            self.set_user_permissions(username, vhost)
-            event.relation.data[self.app]["password"] = password
-            event.relation.data[self.app]["hostname"] = self.get_hostname(
-                external_connectivity
+            self._ensure_relation_credentials(
+                event.relation,
+                username,
+                vhost,
+                external_connectivity,
             )
         except requests.exceptions.HTTPError as http_e:
             # If the peers binding address exists, but the operator has not
@@ -1292,6 +2102,12 @@ USE_LONGNAME=true
 
         :param event: The current event
         """
+        if not self.unit.is_leader():
+            msg = "Not leader unit, unable to create service account"
+            logger.error(msg)
+            event.fail(msg)
+            return
+
         if not self.rabbit_running and not self.peers_bind_address:
             msg = "RabbitMQ not running, unable to create account"
             logger.error(msg)
@@ -1454,6 +2270,11 @@ USE_LONGNAME=true
             event.fail(msg)
             return
 
+        if self._operator_user_recovery_required():
+            logger.error(OPERATOR_USER_RECOVERY_MESSAGE)
+            event.fail(OPERATOR_USER_RECOVERY_MESSAGE)
+            return
+
         if not self._manage_queues():
             msg = "Queue management is disabled, unable to ensure queue HA"
             logger.error(msg)
@@ -1531,10 +2352,6 @@ USE_LONGNAME=true
             resources_list.append(self._construct_lb())
             logger.info(
                 f"Patching k8s loadbalancer service object {self._lb_name}"
-            )
-        else:
-            self.unit.status = BlockedStatus(
-                "Invalid config value 'loadbalancer_annotations'"
             )
         klm.reconcile(resources_list)
 

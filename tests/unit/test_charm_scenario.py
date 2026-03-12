@@ -20,6 +20,7 @@ from unittest.mock import (
 
 import ops.model
 import ops.pebble
+import pytest
 import requests
 from ops import (
     testing,
@@ -64,6 +65,39 @@ def _patch_config_changed_for_success(
         "rabbit_running",
         property(lambda self: True),
     )
+    monkeypatch.setattr(charm_instance, "_rabbitmq_running", lambda: True)
+    monkeypatch.setattr(
+        charm_instance,
+        "_evaluate_broker_safety",
+        lambda: (True, "safe"),
+    )
+    monkeypatch.setattr(
+        charm_instance,
+        "_reconcile_listener_protection",
+        lambda safe: None,
+    )
+    monkeypatch.setattr(
+        type(charm_instance),
+        "resolved_disk_free_limit_bytes",
+        property(lambda self: 536870912),
+    )
+    monkeypatch.setattr(
+        charm_instance,
+        "_refresh_rabbitmq_version",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        charm_instance,
+        "_ensure_broker_running",
+        lambda event=None: (charm_instance._reconcile_workload(event), True)[
+            -1
+        ],
+    )
+    monkeypatch.setattr(
+        charm_instance,
+        "_operator_user_recovery_required",
+        lambda: False,
+    )
 
 
 def test_get_operator_info_action(ctx, rabbitmq_container, networks):
@@ -95,6 +129,9 @@ def test_metrics_endpoint_provider_is_configured(ctx):
             "static_configs": [{"targets": ["*:15692"]}],
         }
     ]
+    assert manager.charm.metrics_endpoint._alert_rules_path.endswith(
+        "src/prometheus_alert_rules"
+    )
 
 
 def test_grafana_dashboard_provider_loads_bundled_dashboard(ctx):
@@ -129,23 +166,58 @@ def test_rabbitmq_pebble_ready(ctx, rabbitmq_container, networks, monkeypatch):
     container = state_out.get_container(charm.RABBITMQ_CONTAINER)
     assert set(container.plan.to_dict()["services"]) == {
         "rabbitmq",
-        "epmd",
         "notifier",
     }
+    assert set(container.plan.to_dict()["checks"]) == {
+        "alive",
+        "ready",
+    }
+    assert (
+        container.plan.to_dict()["checks"]["alive"]["exec"]["command"]
+        == charm.RABBITMQ_ALIVE_CHECK_PATH
+    )
     assert (
         container.service_statuses[charm.RABBITMQ_SERVICE]
         == ops.pebble.ServiceStatus.ACTIVE
     )
 
 
-def test_config_changed_defers_without_operator_user(
-    ctx, rabbitmq_container, networks
+def test_upgrade_charm_reconciles_and_autostarts(
+    ctx, rabbitmq_container, networks, monkeypatch
 ):
-    """A non-leader defers config-changed until the operator user exists."""
+    """Upgrade-charm should run the same startup reconciliation path."""
     peer = testing.PeerRelation(
         endpoint="peers",
         local_app_data={
             "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
+            "erlang_cookie": "magicsecurity",
+        },
+        local_unit_data={},
+    )
+    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
+
+    with ctx(ctx.on.upgrade_charm(), state) as manager:
+        _patch_config_changed_for_success(monkeypatch, manager.charm)
+        state_out = manager.run()
+
+    container = state_out.get_container(charm.RABBITMQ_CONTAINER)
+    assert (
+        container.service_statuses[charm.RABBITMQ_SERVICE]
+        == ops.pebble.ServiceStatus.ACTIVE
+    )
+    assert state_out.deferred == []
+
+
+def test_config_changed_proceeds_without_operator_user(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """Non-leaders should still reconcile startup without operator-user state."""
+    peer = testing.PeerRelation(
+        endpoint="peers",
+        local_app_data={
+            "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
             "erlang_cookie": "magicsecurity",
         },
         local_unit_data={},
@@ -154,10 +226,11 @@ def test_config_changed_defers_without_operator_user(
         rabbitmq_container, networks, leader=False, relations=[peer]
     )
 
-    state_out = ctx.run(ctx.on.config_changed(), state)
+    with ctx(ctx.on.config_changed(), state) as manager:
+        _patch_config_changed_for_success(monkeypatch, manager.charm)
+        state_out = manager.run()
 
-    assert len(state_out.deferred) == 1
-    assert state_out.deferred[0].observer == "_on_config_changed"
+    assert state_out.deferred == []
 
 
 def test_config_changed_proceeds_for_leader_without_operator_user(
@@ -168,6 +241,7 @@ def test_config_changed_proceeds_for_leader_without_operator_user(
         endpoint="peers",
         local_app_data={
             "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
             "erlang_cookie": "magicsecurity",
         },
         local_unit_data={},
@@ -189,6 +263,7 @@ def test_config_changed_leader_updates_cluster_name(
         endpoint="peers",
         local_app_data={
             "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
             "erlang_cookie": "magicsecurity",
         },
         local_unit_data={},
@@ -299,6 +374,46 @@ def test_config_changed_non_leader_skips_cluster_name_update(
     admin_api.set_cluster_name.assert_not_called()
 
 
+def test_config_changed_blocks_when_disk_limit_resolution_fails(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """Config-changed blocks if disk free limit resolution cannot succeed."""
+    peer = testing.PeerRelation(
+        endpoint="peers",
+        local_app_data={
+            "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
+            "erlang_cookie": "magicsecurity",
+        },
+        local_unit_data={},
+    )
+    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
+
+    with ctx(ctx.on.config_changed(), state) as manager:
+        monkeypatch.setattr(
+            manager.charm, "_set_ownership_on_data_dir", lambda: True
+        )
+        monkeypatch.setattr(
+            type(manager.charm), "rabbit_running", property(lambda self: True)
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(
+                lambda self: (_ for _ in ()).throw(
+                    charm.RabbitOperatorError(
+                        "Invalid disk-free-limit-bytes value: nope"
+                    )
+                )
+            ),
+        )
+        state_out = manager.run()
+
+    assert state_out.unit_status == ops.model.BlockedStatus(
+        "Invalid disk-free-limit-bytes value: nope"
+    )
+
+
 def test_config_changed_defers_without_erlang_cookie(
     ctx, rabbitmq_container, networks
 ):
@@ -318,7 +433,7 @@ def test_config_changed_defers_without_erlang_cookie(
     state_out = ctx.run(ctx.on.config_changed(), state)
 
     assert len(state_out.deferred) == 1
-    assert state_out.deferred[0].observer == "_on_config_changed"
+    assert state_out.deferred[0].observer == "_reconcile"
 
 
 def test_config_changed_defers_without_container_connectivity(ctx, networks):
@@ -343,7 +458,7 @@ def test_config_changed_defers_without_container_connectivity(ctx, networks):
     state_out = ctx.run(ctx.on.config_changed(), state)
 
     assert len(state_out.deferred) == 1
-    assert state_out.deferred[0].observer == "_on_config_changed"
+    assert state_out.deferred[0].observer == "_reconcile"
 
 
 def test_config_changed_defers_without_peers_bind_address(
@@ -381,17 +496,36 @@ def test_config_changed_defers_without_peers_bind_address(
         state_out = manager.run()
 
     assert len(state_out.deferred) == 1
-    assert state_out.deferred[0].observer == "_on_config_changed"
+    assert state_out.deferred[0].observer == "_reconcile"
 
 
 def test_update_status_waiting_without_operator_user(
-    ctx, rabbitmq_container, networks
+    ctx, rabbitmq_container, networks, monkeypatch
 ):
-    """Update status waits until the leader bootstraps the operator user."""
-    state = _state(rabbitmq_container, networks, leader=True)
+    """Update-status can retry startup before reporting operator-user wait."""
+    peer = testing.PeerRelation(
+        endpoint="peers",
+        local_app_data={"erlang_cookie": "magicsecurity"},
+        local_unit_data={},
+    )
+    state = _state(
+        rabbitmq_container, networks, leader=False, relations=[peer]
+    )
 
-    state_out = ctx.run(ctx.on.update_status(), state)
+    with ctx(ctx.on.update_status(), state) as manager:
+        ensure_running = Mock(return_value=True)
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: False)
+        monkeypatch.setattr(
+            manager.charm, "_ensure_broker_running", ensure_running
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
+        )
+        state_out = manager.run()
 
+    ensure_running.assert_called_once_with(None)
     assert state_out.unit_status == ops.model.WaitingStatus(
         "Waiting for leader to create operator user"
     )
@@ -432,6 +566,50 @@ def test_update_status_active_when_relations_ready(
             "rabbit_running",
             property(lambda self: True),
         )
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: True)
+        monkeypatch.setattr(
+            manager.charm,
+            "_operator_user_recovery_required",
+            lambda: False,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_evaluate_broker_safety",
+            lambda: (True, "safe"),
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_reconcile_listener_protection",
+            lambda safe: None,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_reconcile_running_broker_state",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_reconcile_amqp_relations",
+            lambda event=None: True,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_cleanup_stale_amqp_users",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_reconcile_queue_membership",
+            lambda event=None: True,
+        )
+        monkeypatch.setattr(
+            manager.charm, "_publish_relation_data", lambda: None
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
+        )
         monkeypatch.setattr(
             manager.charm,
             "_get_admin_api",
@@ -445,7 +623,7 @@ def test_update_status_active_when_relations_ready(
 
 
 def test_update_status_waiting_without_erlang_cookie(
-    ctx, rabbitmq_container, networks
+    ctx, rabbitmq_container, networks, monkeypatch
 ):
     """Update status waits until the leader shares the Erlang cookie."""
     peer = testing.PeerRelation(
@@ -456,9 +634,17 @@ def test_update_status_waiting_without_erlang_cookie(
         },
         local_unit_data={},
     )
-    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
+    state = _state(
+        rabbitmq_container, networks, leader=False, relations=[peer]
+    )
 
-    state_out = ctx.run(ctx.on.update_status(), state)
+    with ctx(ctx.on.update_status(), state) as manager:
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
+        )
+        state_out = manager.run()
 
     assert state_out.unit_status == ops.model.WaitingStatus(
         "Waiting for leader to provide erlang cookie"
@@ -481,15 +667,194 @@ def test_update_status_blocked_when_rabbit_not_running(
     state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
 
     with ctx(ctx.on.update_status(), state) as manager:
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: False)
         monkeypatch.setattr(
             type(manager.charm),
-            "rabbit_running",
-            property(lambda self: False),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
         )
         state_out = manager.run()
 
     assert state_out.unit_status == ops.model.BlockedStatus(
         "RabbitMQ not running"
+    )
+
+
+def test_update_status_blocked_when_operator_user_recovery_required(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """The leader blocks with a clear recovery message on stale operator credentials."""
+    peer = testing.PeerRelation(
+        endpoint="peers",
+        local_app_data={
+            "operator_password": "foobar",
+            "operator_user_created": "operator",
+            "erlang_cookie": "magicsecurity",
+        },
+        local_unit_data={},
+    )
+    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
+
+    with ctx(ctx.on.update_status(), state) as manager:
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: True)
+        monkeypatch.setattr(
+            manager.charm,
+            "_operator_user_recovery_required",
+            lambda: True,
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
+        )
+        state_out = manager.run()
+
+    assert state_out.unit_status == ops.model.BlockedStatus(
+        charm.OPERATOR_USER_RECOVERY_MESSAGE
+    )
+
+
+def test_update_status_blocked_when_protection_mode_engaged(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """Unsafe-but-running units report protection mode."""
+    peer = testing.PeerRelation(
+        endpoint="peers",
+        local_app_data={
+            "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
+            "erlang_cookie": "magicsecurity",
+        },
+        local_unit_data={},
+    )
+    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
+
+    with ctx(ctx.on.update_status(), state) as manager:
+        reconcile = Mock()
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: True)
+        monkeypatch.setattr(
+            manager.charm,
+            "_operator_user_recovery_required",
+            lambda: False,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_evaluate_broker_safety",
+            lambda: (False, "Local alarms active"),
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_reconcile_listener_protection",
+            reconcile,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_reconcile_running_broker_state",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_reconcile_amqp_relations",
+            lambda event=None: True,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_cleanup_stale_amqp_users",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_reconcile_queue_membership",
+            lambda event=None: True,
+        )
+        monkeypatch.setattr(
+            manager.charm, "_publish_relation_data", lambda: None
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
+        )
+        state_out = manager.run()
+
+    reconcile.assert_called_once_with(False)
+    assert state_out.unit_status == ops.model.BlockedStatus(
+        "Protection mode: Local alarms active"
+    )
+
+
+def test_update_status_warns_instead_of_blocking_when_protection_disabled(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """Unsafe units stay routable when automatic protection is disabled."""
+    peer = testing.PeerRelation(
+        endpoint="peers",
+        local_app_data={
+            "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
+            "erlang_cookie": "magicsecurity",
+        },
+        local_unit_data={},
+    )
+    state = testing.State(
+        leader=True,
+        relations=[peer],
+        containers=[rabbitmq_container],
+        networks=networks,
+        config={"protect-members": False},
+    )
+
+    with ctx(ctx.on.update_status(), state) as manager:
+        reconcile = Mock()
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: True)
+        monkeypatch.setattr(
+            manager.charm,
+            "_operator_user_recovery_required",
+            lambda: False,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_evaluate_broker_safety",
+            lambda: (False, "Local alarms active"),
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_reconcile_listener_protection",
+            reconcile,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_reconcile_running_broker_state",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_reconcile_amqp_relations",
+            lambda event=None: True,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_cleanup_stale_amqp_users",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_reconcile_queue_membership",
+            lambda event=None: True,
+        )
+        monkeypatch.setattr(
+            manager.charm, "_publish_relation_data", lambda: None
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
+        )
+        state_out = manager.run()
+
+    reconcile.assert_called_once_with(False)
+    assert state_out.unit_status == ops.model.ActiveStatus(
+        "WARNING: protection disabled (Local alarms active)"
     )
 
 
@@ -513,6 +878,50 @@ def test_update_status_warns_when_queues_are_undersized(
             type(manager.charm),
             "rabbit_running",
             property(lambda self: True),
+        )
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: True)
+        monkeypatch.setattr(
+            manager.charm,
+            "_operator_user_recovery_required",
+            lambda: False,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_evaluate_broker_safety",
+            lambda: (True, "safe"),
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_reconcile_listener_protection",
+            lambda safe: None,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_reconcile_running_broker_state",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_reconcile_amqp_relations",
+            lambda event=None: True,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_cleanup_stale_amqp_users",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_reconcile_queue_membership",
+            lambda event=None: True,
+        )
+        monkeypatch.setattr(
+            manager.charm, "_publish_relation_data", lambda: None
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
         )
         monkeypatch.setattr(
             manager.charm,
@@ -614,6 +1023,11 @@ def test_ensure_queue_ha_action_reports_result(
         )
         monkeypatch.setattr(
             manager.charm,
+            "_operator_user_recovery_required",
+            lambda: False,
+        )
+        monkeypatch.setattr(
+            manager.charm,
             "ensure_queue_ha",
             lambda dry_run=False: {
                 "undersized-queues": 2,
@@ -685,6 +1099,69 @@ def test_get_service_account_action_returns_credentials(
     )
 
 
+def test_get_service_account_action_fails_on_non_leader(
+    ctx, rabbitmq_container, networks
+):
+    """The service-account action fails clearly on non-leader units."""
+    peer = testing.PeerRelation(
+        endpoint="peers",
+        local_app_data={
+            "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
+            "erlang_cookie": "magicsecurity",
+        },
+        local_unit_data={},
+    )
+    state = _state(
+        rabbitmq_container, networks, leader=False, relations=[peer]
+    )
+
+    with ctx(
+        ctx.on.action(
+            "get-service-account",
+            params={"username": "svc-user", "vhost": "svc-vhost"},
+        ),
+        state,
+    ) as manager:
+        with pytest.raises(
+            Exception,
+            match="Not leader unit, unable to create service account",
+        ):
+            manager.run()
+
+
+def test_recreate_operator_user_action_returns_credentials(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """The recreate action rebuilds operator-user state from peer data."""
+    peer = testing.PeerRelation(
+        endpoint="peers",
+        local_app_data={
+            "operator_password": "foobar",
+            "erlang_cookie": "magicsecurity",
+        },
+        local_unit_data={},
+    )
+    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
+
+    with ctx(ctx.on.action("recreate-operator-user"), state) as manager:
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: True)
+        monkeypatch.setattr(
+            manager.charm,
+            "_run_rabbitmqctl",
+            Mock(return_value=("", "")),
+        )
+        state_out = manager.run()
+
+    updated_peer = next(
+        relation
+        for relation in state_out.relations
+        if relation.endpoint == "peers"
+    )
+    assert ctx.action_results == {"operator-user": "operator"}
+    assert updated_peer.local_app_data["operator_user_created"] == "operator"
+
+
 def test_timer_notice_calls_ensure_queue_ha_for_leader(
     ctx, rabbitmq_container, networks, timer_notice, monkeypatch
 ):
@@ -715,13 +1192,41 @@ def test_timer_notice_calls_ensure_queue_ha_for_leader(
         ctx.on.pebble_custom_notice(container, timer_notice), state
     ) as manager:
         monkeypatch.setattr(
-            type(manager.charm),
-            "rabbit_running",
-            property(lambda self: True),
+            manager.charm,
+            "_set_ownership_on_data_dir",
+            lambda: True,
+        )
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: True)
+        monkeypatch.setattr(
+            manager.charm,
+            "_operator_user_recovery_required",
+            lambda: False,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_reconcile_running_broker_state",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_reconcile_amqp_relations",
+            lambda event=None: True,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_cleanup_stale_amqp_users",
+            lambda: None,
         )
         monkeypatch.setattr(manager.charm, "ensure_queue_ha", ensure_queue_ha)
         monkeypatch.setattr(
-            manager.charm, "_on_update_status", lambda event: None
+            manager.charm,
+            "_publish_relation_data",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
         )
         manager.run()
 
@@ -758,11 +1263,37 @@ def test_timer_notice_skips_ensure_queue_ha_for_non_leader(
         ctx.on.pebble_custom_notice(container, timer_notice), state
     ) as manager:
         monkeypatch.setattr(
-            type(manager.charm),
-            "rabbit_running",
-            property(lambda self: True),
+            manager.charm,
+            "_set_ownership_on_data_dir",
+            lambda: True,
+        )
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: True)
+        monkeypatch.setattr(
+            manager.charm,
+            "_reconcile_running_broker_state",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_reconcile_amqp_relations",
+            lambda event=None: True,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_cleanup_stale_amqp_users",
+            lambda: None,
         )
         monkeypatch.setattr(manager.charm, "ensure_queue_ha", ensure_queue_ha)
+        monkeypatch.setattr(
+            manager.charm,
+            "_publish_relation_data",
+            lambda: None,
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
+        )
         manager.run()
 
     ensure_queue_ha.assert_not_called()
