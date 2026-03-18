@@ -27,6 +27,9 @@ from ops import (
 )
 
 import charm
+from tests.unit.conftest import (
+    build_peer_relation,
+)
 
 
 def _state(
@@ -80,6 +83,11 @@ def _patch_config_changed_for_success(
         type(charm_instance),
         "resolved_disk_free_limit_bytes",
         property(lambda self: 536870912),
+    )
+    monkeypatch.setattr(
+        type(charm_instance),
+        "resolved_wal_max_size_bytes",
+        property(lambda self: 483183821),
     )
     monkeypatch.setattr(
         charm_instance,
@@ -180,6 +188,31 @@ def test_rabbitmq_pebble_ready(ctx, rabbitmq_container, networks, monkeypatch):
         container.service_statuses[charm.RABBITMQ_SERVICE]
         == ops.pebble.ServiceStatus.ACTIVE
     )
+
+
+def test_rabbitmq_conf_contains_wal_max_size_bytes(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """The rendered rabbitmq.conf includes the Raft WAL size setting."""
+    peer = testing.PeerRelation(
+        endpoint="peers",
+        local_app_data={
+            "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
+            "erlang_cookie": "magicsecurity",
+        },
+        local_unit_data={},
+    )
+    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
+
+    with ctx(ctx.on.pebble_ready(rabbitmq_container), state) as manager:
+        _patch_config_changed_for_success(monkeypatch, manager.charm)
+        state_out = manager.run()
+
+    container = state_out.get_container(charm.RABBITMQ_CONTAINER)
+    fs = container.get_filesystem(ctx)
+    rabbitmq_conf = (fs / "etc/rabbitmq/rabbitmq.conf").read_text()
+    assert "raft.wal_max_size_bytes = 483183821" in rabbitmq_conf
 
 
 def test_upgrade_charm_reconciles_and_autostarts(
@@ -523,6 +556,11 @@ def test_update_status_waiting_without_operator_user(
             "resolved_disk_free_limit_bytes",
             property(lambda self: 536870912),
         )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_wal_max_size_bytes",
+            property(lambda self: 483183821),
+        )
         state_out = manager.run()
 
     ensure_running.assert_called_once_with(None)
@@ -611,6 +649,11 @@ def test_update_status_active_when_relations_ready(
             property(lambda self: 536870912),
         )
         monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_wal_max_size_bytes",
+            property(lambda self: 483183821),
+        )
+        monkeypatch.setattr(
             manager.charm,
             "_get_admin_api",
             lambda *args, **kwargs: Mock(
@@ -644,6 +687,11 @@ def test_update_status_waiting_without_erlang_cookie(
             "resolved_disk_free_limit_bytes",
             property(lambda self: 536870912),
         )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_wal_max_size_bytes",
+            property(lambda self: 483183821),
+        )
         state_out = manager.run()
 
     assert state_out.unit_status == ops.model.WaitingStatus(
@@ -672,6 +720,11 @@ def test_update_status_blocked_when_rabbit_not_running(
             type(manager.charm),
             "resolved_disk_free_limit_bytes",
             property(lambda self: 536870912),
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_wal_max_size_bytes",
+            property(lambda self: 483183821),
         )
         state_out = manager.run()
 
@@ -706,6 +759,11 @@ def test_update_status_blocked_when_operator_user_recovery_required(
             type(manager.charm),
             "resolved_disk_free_limit_bytes",
             property(lambda self: 536870912),
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_wal_max_size_bytes",
+            property(lambda self: 483183821),
         )
         state_out = manager.run()
 
@@ -774,6 +832,11 @@ def test_update_status_blocked_when_protection_mode_engaged(
             type(manager.charm),
             "resolved_disk_free_limit_bytes",
             property(lambda self: 536870912),
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_wal_max_size_bytes",
+            property(lambda self: 483183821),
         )
         state_out = manager.run()
 
@@ -850,6 +913,11 @@ def test_update_status_warns_instead_of_blocking_when_protection_disabled(
             "resolved_disk_free_limit_bytes",
             property(lambda self: 536870912),
         )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_wal_max_size_bytes",
+            property(lambda self: 483183821),
+        )
         state_out = manager.run()
 
     reconcile.assert_called_once_with(False)
@@ -924,6 +992,11 @@ def test_update_status_warns_when_queues_are_undersized(
             property(lambda self: 536870912),
         )
         monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_wal_max_size_bytes",
+            property(lambda self: 483183821),
+        )
+        monkeypatch.setattr(
             manager.charm,
             "_get_admin_api",
             lambda *args, **kwargs: Mock(
@@ -943,7 +1016,8 @@ def test_add_member_action_calls_admin_api(
     ctx, rabbitmq_container, networks, monkeypatch
 ):
     """The add-member action calls the admin API with the generated nodename."""
-    state = _state(rabbitmq_container, networks, leader=True)
+    peer = build_peer_relation()
+    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
     admin_api = Mock()
 
     with ctx(
@@ -958,21 +1032,33 @@ def test_add_member_action_calls_admin_api(
         state,
     ) as manager:
         monkeypatch.setattr(manager.charm, "_get_admin_api", lambda: admin_api)
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: True)
         monkeypatch.setattr(
-            manager.charm, "_on_update_status", lambda event: None
+            manager.charm, "_operator_user_recovery_required", lambda: False
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
         )
         manager.run()
 
     admin_api.add_member.assert_called_once_with(
         "rabbit@unit-1.rabbitmq-k8s-endpoints", "/", "test_queue"
     )
+    assert ctx.action_results == {
+        "queue-name": "test_queue",
+        "node": "rabbit@unit-1.rabbitmq-k8s-endpoints",
+        "vhost": "/",
+    }
 
 
 def test_delete_member_action_calls_admin_api(
     ctx, rabbitmq_container, networks, monkeypatch
 ):
     """The delete-member action calls the admin API with the generated nodename."""
-    state = _state(rabbitmq_container, networks, leader=True)
+    peer = build_peer_relation()
+    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
     admin_api = Mock()
 
     with ctx(
@@ -987,12 +1073,110 @@ def test_delete_member_action_calls_admin_api(
         state,
     ) as manager:
         monkeypatch.setattr(manager.charm, "_get_admin_api", lambda: admin_api)
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: True)
         monkeypatch.setattr(
-            manager.charm, "_on_update_status", lambda event: None
+            manager.charm, "_operator_user_recovery_required", lambda: False
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
         )
         manager.run()
 
     admin_api.delete_member.assert_called_once_with(
+        "rabbit@unit-1.rabbitmq-k8s-endpoints", "/", "test_queue"
+    )
+    assert ctx.action_results == {
+        "queue-name": "test_queue",
+        "node": "rabbit@unit-1.rabbitmq-k8s-endpoints",
+        "vhost": "/",
+    }
+
+
+def test_add_member_action_fails_on_non_leader(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """The add-member action fails when the unit is not the leader."""
+    state = _state(rabbitmq_container, networks, leader=False)
+
+    with ctx(
+        ctx.on.action(
+            "add-member",
+            params={
+                "unit-name": "unit/1",
+                "vhost": "/",
+                "queue-name": "test_queue",
+            },
+        ),
+        state,
+    ) as manager:
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
+        )
+        with pytest.raises(Exception, match="Not leader unit"):
+            manager.run()
+
+
+def test_delete_member_action_fails_on_non_leader(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """The delete-member action fails when the unit is not the leader."""
+    state = _state(rabbitmq_container, networks, leader=False)
+
+    with ctx(
+        ctx.on.action(
+            "delete-member",
+            params={
+                "unit-name": "unit/1",
+                "vhost": "/",
+                "queue-name": "test_queue",
+            },
+        ),
+        state,
+    ) as manager:
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
+        )
+        with pytest.raises(Exception, match="Not leader unit"):
+            manager.run()
+
+
+def test_add_member_action_defaults_vhost_to_slash(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """The add-member action defaults vhost to '/' when not provided."""
+    peer = build_peer_relation()
+    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
+    admin_api = Mock()
+
+    with ctx(
+        ctx.on.action(
+            "add-member",
+            params={
+                "unit-name": "unit/1",
+                "queue-name": "test_queue",
+            },
+        ),
+        state,
+    ) as manager:
+        monkeypatch.setattr(manager.charm, "_get_admin_api", lambda: admin_api)
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: True)
+        monkeypatch.setattr(
+            manager.charm, "_operator_user_recovery_required", lambda: False
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
+        )
+        manager.run()
+
+    admin_api.add_member.assert_called_once_with(
         "rabbit@unit-1.rabbitmq-k8s-endpoints", "/", "test_queue"
     )
 
@@ -1021,10 +1205,33 @@ def test_ensure_queue_ha_action_reports_result(
             "rabbit_running",
             property(lambda self: True),
         )
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: True)
         monkeypatch.setattr(
             manager.charm,
             "_operator_user_recovery_required",
             lambda: False,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_evaluate_broker_safety",
+            lambda: (True, "safe"),
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_reconcile_listener_protection",
+            lambda safe: None,
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_get_admin_api",
+            lambda *args, **kwargs: Mock(
+                list_quorum_queues=Mock(return_value=[])
+            ),
         )
         monkeypatch.setattr(
             manager.charm,
@@ -1033,9 +1240,6 @@ def test_ensure_queue_ha_action_reports_result(
                 "undersized-queues": 2,
                 "replicated-queues": 0,
             },
-        )
-        monkeypatch.setattr(
-            manager.charm, "_on_update_status", lambda event: None
         )
         manager.run()
 
@@ -1297,3 +1501,249 @@ def test_timer_notice_skips_ensure_queue_ha_for_non_leader(
         manager.run()
 
     ensure_queue_ha.assert_not_called()
+
+
+def test_rebalance_quorum_action_calls_api(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """The rebalance-quorum action calls the admin API."""
+    peer = build_peer_relation()
+    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
+    admin_api = Mock()
+
+    with ctx(
+        ctx.on.action("rebalance-quorum"),
+        state,
+    ) as manager:
+        monkeypatch.setattr(manager.charm, "_get_admin_api", lambda: admin_api)
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: True)
+        monkeypatch.setattr(
+            manager.charm, "_operator_user_recovery_required", lambda: False
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
+        )
+        manager.run()
+
+    admin_api.rebalance_queues.assert_called_once_with()
+    assert ctx.action_results == {"status": "rebalance initiated"}
+
+
+def test_rebalance_quorum_action_fails_on_non_leader(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """The rebalance-quorum action fails when the unit is not the leader."""
+    state = _state(rabbitmq_container, networks, leader=False)
+
+    with ctx(
+        ctx.on.action("rebalance-quorum"),
+        state,
+    ) as manager:
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
+        )
+        with pytest.raises(Exception, match="Not leader unit"):
+            manager.run()
+
+
+def test_grow_action_calls_api(ctx, rabbitmq_container, networks, monkeypatch):
+    """The grow action calls the admin API with explicit params."""
+    peer = build_peer_relation()
+    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
+    admin_api = Mock()
+
+    with ctx(
+        ctx.on.action(
+            "grow",
+            params={
+                "unit-name": "unit/1",
+                "selector": "all",
+            },
+        ),
+        state,
+    ) as manager:
+        monkeypatch.setattr(manager.charm, "_get_admin_api", lambda: admin_api)
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: True)
+        monkeypatch.setattr(
+            manager.charm, "_operator_user_recovery_required", lambda: False
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
+        )
+        manager.run()
+
+    admin_api.grow_queue.assert_called_once_with(
+        "rabbit@unit-1.rabbitmq-k8s-endpoints", "all", ".*", ".*"
+    )
+    assert ctx.action_results == {
+        "node": "rabbit@unit-1.rabbitmq-k8s-endpoints",
+        "selector": "all",
+        "vhost-pattern": ".*",
+        "queue-pattern": ".*",
+        "status": "grow initiated",
+    }
+
+
+def test_grow_action_with_optional_patterns(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """The grow action passes optional vhost-pattern and queue-pattern."""
+    peer = build_peer_relation()
+    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
+    admin_api = Mock()
+
+    with ctx(
+        ctx.on.action(
+            "grow",
+            params={
+                "unit-name": "unit/0",
+                "selector": "even",
+                "vhost-pattern": "prod-.*",
+                "queue-pattern": "orders-.*",
+            },
+        ),
+        state,
+    ) as manager:
+        monkeypatch.setattr(manager.charm, "_get_admin_api", lambda: admin_api)
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: True)
+        monkeypatch.setattr(
+            manager.charm, "_operator_user_recovery_required", lambda: False
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
+        )
+        manager.run()
+
+    admin_api.grow_queue.assert_called_once_with(
+        "rabbit@unit-0.rabbitmq-k8s-endpoints",
+        "even",
+        "prod-.*",
+        "orders-.*",
+    )
+
+
+def test_grow_action_fails_on_non_leader(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """The grow action fails when the unit is not the leader."""
+    state = _state(rabbitmq_container, networks, leader=False)
+
+    with ctx(
+        ctx.on.action(
+            "grow",
+            params={"unit-name": "unit/1", "selector": "all"},
+        ),
+        state,
+    ) as manager:
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
+        )
+        with pytest.raises(Exception, match="Not leader unit"):
+            manager.run()
+
+
+def test_shrink_action_calls_api(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """The shrink action calls the admin API and reports results."""
+    peer = build_peer_relation()
+    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
+    admin_api = Mock()
+    admin_api.shrink_queue.return_value = {
+        "deleted": [{"queue": "q1", "size": 2}, {"queue": "q2", "size": 2}],
+        "errors": [],
+    }
+
+    with ctx(
+        ctx.on.action(
+            "shrink",
+            params={"unit-name": "unit/1"},
+        ),
+        state,
+    ) as manager:
+        monkeypatch.setattr(manager.charm, "_get_admin_api", lambda: admin_api)
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: True)
+        monkeypatch.setattr(
+            manager.charm, "_operator_user_recovery_required", lambda: False
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
+        )
+        manager.run()
+
+    admin_api.shrink_queue.assert_called_once_with(
+        "rabbit@unit-1.rabbitmq-k8s-endpoints"
+    )
+    results = ctx.action_results
+    assert results["deleted-count"] == "2"
+    assert results["error-count"] == "0"
+
+
+def test_shrink_action_error_only(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """The shrink action with error-only=True reports only errors."""
+    peer = build_peer_relation()
+    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
+    admin_api = Mock()
+    admin_api.shrink_queue.return_value = {
+        "deleted": [{"queue": "q1", "size": 2}],
+        "errors": [{"queue": "q2", "error": "last remaining member"}],
+    }
+
+    with ctx(
+        ctx.on.action(
+            "shrink",
+            params={"unit-name": "unit/1", "error-only": True},
+        ),
+        state,
+    ) as manager:
+        monkeypatch.setattr(manager.charm, "_get_admin_api", lambda: admin_api)
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: True)
+        monkeypatch.setattr(
+            manager.charm, "_operator_user_recovery_required", lambda: False
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
+        )
+        manager.run()
+
+    results = ctx.action_results
+    assert results["error-count"] == "1"
+    assert "errors" in results
+
+
+def test_shrink_action_fails_on_non_leader(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """The shrink action fails when the unit is not the leader."""
+    state = _state(rabbitmq_container, networks, leader=False)
+
+    with ctx(
+        ctx.on.action(
+            "shrink",
+            params={"unit-name": "unit/1"},
+        ),
+        state,
+    ) as manager:
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
+        )
+        with pytest.raises(Exception, match="Not leader unit"):
+            manager.run()

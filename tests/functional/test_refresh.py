@@ -39,6 +39,9 @@ def test_refresh_from_stable_to_local(
     assert pre_refresh.results["operator-user"] == "operator"
     assert pre_refresh.results["operator-password"]
 
+    # Pin the OCI image to the local build's upstream-source during
+    # refresh.  The stable channel bundles its own image; we override
+    # it here to test the exact image this charm revision ships with.
     juju.refresh(
         app_name,
         path=str(charm_file),

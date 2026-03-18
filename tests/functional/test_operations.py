@@ -56,6 +56,6 @@ def test_normal_operations(
         "ensure-queue-ha",
         {"dry-run": True},
     )
-    assert queue_ha.results["dry-run"] == "True"
+    assert str(queue_ha.results["dry-run"]).lower() == "true"
     assert int(queue_ha.results["replicated-queues"]) == 0
     assert int(queue_ha.results["undersized-queues"]) == 0

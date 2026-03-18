@@ -25,6 +25,7 @@ from typing import (
 )
 
 import rabbitmq_admin
+import requests
 
 
 class ExtendedAdminApi(rabbitmq_admin.AdminAPI):
@@ -83,6 +84,21 @@ class ExtendedAdminApi(rabbitmq_admin.AdminAPI):
         self._api_post(
             "/api/queues/quorum/replicas/on/{}/grow".format(node), data=data
         )
+
+    def shrink_queue(self, node):
+        """Remove all quorum queue replicas from a node.
+
+        Returns the API response dict with 'deleted' and 'errors' keys.
+        Note: _api_delete does not return the response body, so we
+        bypass it and call requests.delete() directly.
+        """
+        response = requests.delete(
+            self.url + "/api/queues/quorum/replicas/on/{}/shrink".format(node),
+            auth=self.auth,
+            headers=self.headers,
+        )
+        response.raise_for_status()
+        return response.json()
 
     def add_member(self, node, vhost, queue):
         """Add a member to a queue."""

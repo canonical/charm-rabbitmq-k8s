@@ -43,15 +43,17 @@ def test_recover_from_disk_pressure(
     filled_bytes = fill_rabbitmq_disk_to_alarm(juju, f"{app_name}/0")
     assert filled_bytes > 0
 
-    wait_for_unit_workload_status(
-        juju,
-        f"{app_name}/0",
-        current="blocked",
-        message_substring="Protection mode: Local alarms active",
-        timeout=5 * 60,
-    )
+    try:
+        wait_for_unit_workload_status(
+            juju,
+            f"{app_name}/0",
+            current="blocked",
+            message_substring="Protection mode: Local alarms active",
+            timeout=5 * 60,
+        )
+    finally:
+        clear_rabbitmq_filler_file(juju, f"{app_name}/0")
 
-    clear_rabbitmq_filler_file(juju, f"{app_name}/0")
     wait_for_app(juju, app_name, units=1)
 
     operator_info = run_action(
