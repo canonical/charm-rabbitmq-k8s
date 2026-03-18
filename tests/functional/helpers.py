@@ -47,6 +47,26 @@ def app_exists(juju: jubilant.Juju, app_name: str) -> bool:
     return app_name in status_payload(juju).get("applications", {})
 
 
+def wait_for_model_empty(
+    juju: jubilant.Juju,
+    timeout: int = 10 * 60,
+    interval: int = 5,
+) -> None:
+    """Wait until the model has no applications and no storage."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        payload = status_payload(juju)
+        apps = payload.get("applications", {})
+        storage = payload.get("storage", {}).get("storage", {})
+        if not apps and not storage:
+            return
+        time.sleep(interval)
+    raise AssertionError(
+        f"Timed out waiting for model to be empty; "
+        f"apps={list(apps)}, storage={list(storage)}"
+    )
+
+
 def wait_for_apps(
     juju: jubilant.Juju,
     app_names: tuple[str, ...] | list[str],
@@ -153,6 +173,8 @@ def relation_exists(juju: jubilant.Juju, provider: str, requirer: str) -> bool:
             or line.startswith("Model ")
             or line.startswith("App ")
             or line.startswith("Unit ")
+            or line.startswith("Relation ")
+            or line.startswith("Relations:")
         ):
             continue
         if provider in line and requirer in line:
@@ -263,17 +285,29 @@ def wait_for_running_nodes(
     juju: jubilant.Juju,
     unit_name: str,
     expected_nodes: set[str],
-    timeout: int = 180,
+    timeout: int = 10 * 60,
     interval: int = 5,
 ) -> dict:
     """Wait until RabbitMQ reports the expected running nodes."""
     deadline = time.monotonic() + timeout
     last_status = {}
+    last_error = None
     while time.monotonic() < deadline:
-        last_status = cluster_status(juju, unit_name)
-        if set(last_status["running_nodes"]) == expected_nodes:
+        try:
+            last_status = cluster_status(juju, unit_name)
+            last_error = None
+        except Exception as e:
+            last_error = e
+            time.sleep(interval)
+            continue
+        if set(last_status.get("running_nodes", [])) == expected_nodes:
             return last_status
         time.sleep(interval)
+    if last_error:
+        raise AssertionError(
+            f"Timed out waiting for running nodes {expected_nodes}; "
+            f"last error: {last_error}"
+        )
     raise AssertionError(
         f"Timed out waiting for running nodes {expected_nodes}; "
         f"last status was {last_status}"
@@ -486,6 +520,103 @@ def wait_for_loki_logs(
         f"Timed out waiting for Loki logs for {query!r}; "
         f"last result was {last_result}"
     )
+
+
+def wait_for_app_removed(
+    juju: jubilant.Juju,
+    app_name: str,
+    timeout: int = 10 * 60,
+    interval: int = 5,
+) -> None:
+    """Wait until the application no longer exists in the model."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not app_exists(juju, app_name):
+            return
+        time.sleep(interval)
+    raise AssertionError(
+        f"Timed out waiting for application {app_name!r} to be removed"
+    )
+
+
+def k8s_service_exists(juju: jubilant.Juju, service_name: str) -> bool:
+    """Return whether a Kubernetes service exists in the model namespace."""
+    output = subprocess.run(
+        [
+            kubectl(),
+            "get",
+            "service",
+            service_name,
+            "-n",
+            model_name(juju),
+            "--ignore-not-found",
+            "-o",
+            "name",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )  # nosec B603
+    return bool(output.stdout.strip())
+
+
+def k8s_pods_with_label(juju: jubilant.Juju, label_selector: str) -> list[str]:
+    """Return pod names matching a label selector in the model namespace."""
+    output = subprocess.run(
+        [
+            kubectl(),
+            "get",
+            "pods",
+            "-l",
+            label_selector,
+            "-n",
+            model_name(juju),
+            "--ignore-not-found",
+            "-o",
+            "jsonpath={.items[*].metadata.name}",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )  # nosec B603
+    return output.stdout.strip().split() if output.stdout.strip() else []
+
+
+def wait_for_k8s_service_gone(
+    juju: jubilant.Juju,
+    service_name: str,
+    timeout: int = 5 * 60,
+    interval: int = 5,
+) -> None:
+    """Wait until a Kubernetes service no longer exists."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not k8s_service_exists(juju, service_name):
+            return
+        time.sleep(interval)
+    raise AssertionError(
+        f"Timed out waiting for Kubernetes service {service_name!r} to be removed"
+    )
+
+
+def delete_all_app_pods(juju: jubilant.Juju, app_name: str) -> None:
+    """Force-delete all pods for an application."""
+    subprocess.run(
+        [
+            kubectl(),
+            "delete",
+            "pod",
+            "-l",
+            f"app.kubernetes.io/name={app_name}",
+            "-n",
+            model_name(juju),
+            "--grace-period=0",
+            "--force",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )  # nosec B603
 
 
 def raw_status(juju: jubilant.Juju) -> dict:
@@ -843,20 +974,6 @@ def amqp_uri(
     return (
         f"amqp://{username}:{password}@{host}:{port}/{quote(vhost, safe='')}"
     )
-
-
-def rabbitmq_disk_free_limit_bytes(juju: jubilant.Juju, unit_name: str) -> int:
-    """Return the configured RabbitMQ disk free limit in bytes."""
-    output = juju.ssh(
-        unit_name,
-        (
-            "sed -n "
-            '"s/^disk_free_limit.absolute = //p" '
-            "/etc/rabbitmq/rabbitmq.conf"
-        ),
-        container=RABBITMQ_CONTAINER,
-    )
-    return int(output.strip())
 
 
 def rabbitmq_available_bytes(juju: jubilant.Juju, unit_name: str) -> int:

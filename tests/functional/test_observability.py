@@ -126,32 +126,33 @@ def test_rabbitmq_node_down_alert_fires_and_clears(
     unit_name = f"{rabbitmq_with_cos}/0"
 
     hold_rabbitmq_service_stopped(juju, unit_name)
-    wait_for_prometheus_query_result(
-        juju, f'up{{juju_application="{rabbitmq_with_cos}"}} == 0'
-    )
-    _wait_until(
-        lambda: any(
-            alert.get("labels", {}).get("alertname") == "RabbitMQNodeDown"
-            and alert.get("labels", {}).get("juju_application")
-            == rabbitmq_with_cos
-            and alert.get("state") == "firing"
-            for alert in prometheus_alerts(juju)
-        ),
-        timeout=8 * 60,
-        failure_message="Timed out waiting for RabbitMQNodeDown in Prometheus",
-    )
-    _wait_until(
-        lambda: any(
-            alert.get("labels", {}).get("alertname") == "RabbitMQNodeDown"
-            and alert.get("labels", {}).get("juju_application")
-            == rabbitmq_with_cos
-            for alert in alertmanager_alerts(juju)
-        ),
-        timeout=3 * 60,
-        failure_message="Timed out waiting for RabbitMQNodeDown in Alertmanager",
-    )
-
-    release_rabbitmq_service_stop(juju, unit_name)
+    try:
+        wait_for_prometheus_query_result(
+            juju, f'up{{juju_application="{rabbitmq_with_cos}"}} == 0'
+        )
+        _wait_until(
+            lambda: any(
+                alert.get("labels", {}).get("alertname") == "RabbitMQNodeDown"
+                and alert.get("labels", {}).get("juju_application")
+                == rabbitmq_with_cos
+                and alert.get("state") == "firing"
+                for alert in prometheus_alerts(juju)
+            ),
+            timeout=8 * 60,
+            failure_message="Timed out waiting for RabbitMQNodeDown in Prometheus",
+        )
+        _wait_until(
+            lambda: any(
+                alert.get("labels", {}).get("alertname") == "RabbitMQNodeDown"
+                and alert.get("labels", {}).get("juju_application")
+                == rabbitmq_with_cos
+                for alert in alertmanager_alerts(juju)
+            ),
+            timeout=3 * 60,
+            failure_message="Timed out waiting for RabbitMQNodeDown in Alertmanager",
+        )
+    finally:
+        release_rabbitmq_service_stop(juju, unit_name)
     _wait_until(
         lambda: (
             lambda status: (

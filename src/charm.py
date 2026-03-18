@@ -202,6 +202,8 @@ QUALIFIED_NAME_PATTERN = re.compile(
     r"^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$"
 )
 
+WAL_MAX_SIZE_CAP = 512 * 1024 * 1024  # 512 MiB hard cap for Raft WAL size
+
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 TEMPLATE_ENV = Environment(
     loader=FileSystemLoader(TEMPLATES_DIR),
@@ -340,6 +342,15 @@ class RabbitMQOperatorCharm(CharmBase):
         self.framework.observe(
             self.on.ensure_queue_ha_action, self._ensure_queue_ha_action
         )
+
+        self.framework.observe(
+            self.on.rebalance_quorum_action,
+            self._on_rebalance_quorum_action,
+        )
+
+        self.framework.observe(self.on.grow_action, self._on_grow_action)
+
+        self.framework.observe(self.on.shrink_action, self._on_shrink_action)
 
         self.framework.observe(
             self.on[RABBITMQ_CONTAINER].pebble_custom_notice,
@@ -972,25 +983,99 @@ class RabbitMQOperatorCharm(CharmBase):
         """Compatibility wrapper for peer relation create/change reconciliation."""
         self._reconcile(event)
 
-    def _on_add_member_action(self, event) -> None:
+    def _on_add_member_action(self, event: ActionEvent) -> None:
         """Handle add_member charm action."""
+        if not self._require_queue_management_ready(event):
+            return
         api = self._get_admin_api()
-        api.add_member(
-            self.generate_nodename(event.params["unit-name"]),
-            event.params.get("vhost"),
-            event.params["queue-name"],
+        node = self.generate_nodename(event.params["unit-name"])
+        vhost = event.params.get("vhost") or "/"
+        queue_name = event.params["queue-name"]
+        api.add_member(node, vhost, queue_name)
+        event.set_results(
+            {"queue-name": queue_name, "node": node, "vhost": vhost}
         )
-        self._on_update_status(event)
 
-    def _on_delete_member_action(self, event) -> None:
+    def _on_delete_member_action(self, event: ActionEvent) -> None:
         """Handle delete_member charm action."""
+        if not self._require_queue_management_ready(event):
+            return
         api = self._get_admin_api()
-        api.delete_member(
-            self.generate_nodename(event.params["unit-name"]),
-            event.params.get("vhost"),
-            event.params["queue-name"],
+        node = self.generate_nodename(event.params["unit-name"])
+        vhost = event.params.get("vhost") or "/"
+        queue_name = event.params["queue-name"]
+        api.delete_member(node, vhost, queue_name)
+        event.set_results(
+            {"queue-name": queue_name, "node": node, "vhost": vhost}
         )
-        self._on_update_status(event)
+
+    def _require_queue_management_ready(self, event: ActionEvent) -> bool:
+        """Check common preconditions for queue management actions.
+
+        Returns True if the charm is ready. Returns False after calling
+        event.fail() on the first failed check.
+        """
+        if not self.unit.is_leader():
+            event.fail("Not leader unit")
+            return False
+        if not self._rabbitmq_running():
+            event.fail("RabbitMQ not running")
+            return False
+        if not self.peers.operator_user_created:
+            event.fail("Operator user not created")
+            return False
+        if self._operator_user_recovery_required():
+            event.fail(OPERATOR_USER_RECOVERY_MESSAGE)
+            return False
+        return True
+
+    def _on_rebalance_quorum_action(self, event: ActionEvent) -> None:
+        """Handle rebalance-quorum charm action."""
+        if not self._require_queue_management_ready(event):
+            return
+        api = self._get_admin_api()
+        api.rebalance_queues()
+        event.set_results({"status": "rebalance initiated"})
+
+    def _on_grow_action(self, event: ActionEvent) -> None:
+        """Handle grow charm action."""
+        if not self._require_queue_management_ready(event):
+            return
+        api = self._get_admin_api()
+        node = self.generate_nodename(event.params["unit-name"])
+        selector = event.params["selector"]
+        vhost_pattern = event.params.get("vhost-pattern") or ".*"
+        queue_pattern = event.params.get("queue-pattern") or ".*"
+        api.grow_queue(node, selector, vhost_pattern, queue_pattern)
+        event.set_results(
+            {
+                "node": node,
+                "selector": selector,
+                "vhost-pattern": vhost_pattern,
+                "queue-pattern": queue_pattern,
+                "status": "grow initiated",
+            }
+        )
+
+    def _on_shrink_action(self, event: ActionEvent) -> None:
+        """Handle shrink charm action."""
+        if not self._require_queue_management_ready(event):
+            return
+        api = self._get_admin_api()
+        node = self.generate_nodename(event.params["unit-name"])
+        result = api.shrink_queue(node)
+        error_only = event.params.get("error-only", False)
+        deleted = result.get("deleted", [])
+        errors = result.get("errors", [])
+        results = {
+            "deleted-count": str(len(deleted)),
+            "error-count": str(len(errors)),
+        }
+        if not error_only:
+            results["deleted"] = json.dumps(deleted)
+        if errors:
+            results["errors"] = json.dumps(errors)
+        event.set_results(results)
 
     def _on_ready_amqp_clients(self, event) -> None:
         """Compatibility wrapper for AMQP relation reconciliation."""
@@ -1334,6 +1419,20 @@ class RabbitMQOperatorCharm(CharmBase):
                 "disk-free-limit-bytes exceeds bound rabbitmq-data PVC capacity"
             )
         return resolved
+
+    @property
+    def resolved_wal_max_size_bytes(self) -> int:
+        """Return the safe Raft WAL max size in bytes."""
+        pvc_capacity = self._rabbitmq_data_pvc_capacity_bytes()
+        disk_free_limit = self.resolved_disk_free_limit_bytes
+        wal_max_size = min(
+            WAL_MAX_SIZE_CAP, (pvc_capacity - disk_free_limit) // 2
+        )
+        if wal_max_size <= 0:
+            raise RabbitOperatorError(
+                "PVC capacity too small for a safe Raft WAL size"
+            )
+        return wal_max_size
 
     def _bytes_from_string(self, value: str) -> int | str:
         """Parse a raw byte value or human-readable size string."""
@@ -1744,6 +1843,7 @@ class RabbitMQOperatorCharm(CharmBase):
             app_name=self.app.name,
             cluster_partition_handling=self.cluster_partition_handling,
             disk_free_limit_bytes=self.resolved_disk_free_limit_bytes,
+            wal_max_size_bytes=self.resolved_wal_max_size_bytes,
         )
         return self._push_text_file(
             container,
@@ -1896,6 +1996,7 @@ class RabbitMQOperatorCharm(CharmBase):
         try:
             self.cluster_partition_handling
             self.resolved_disk_free_limit_bytes
+            self.resolved_wal_max_size_bytes
         except RabbitOperatorError as e:
             return str(e)
         return None
@@ -2240,7 +2341,6 @@ class RabbitMQOperatorCharm(CharmBase):
                 "dry-run": dry_run,
             }
         )
-        self._on_update_status(event)
 
     @property
     def _service_ports(self) -> List[ServicePort]:

@@ -1240,6 +1240,7 @@ def test_render_rabbitmq_conf_skips_push_when_unchanged():
         app_name=fake.app.name,
         cluster_partition_handling=fake.cluster_partition_handling,
         disk_free_limit_bytes=fake.resolved_disk_free_limit_bytes,
+        wal_max_size_bytes=fake.resolved_wal_max_size_bytes,
     )
     stream = Mock()
     stream.read.return_value = rabbitmq_conf
@@ -1309,7 +1310,9 @@ def test_rabbitmq_data_pvc_capacity_bytes_container_not_ready():
         charm.RabbitOperatorError,
         match="container not yet available",
     ):
-        charm.RabbitMQOperatorCharm._rabbitmq_data_pvc_capacity_bytes(fake)
+        charm.RabbitMQOperatorCharm._rabbitmq_data_pvc_capacity_bytes.func(
+            fake
+        )
 
 
 def test_rabbitmq_data_pvc_capacity_bytes_exec_error_raises():
@@ -1420,6 +1423,71 @@ def test_resolved_disk_free_limit_bytes_rejects_values_larger_than_pvc():
         charm.RabbitMQOperatorCharm.resolved_disk_free_limit_bytes.fget(fake)
 
 
+def test_resolved_wal_max_size_bytes_large_pvc_is_capped():
+    """A 4Gi PVC produces a WAL size capped at 512Mi."""
+    fake = _fake_charm(
+        _rabbitmq_data_pvc_capacity_bytes=Mock(return_value=4 * 1024**3),
+        resolved_disk_free_limit_bytes=429496729,
+    )
+
+    result = charm.RabbitMQOperatorCharm.resolved_wal_max_size_bytes.fget(fake)
+
+    assert result == 536870912  # 512 MiB
+
+
+def test_resolved_wal_max_size_bytes_small_pvc_uncapped():
+    """A 1Gi PVC produces an uncapped WAL size of (pvc - disk_free) // 2."""
+    fake = _fake_charm(
+        _rabbitmq_data_pvc_capacity_bytes=Mock(return_value=1073741824),
+        resolved_disk_free_limit_bytes=107374182,
+    )
+
+    result = charm.RabbitMQOperatorCharm.resolved_wal_max_size_bytes.fget(fake)
+
+    assert result == 483183821  # (1073741824 - 107374182) // 2
+
+
+def test_resolved_wal_max_size_bytes_tiny_pvc_raises():
+    """A PVC where capacity equals the disk free limit raises RabbitOperatorError."""
+    pvc_capacity = 1073741824
+    fake = _fake_charm(
+        _rabbitmq_data_pvc_capacity_bytes=Mock(return_value=pvc_capacity),
+        resolved_disk_free_limit_bytes=pvc_capacity,
+    )
+
+    with pytest.raises(charm.RabbitOperatorError):
+        charm.RabbitMQOperatorCharm.resolved_wal_max_size_bytes.fget(fake)
+
+
+def test_configuration_error_returns_wal_size_resolution_message():
+    """Status collection should block when resolved_wal_max_size_bytes raises."""
+
+    class FakeCharm(SimpleNamespace):
+        @property
+        def cluster_partition_handling(self):
+            return "pause_minority"
+
+        @property
+        def resolved_disk_free_limit_bytes(self):
+            return 107374182
+
+        @property
+        def resolved_wal_max_size_bytes(self):
+            raise charm.RabbitOperatorError(
+                "PVC capacity too small for a safe Raft WAL size"
+            )
+
+    fake = FakeCharm(
+        unit=SimpleNamespace(is_leader=lambda: False),
+        _annotations_valid=True,
+    )
+
+    assert (
+        charm.RabbitMQOperatorCharm._configuration_error(fake)
+        == "PVC capacity too small for a safe Raft WAL size"
+    )
+
+
 def test_configuration_error_returns_disk_limit_resolution_message():
     """Status collection should block on disk-limit resolution errors, not crash."""
 
@@ -1433,6 +1501,10 @@ def test_configuration_error_returns_disk_limit_resolution_message():
             raise charm.RabbitOperatorError(
                 "Failed to configure Kubernetes client for rabbitmq-data PVC lookup"
             )
+
+        @property
+        def resolved_wal_max_size_bytes(self):
+            return 536870912
 
     fake = FakeCharm(
         unit=SimpleNamespace(is_leader=lambda: False),
@@ -2078,7 +2150,7 @@ def test_ensure_queue_ha_action_gate_failures(
 
 
 def test_ensure_queue_ha_action_success():
-    """Queue HA action returns the replication summary and updates status."""
+    """Queue HA action returns the replication summary."""
     event = Mock()
     event.params = {"dry-run": True}
     unit = Mock()
@@ -2093,7 +2165,6 @@ def test_ensure_queue_ha_action_success():
                 "replicated-queues": 1,
             }
         ),
-        _on_update_status=Mock(),
     )
     fake.rabbit_running = True
 
@@ -2106,7 +2177,87 @@ def test_ensure_queue_ha_action_success():
             "dry-run": True,
         }
     )
-    fake._on_update_status.assert_called_once_with(event)
+
+
+@pytest.mark.parametrize(
+    (
+        "leader",
+        "rabbitmq_running",
+        "operator_user_created",
+        "recovery_required",
+        "message",
+    ),
+    [
+        (
+            False,
+            True,
+            "rmqadmin",
+            False,
+            "Not leader unit",
+        ),
+        (
+            True,
+            False,
+            "rmqadmin",
+            False,
+            "RabbitMQ not running",
+        ),
+        (
+            True,
+            True,
+            None,
+            False,
+            "Operator user not created",
+        ),
+        (
+            True,
+            True,
+            "rmqadmin",
+            True,
+            charm.OPERATOR_USER_RECOVERY_MESSAGE,
+        ),
+    ],
+)
+def test_require_queue_management_ready_failures(
+    leader, rabbitmq_running, operator_user_created, recovery_required, message
+):
+    """Each precondition failure calls event.fail and returns False."""
+    event = Mock()
+    unit = Mock()
+    unit.is_leader.return_value = leader
+    fake = _fake_charm(
+        unit=unit,
+        peers=SimpleNamespace(operator_user_created=operator_user_created),
+        _rabbitmq_running=Mock(return_value=rabbitmq_running),
+        _operator_user_recovery_required=Mock(return_value=recovery_required),
+    )
+
+    result = charm.RabbitMQOperatorCharm._require_queue_management_ready(
+        fake, event
+    )
+
+    assert result is False
+    event.fail.assert_called_once_with(message)
+
+
+def test_require_queue_management_ready_passes():
+    """All preconditions met returns True without failing the event."""
+    event = Mock()
+    unit = Mock()
+    unit.is_leader.return_value = True
+    fake = _fake_charm(
+        unit=unit,
+        peers=SimpleNamespace(operator_user_created="rmqadmin"),
+        _rabbitmq_running=Mock(return_value=True),
+        _operator_user_recovery_required=Mock(return_value=False),
+    )
+
+    result = charm.RabbitMQOperatorCharm._require_queue_management_ready(
+        fake, event
+    )
+
+    assert result is True
+    event.fail.assert_not_called()
 
 
 def test_on_update_status_reconciles_without_event():

@@ -17,6 +17,8 @@ import jubilant
 import pytest
 import yaml
 
+PROJECT_ROOT = pathlib.Path(__file__).parents[2]
+
 GENERATED_METADATA_FILES = (
     "actions.yaml",
     "config.yaml",
@@ -79,7 +81,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 @pytest.fixture(scope="session")
 def charmcraft_config() -> dict[str, Any]:
     """Return the parsed charmcraft configuration."""
-    with pathlib.Path("charmcraft.yaml").open(encoding="utf-8") as stream:
+    with (PROJECT_ROOT / "charmcraft.yaml").open(encoding="utf-8") as stream:
         return yaml.safe_load(stream)
 
 
@@ -126,7 +128,7 @@ def charm_file(app_name: str, pytestconfig: pytest.Config) -> pathlib.Path:
         return pathlib.Path(supplied).resolve()
 
     for generated_file in GENERATED_METADATA_FILES:
-        pathlib.Path(generated_file).unlink(missing_ok=True)
+        (PROJECT_ROOT / generated_file).unlink(missing_ok=True)
 
     try:
         subprocess.run(
@@ -134,13 +136,14 @@ def charm_file(app_name: str, pytestconfig: pytest.Config) -> pathlib.Path:
             check=True,
             capture_output=True,
             text=True,
+            cwd=PROJECT_ROOT,
         )  # nosec B603, B607
     except subprocess.CalledProcessError as exc:
         raise OSError(
             f"Error packing charm: {exc}\nStderr:\n{exc.stderr}"
         ) from exc
 
-    charms = sorted(pathlib.Path(".").glob(f"{app_name}*.charm"))
+    charms = sorted(PROJECT_ROOT.glob(f"{app_name}*.charm"))
     if not charms:
         raise FileNotFoundError(f"Unable to find packed charm for {app_name}")
     if len(charms) > 1:
