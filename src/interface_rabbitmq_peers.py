@@ -179,11 +179,11 @@ class RabbitMQOperatorPeers(Object):
         logging.debug(f"Setting nodename {nodename}")
         self.peers_rel.data[self.model.unit][self.NODENAME] = nodename
 
-    def retrieve_password(self, username: str) -> str:
+    def retrieve_password(self, username: str) -> str | None:
         """Retrieve persisted password for provided username."""
         if not self.peers_rel:
             return None
-        return str(self.peers_rel.data[self.peers_rel.app].get(username))
+        return self.peers_rel.data[self.peers_rel.app].get(username)
 
     @property
     def operator_password(self) -> str:

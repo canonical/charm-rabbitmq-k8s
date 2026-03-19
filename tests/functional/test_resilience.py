@@ -66,7 +66,7 @@ def test_resilience_during_scale_events(
         test_id=f"resilience-{uuid.uuid4().hex[:8]}",
         queue_prefix="resilience",
     )
-    stdout, stderr = b"", b""
+    stdout, stderr = "", ""
     try:
         time.sleep(20)
 
@@ -137,7 +137,7 @@ def test_resilience_during_pod_restarts(
         test_id=f"restart-{uuid.uuid4().hex[:8]}",
         queue_prefix="restart",
     )
-    stdout, stderr = b"", b""
+    stdout, stderr = "", ""
     try:
         time.sleep(20)
 

@@ -371,7 +371,7 @@ def test_exact_number_of_nodes_needed():
         ("key1=value1,example..com/key2=value2", None),
         ("key1=value1,key=value2,key3=", None),
         ("key1=value1,=value2", None),
-        ("key1=value1,key=val=ue2", None),
+        ("key1=value1,key=val=ue2", {"key1": "value1", "key": "val=ue2"}),
         ("a" * 256 + "=value", None),
         ("key@=value", None),
         ("key. =value", None),
@@ -413,6 +413,7 @@ def test_ensure_ownership_different_ownership():
     container.exec.assert_called_once_with(
         ["chown", "-R", "rabbitmq:rabbitmq", "/test/path"]
     )
+    container.exec.return_value.wait_output.assert_called_once()
 
 
 def test_ensure_ownership_exec_error():
@@ -420,9 +421,11 @@ def test_ensure_ownership_exec_error():
     container = Mock()
     file_info = Mock(user="root", group="root")
     container.list_files.return_value = [file_info]
-    container.exec.side_effect = ops.pebble.ExecError(
+    process = Mock()
+    process.wait_output.side_effect = ops.pebble.ExecError(
         ["chown"], 1, "stdout", "Permission denied"
     )
+    container.exec.return_value = process
 
     result = charm.RabbitMQOperatorCharm._ensure_ownership(
         SimpleNamespace(), container, "/test/path", "rabbitmq", "rabbitmq"
@@ -434,9 +437,11 @@ def test_ensure_ownership_exec_error():
 def test_set_ownership_on_data_dir_not_mounted():
     """Data-dir ownership waits until the storage mount exists."""
     container = Mock()
-    container.exec.side_effect = ops.pebble.ExecError(
+    process = Mock()
+    process.wait_output.side_effect = ops.pebble.ExecError(
         ["mountpoint"], 1, "", "not a mountpoint"
     )
+    container.exec.return_value = process
     fake = _fake_charm(
         unit=Mock(get_container=Mock(return_value=container)),
         _rabbitmq_running=Mock(return_value=True),
@@ -1108,7 +1113,7 @@ def test_reconcile_workload_layer_skips_replan_when_plan_matches():
     container = Mock()
     container.get_plan.return_value.to_dict.return_value = {
         "services": desired_layer["services"],
-        "checks": desired_layer["checks"],
+        "checks": desired_layer.get("checks", {}),
     }
     fake = _fake_charm(_rabbitmq_layer=lambda: desired_layer)
 
@@ -1142,6 +1147,37 @@ def test_reconcile_workload_layer_replans_when_plan_drifts():
         "rabbitmq", desired_layer, combine=True
     )
     container.replan.assert_called_once_with()
+
+
+def test_rabbitmq_layer_omits_checks_before_operator_bootstrap():
+    """Health checks should not be armed before the broker is bootstrapped."""
+    layer = charm.RabbitMQOperatorCharm._rabbitmq_layer(
+        SimpleNamespace(peers=SimpleNamespace(operator_user_created=None))
+    )
+
+    assert "checks" not in layer
+
+
+def test_rabbitmq_layer_adds_checks_after_operator_bootstrap():
+    """Health checks should be added once operator bootstrap completed."""
+    layer = charm.RabbitMQOperatorCharm._rabbitmq_layer(
+        SimpleNamespace(peers=SimpleNamespace(operator_user_created="operator"))
+    )
+
+    assert layer["checks"] == {
+        "alive": {
+            "override": "replace",
+            "level": "alive",
+            "period": charm.HEALTH_CHECK_INTERVAL,
+            "exec": {"command": charm.RABBITMQ_ALIVE_CHECK_PATH},
+        },
+        "ready": {
+            "override": "replace",
+            "level": "ready",
+            "period": charm.HEALTH_CHECK_INTERVAL,
+            "exec": {"command": charm.RABBITMQ_SAFETY_CHECK_PATH},
+        },
+    }
 
 
 def test_render_and_push_workload_scripts_only_restarts_notifier_for_notifier_changes():
@@ -1291,8 +1327,10 @@ def test_rabbitmq_data_pvc_capacity_bytes():
     unit.get_container.return_value = container
     fake = _fake_charm(unit=unit)
 
-    resolved = charm.RabbitMQOperatorCharm._rabbitmq_data_pvc_capacity_bytes(
-        fake
+    resolved = (
+        charm.RabbitMQOperatorCharm._rabbitmq_data_pvc_capacity_bytes.func(
+            fake
+        )
     )
 
     assert resolved == 1073741824
@@ -1380,7 +1418,7 @@ def test_resolved_disk_free_limit_bytes_auto_uses_ten_percent_of_pvc():
             "protect-members": True,
             "minimum-replicas": 3,
         },
-        _rabbitmq_data_pvc_capacity_bytes=Mock(return_value=1024**3),
+        _rabbitmq_data_pvc_capacity_bytes=1024**3,
     )
 
     assert (
@@ -1398,7 +1436,7 @@ def test_resolved_disk_free_limit_bytes_explicit_value_is_parsed():
             "protect-members": True,
             "minimum-replicas": 3,
         },
-        _rabbitmq_data_pvc_capacity_bytes=Mock(return_value=10 * 1024**3),
+        _rabbitmq_data_pvc_capacity_bytes=10 * 1024**3,
     )
 
     assert (
@@ -1416,7 +1454,7 @@ def test_resolved_disk_free_limit_bytes_rejects_values_larger_than_pvc():
             "protect-members": True,
             "minimum-replicas": 3,
         },
-        _rabbitmq_data_pvc_capacity_bytes=Mock(return_value=1024**3),
+        _rabbitmq_data_pvc_capacity_bytes=1024**3,
     )
 
     with pytest.raises(charm.RabbitOperatorError):
@@ -1426,7 +1464,7 @@ def test_resolved_disk_free_limit_bytes_rejects_values_larger_than_pvc():
 def test_resolved_wal_max_size_bytes_large_pvc_is_capped():
     """A 4Gi PVC produces a WAL size capped at 512Mi."""
     fake = _fake_charm(
-        _rabbitmq_data_pvc_capacity_bytes=Mock(return_value=4 * 1024**3),
+        _rabbitmq_data_pvc_capacity_bytes=4 * 1024**3,
         resolved_disk_free_limit_bytes=429496729,
     )
 
@@ -1438,7 +1476,7 @@ def test_resolved_wal_max_size_bytes_large_pvc_is_capped():
 def test_resolved_wal_max_size_bytes_small_pvc_uncapped():
     """A 1Gi PVC produces an uncapped WAL size of (pvc - disk_free) // 2."""
     fake = _fake_charm(
-        _rabbitmq_data_pvc_capacity_bytes=Mock(return_value=1073741824),
+        _rabbitmq_data_pvc_capacity_bytes=1073741824,
         resolved_disk_free_limit_bytes=107374182,
     )
 
@@ -1451,7 +1489,7 @@ def test_resolved_wal_max_size_bytes_tiny_pvc_raises():
     """A PVC where capacity equals the disk free limit raises RabbitOperatorError."""
     pvc_capacity = 1073741824
     fake = _fake_charm(
-        _rabbitmq_data_pvc_capacity_bytes=Mock(return_value=pvc_capacity),
+        _rabbitmq_data_pvc_capacity_bytes=pvc_capacity,
         resolved_disk_free_limit_bytes=pvc_capacity,
     )
 
@@ -1524,6 +1562,7 @@ def test_render_safety_check_checks_listener_and_honours_protection_flag():
     script = charm.RabbitMQOperatorCharm._render_template(
         fake,
         "rabbitmq-safety-check.sh.j2",
+        safety_reason_file=charm.RABBITMQ_SAFETY_REASON_FILE,
         safety_reason_not_running=charm.SAFETY_REASON_NOT_RUNNING,
         safety_reason_local_alarms=charm.SAFETY_REASON_LOCAL_ALARMS,
         safety_reason_cluster_status=charm.SAFETY_REASON_CLUSTER_STATUS,
@@ -1531,6 +1570,7 @@ def test_render_safety_check_checks_listener_and_honours_protection_flag():
         amqp_port=charm.RABBITMQ_SERVICE_PORT,
     )
 
+    assert "REASON_FILE=" in script
     assert (
         "listeners 2>/dev/null | grep -Eq '(^|[^0-9])port: 5672([^0-9]|$)'"
         in script
@@ -1612,74 +1652,6 @@ def test_render_and_push_pebble_notifier_delegates_to_push_text_file():
     container.pull.assert_not_called()
 
 
-def test_evaluate_broker_safety_detects_local_alarms():
-    """Safety evaluation is unsafe when local alarms are active."""
-    container = Mock()
-    container.exec.side_effect = [
-        ops.pebble.ExecError(
-            ["rabbitmq-diagnostics", "check_local_alarms"],
-            1,
-            "",
-            "memory alarm",
-        ),
-    ]
-    fake = _fake_charm(
-        unit=Mock(get_container=Mock(return_value=container)),
-        _rabbitmq_running=Mock(return_value=True),
-    )
-
-    safe, reason = charm.RabbitMQOperatorCharm._evaluate_broker_safety(fake)
-
-    assert not safe
-    assert reason == charm.SAFETY_REASON_LOCAL_ALARMS
-
-
-def test_evaluate_broker_safety_detects_cluster_status_failure():
-    """Safety evaluation is unsafe when cluster status cannot be fetched."""
-    container = Mock()
-    container.exec.side_effect = [
-        Mock(wait_output=Mock(return_value=("", ""))),
-        Mock(wait_output=Mock(return_value=("", ""))),
-        ops.pebble.ExecError(
-            ["rabbitmq-diagnostics", "cluster_status"],
-            1,
-            "",
-            "timeout",
-        ),
-    ]
-    fake = _fake_charm(
-        unit=Mock(get_container=Mock(return_value=container)),
-        _rabbitmq_running=Mock(return_value=True),
-    )
-
-    safe, reason = charm.RabbitMQOperatorCharm._evaluate_broker_safety(fake)
-
-    assert not safe
-    assert reason == charm.SAFETY_REASON_CLUSTER_STATUS
-
-
-def test_evaluate_broker_safety_detects_loss_of_majority():
-    """Safety evaluation is unsafe when the cluster loses majority."""
-    cluster_status = {
-        "disk_nodes": ["n1", "n2", "n3"],
-        "running_nodes": ["n1"],
-    }
-    container = Mock()
-    container.exec.side_effect = [
-        Mock(wait_output=Mock(return_value=("", ""))),
-        Mock(wait_output=Mock(return_value=(json.dumps(cluster_status), ""))),
-    ]
-    fake = _fake_charm(
-        unit=Mock(get_container=Mock(return_value=container)),
-        _rabbitmq_running=Mock(return_value=True),
-    )
-
-    safe, reason = charm.RabbitMQOperatorCharm._evaluate_broker_safety(fake)
-
-    assert not safe
-    assert reason == "Cluster lost majority (1/3 running disk nodes)"
-
-
 def test_reconcile_listener_protection_suspends_on_unsafe_transition():
     """Unsafe units suspend listeners and create the charm marker."""
     container = Mock()
@@ -1701,6 +1673,7 @@ def test_reconcile_listener_protection_resumes_only_with_charm_marker():
     """Safe units only auto-resume listeners when the charm marker exists."""
     container = Mock()
     container.exists.return_value = False
+    container.exec.side_effect = [Mock(), Mock()]
     fake = _fake_charm(unit=Mock(get_container=Mock(return_value=container)))
     fake._resume_listeners = lambda current, context: charm.RabbitMQOperatorCharm._resume_listeners(  # noqa: E501
         fake, current, context
@@ -1712,11 +1685,13 @@ def test_reconcile_listener_protection_resumes_only_with_charm_marker():
 
     container.reset_mock()
     container.exists.return_value = True
+    container.exec.side_effect = [Mock(), Mock()]
     charm.RabbitMQOperatorCharm._reconcile_listener_protection(fake, True)
 
-    container.exec.assert_called_once_with(
-        ["rabbitmqctl", "resume_listeners"], timeout=30
-    )
+    assert container.exec.call_args_list == [
+        call(["rabbitmqctl", "await_startup"], timeout=60),
+        call(["rabbitmqctl", "resume_listeners"], timeout=30),
+    ]
     container.remove_path.assert_called_once_with(
         charm.RABBITMQ_PROTECTOR_MARKER
     )
@@ -2354,3 +2329,316 @@ def test_reconcile_lb_reconciles_valid_service():
     charm.RabbitMQOperatorCharm._reconcile_lb(fake, None)
 
     resource_manager.reconcile.assert_called_once_with([service])
+
+
+def test_get_queue_growth_selector_zero_members():
+    """A queue with zero members needs all nodes as candidates."""
+    fake = _fake_charm()
+
+    assert (
+        charm.RabbitMQOperatorCharm.get_queue_growth_selector(fake, 0, 0)
+        == "all"
+    )
+    assert (
+        charm.RabbitMQOperatorCharm.get_queue_growth_selector(fake, 0, 3)
+        == "all"
+    )
+
+
+def test_peer_relation_leaving_handles_model_error():
+    """Container disconnection during peer-leaving is handled gracefully."""
+    container = Mock()
+    container.exec.side_effect = ops.model.ModelError()
+    event = SimpleNamespace(nodename="rabbitmq-k8s/1")
+    fake = _fake_charm(
+        unit=Mock(
+            is_leader=Mock(return_value=True),
+            get_container=Mock(return_value=container),
+        ),
+    )
+
+    charm.RabbitMQOperatorCharm._on_peer_relation_leaving(fake, event)
+
+    container.exec.assert_called_once()
+
+
+def test_workload_reconcile_prerequisites_non_leader_no_operator_user():
+    """Non-leader without operator_user_created defers and returns False."""
+    event = Mock()
+    fake = _fake_charm(
+        unit=Mock(is_leader=Mock(return_value=False)),
+        peers=SimpleNamespace(
+            erlang_cookie="some-cookie",
+            operator_user_created=None,
+        ),
+        peers_bind_address="10.10.1.1",
+    )
+
+    result = charm.RabbitMQOperatorCharm._workload_reconcile_prerequisites(
+        fake, event
+    )
+
+    assert result is False
+    event.defer.assert_called_once()
+
+
+def test_annotation_values_with_special_characters_accepted():
+    """K8s annotation values with colons, slashes, etc. are valid."""
+    assert charm.validate_annotation_value("http://example.com") is True
+    assert charm.validate_annotation_value("key:value") is True
+    assert charm.validate_annotation_value("a@b=c d") is True
+    assert charm.validate_annotation_value("") is False
+
+
+def test_on_collect_unit_status_does_not_mutate_listener_state():
+    """Status collection must not call _reconcile_listener_protection."""
+    container = Mock()
+    container.exists.return_value = False
+    event = Mock()
+    fake = _fake_charm(
+        unit=Mock(
+            is_leader=Mock(return_value=True),
+            get_container=Mock(return_value=container),
+            set_workload_version=Mock(),
+        ),
+        peers=SimpleNamespace(
+            erlang_cookie="cookie",
+            operator_user_created=True,
+            operator_password="op-pass",
+        ),
+        _stored=SimpleNamespace(rabbitmq_version="3.12.0"),
+        _read_safety_status=Mock(return_value=(True, "safe")),
+        _undersized_queue_count=Mock(return_value=0),
+        _operator_user_recovery_required=Mock(return_value=False),
+        _configuration_error=Mock(return_value=None),
+    )
+    fake._reconcile_listener_protection = Mock()
+
+    charm.RabbitMQOperatorCharm._on_collect_unit_status(fake, event)
+
+    fake._reconcile_listener_protection.assert_not_called()
+
+
+def test_on_collect_unit_status_uses_read_safety_status():
+    """Status collection reads pebble check status via _read_safety_status."""
+    event = Mock()
+    fake = _fake_charm(
+        unit=Mock(
+            is_leader=Mock(return_value=True),
+            set_workload_version=Mock(),
+        ),
+        peers=SimpleNamespace(
+            erlang_cookie="cookie",
+            operator_user_created=True,
+            operator_password="op-pass",
+        ),
+        _stored=SimpleNamespace(rabbitmq_version="3.12.0"),
+        _read_safety_status=Mock(return_value=(True, "safe")),
+        _undersized_queue_count=Mock(return_value=0),
+        _operator_user_recovery_required=Mock(return_value=False),
+        _configuration_error=Mock(return_value=None),
+    )
+    charm.RabbitMQOperatorCharm._on_collect_unit_status(fake, event)
+
+    fake._read_safety_status.assert_called_once()
+
+
+def test_retrieve_password_returns_none_not_string_none():
+    """Missing passwords must return None, not the string 'None'."""
+    from interface_rabbitmq_peers import (
+        RabbitMQOperatorPeers,
+    )
+
+    app_data = {}
+    app_key = Mock()
+    rel = Mock()
+    rel.data = {app_key: app_data}
+    rel.app = app_key
+
+    peers = object.__new__(RabbitMQOperatorPeers)
+    peers.relation_name = "peers"
+
+    with patch.object(
+        type(peers),
+        "peers_rel",
+        new_callable=lambda: property(lambda self: rel),
+    ):
+        result = peers.retrieve_password("nonexistent-user")
+
+    assert result is None
+    assert result != "None"
+
+
+def test_on_pebble_check_failed_suspends_on_ready_check():
+    """The ready check failure drives listener suspension."""
+    container = Mock()
+    container.exists.return_value = False
+    info = SimpleNamespace(name="ready")
+    event = SimpleNamespace(info=info)
+    fake = _fake_charm(
+        unit=Mock(get_container=Mock(return_value=container)),
+    )
+    fake._suspend_listeners = (
+        lambda c: charm.RabbitMQOperatorCharm._suspend_listeners(fake, c)
+    )
+    fake._reconcile_listener_protection = lambda safe: charm.RabbitMQOperatorCharm._reconcile_listener_protection(
+        fake, safe
+    )
+
+    charm.RabbitMQOperatorCharm._on_pebble_check_failed(fake, event)
+
+    # Handler calls _reconcile_listener_protection(safe=False), which reads
+    # container from self.unit.get_container() (not event.workload).
+    container.exec.assert_called_once_with(
+        ["rabbitmqctl", "suspend_listeners"], timeout=30
+    )
+
+
+def test_on_pebble_check_failed_ignores_alive_check():
+    """The alive check failure does not drive listener protection."""
+    info = SimpleNamespace(name="alive")
+    event = SimpleNamespace(info=info)
+    fake = _fake_charm()
+    fake._reconcile_listener_protection = Mock()
+
+    charm.RabbitMQOperatorCharm._on_pebble_check_failed(fake, event)
+
+    fake._reconcile_listener_protection.assert_not_called()
+
+
+def test_on_pebble_check_recovered_resumes_on_ready_check():
+    """The ready check recovery drives listener resumption."""
+    container = Mock()
+    container.exists.return_value = True
+    container.exec.side_effect = [Mock(), Mock()]
+    info = SimpleNamespace(name="ready")
+    event = SimpleNamespace(info=info)
+    fake = _fake_charm(
+        unit=Mock(get_container=Mock(return_value=container)),
+    )
+    fake._resume_listeners = (
+        lambda c, ctx: charm.RabbitMQOperatorCharm._resume_listeners(
+            fake, c, ctx
+        )
+    )
+    fake._reconcile_listener_protection = lambda safe: charm.RabbitMQOperatorCharm._reconcile_listener_protection(
+        fake, safe
+    )
+
+    charm.RabbitMQOperatorCharm._on_pebble_check_recovered(fake, event)
+
+    assert container.exec.call_args_list == [
+        call(["rabbitmqctl", "await_startup"], timeout=60),
+        call(["rabbitmqctl", "resume_listeners"], timeout=30),
+    ]
+
+
+def test_undersized_queue_count_returns_zero_when_admin_api_unavailable():
+    """Queue status should not fail if the management API is still starting."""
+    fake = _fake_charm(
+        unit=Mock(is_leader=Mock(return_value=True)),
+        peers=SimpleNamespace(operator_user_created=True),
+        _manage_queues=Mock(return_value=True),
+        _rabbitmq_running=Mock(return_value=True),
+        get_undersized_queues=Mock(
+            side_effect=requests.exceptions.ConnectionError("not ready")
+        ),
+    )
+
+    result = charm.RabbitMQOperatorCharm._undersized_queue_count(fake)
+
+    assert result == 0
+
+
+def test_reconcile_does_not_drive_listener_protection():
+    """Reconcile delegates listener protection to pebble check events."""
+    fake = _fake_charm(
+        _ensure_broker_running=Mock(return_value=True),
+        _reconcile_operator_user=Mock(return_value=True),
+        _reconcile_amqp_relations=Mock(return_value=True),
+        _cleanup_stale_amqp_users=Mock(),
+        _reconcile_queue_membership=Mock(return_value=True),
+        _publish_relation_data=Mock(),
+        _reconcile_lb=Mock(),
+    )
+    fake._reconcile_listener_protection = Mock()
+
+    charm.RabbitMQOperatorCharm._reconcile(fake, None)
+
+    fake._reconcile_listener_protection.assert_not_called()
+
+
+def test_on_pebble_check_recovered_ignores_alive_check():
+    """The alive check recovery does not drive listener protection."""
+    info = SimpleNamespace(name="alive")
+    event = SimpleNamespace(info=info)
+    fake = _fake_charm()
+    fake._reconcile_listener_protection = Mock()
+
+    charm.RabbitMQOperatorCharm._on_pebble_check_recovered(fake, event)
+
+    fake._reconcile_listener_protection.assert_not_called()
+
+
+def test_read_safety_status_returns_safe_when_check_is_up():
+    """A passing ready check means the broker is safe."""
+    container = Mock()
+    check_info = SimpleNamespace(status=ops.pebble.CheckStatus.UP)
+    container.get_check.return_value = check_info
+    fake = _fake_charm(
+        unit=Mock(get_container=Mock(return_value=container)),
+    )
+
+    safe, reason = charm.RabbitMQOperatorCharm._read_safety_status(fake)
+
+    assert safe is True
+    assert reason == "safe"
+    container.get_check.assert_called_once_with("ready")
+
+
+def test_read_safety_status_returns_unsafe_with_reason_from_file():
+    """A failing ready check reads the reason from the reason file."""
+    container = Mock()
+    check_info = SimpleNamespace(status=ops.pebble.CheckStatus.DOWN)
+    container.get_check.return_value = check_info
+    container.pull.return_value = SimpleNamespace(
+        read=lambda: "Local alarms active\n"
+    )
+    fake = _fake_charm(
+        unit=Mock(get_container=Mock(return_value=container)),
+    )
+
+    safe, reason = charm.RabbitMQOperatorCharm._read_safety_status(fake)
+
+    assert safe is False
+    assert reason == "Local alarms active"
+
+
+def test_read_safety_status_falls_back_when_reason_file_missing():
+    """A failing check without a reason file uses a generic message."""
+    container = Mock()
+    check_info = SimpleNamespace(status=ops.pebble.CheckStatus.DOWN)
+    container.get_check.return_value = check_info
+    container.pull.side_effect = ops.pebble.PathError("not-found", "not found")
+    fake = _fake_charm(
+        unit=Mock(get_container=Mock(return_value=container)),
+    )
+
+    safe, reason = charm.RabbitMQOperatorCharm._read_safety_status(fake)
+
+    assert safe is False
+    assert "safety check failing" in reason.lower()
+
+
+def test_read_safety_status_treats_inactive_as_safe():
+    """A check that hasn't run yet (INACTIVE) is treated as safe."""
+    container = Mock()
+    check_info = SimpleNamespace(status=ops.pebble.CheckStatus.INACTIVE)
+    container.get_check.return_value = check_info
+    fake = _fake_charm(
+        unit=Mock(get_container=Mock(return_value=container)),
+    )
+
+    safe, reason = charm.RabbitMQOperatorCharm._read_safety_status(fake)
+
+    assert safe is True

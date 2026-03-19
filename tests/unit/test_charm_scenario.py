@@ -71,13 +71,8 @@ def _patch_config_changed_for_success(
     monkeypatch.setattr(charm_instance, "_rabbitmq_running", lambda: True)
     monkeypatch.setattr(
         charm_instance,
-        "_evaluate_broker_safety",
+        "_read_safety_status",
         lambda: (True, "safe"),
-    )
-    monkeypatch.setattr(
-        charm_instance,
-        "_reconcile_listener_protection",
-        lambda safe: None,
     )
     monkeypatch.setattr(
         type(charm_instance),
@@ -283,6 +278,41 @@ def test_config_changed_proceeds_for_leader_without_operator_user(
 
     with ctx(ctx.on.config_changed(), state) as manager:
         _patch_config_changed_for_success(monkeypatch, manager.charm)
+        state_out = manager.run()
+
+    assert state_out.deferred == []
+
+
+def test_config_changed_tolerates_queue_status_api_unavailable(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """Config-changed should not fail if queue status is queried before startup."""
+    peer = testing.PeerRelation(
+        endpoint="peers",
+        local_app_data={
+            "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
+            "erlang_cookie": "magicsecurity",
+        },
+        local_unit_data={},
+    )
+    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
+    admin_api = Mock(
+        list_quorum_queues=Mock(
+            side_effect=requests.exceptions.ConnectionError("not ready")
+        )
+    )
+
+    with ctx(ctx.on.config_changed(), state) as manager:
+        _patch_config_changed_for_success(
+            monkeypatch, manager.charm, admin_api=admin_api
+        )
+        monkeypatch.setattr(
+            manager.charm, "_reconcile_running_broker_state", lambda: None
+        )
+        monkeypatch.setattr(
+            manager.charm, "_reconcile_queue_membership", lambda event: True
+        )
         state_out = manager.run()
 
     assert state_out.deferred == []
@@ -569,6 +599,42 @@ def test_update_status_waiting_without_operator_user(
     )
 
 
+def test_update_status_leader_waiting_for_rabbitmq_start(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """Leader reports waiting for RabbitMQ to start before operator user exists."""
+    peer = testing.PeerRelation(
+        endpoint="peers",
+        local_app_data={"erlang_cookie": "magicsecurity"},
+        local_unit_data={},
+    )
+    state = _state(
+        rabbitmq_container, networks, leader=True, relations=[peer]
+    )
+
+    with ctx(ctx.on.update_status(), state) as manager:
+        ensure_running = Mock(return_value=True)
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: False)
+        monkeypatch.setattr(
+            manager.charm, "_ensure_broker_running", ensure_running
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_wal_max_size_bytes",
+            property(lambda self: 483183821),
+        )
+        state_out = manager.run()
+
+    assert state_out.unit_status == ops.model.WaitingStatus(
+        "Waiting for RabbitMQ to start"
+    )
+
+
 def test_update_status_active_when_relations_ready(
     ctx, rabbitmq_container, networks, monkeypatch
 ):
@@ -612,13 +678,8 @@ def test_update_status_active_when_relations_ready(
         )
         monkeypatch.setattr(
             manager.charm,
-            "_evaluate_broker_safety",
+            "_read_safety_status",
             lambda: (True, "safe"),
-        )
-        monkeypatch.setattr(
-            manager.charm,
-            "_reconcile_listener_protection",
-            lambda safe: None,
         )
         monkeypatch.setattr(
             manager.charm,
@@ -788,7 +849,6 @@ def test_update_status_blocked_when_protection_mode_engaged(
     state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
 
     with ctx(ctx.on.update_status(), state) as manager:
-        reconcile = Mock()
         monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: True)
         monkeypatch.setattr(
             manager.charm,
@@ -797,13 +857,8 @@ def test_update_status_blocked_when_protection_mode_engaged(
         )
         monkeypatch.setattr(
             manager.charm,
-            "_evaluate_broker_safety",
+            "_read_safety_status",
             lambda: (False, "Local alarms active"),
-        )
-        monkeypatch.setattr(
-            manager.charm,
-            "_reconcile_listener_protection",
-            reconcile,
         )
         monkeypatch.setattr(
             manager.charm,
@@ -840,7 +895,6 @@ def test_update_status_blocked_when_protection_mode_engaged(
         )
         state_out = manager.run()
 
-    reconcile.assert_called_once_with(False)
     assert state_out.unit_status == ops.model.BlockedStatus(
         "Protection mode: Local alarms active"
     )
@@ -868,7 +922,6 @@ def test_update_status_warns_instead_of_blocking_when_protection_disabled(
     )
 
     with ctx(ctx.on.update_status(), state) as manager:
-        reconcile = Mock()
         monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: True)
         monkeypatch.setattr(
             manager.charm,
@@ -877,13 +930,8 @@ def test_update_status_warns_instead_of_blocking_when_protection_disabled(
         )
         monkeypatch.setattr(
             manager.charm,
-            "_evaluate_broker_safety",
+            "_read_safety_status",
             lambda: (False, "Local alarms active"),
-        )
-        monkeypatch.setattr(
-            manager.charm,
-            "_reconcile_listener_protection",
-            reconcile,
         )
         monkeypatch.setattr(
             manager.charm,
@@ -920,7 +968,6 @@ def test_update_status_warns_instead_of_blocking_when_protection_disabled(
         )
         state_out = manager.run()
 
-    reconcile.assert_called_once_with(False)
     assert state_out.unit_status == ops.model.ActiveStatus(
         "WARNING: protection disabled (Local alarms active)"
     )
@@ -955,13 +1002,8 @@ def test_update_status_warns_when_queues_are_undersized(
         )
         monkeypatch.setattr(
             manager.charm,
-            "_evaluate_broker_safety",
+            "_read_safety_status",
             lambda: (True, "safe"),
-        )
-        monkeypatch.setattr(
-            manager.charm,
-            "_reconcile_listener_protection",
-            lambda safe: None,
         )
         monkeypatch.setattr(
             manager.charm,
@@ -1213,13 +1255,8 @@ def test_ensure_queue_ha_action_reports_result(
         )
         monkeypatch.setattr(
             manager.charm,
-            "_evaluate_broker_safety",
+            "_read_safety_status",
             lambda: (True, "safe"),
-        )
-        monkeypatch.setattr(
-            manager.charm,
-            "_reconcile_listener_protection",
-            lambda safe: None,
         )
         monkeypatch.setattr(
             type(manager.charm),

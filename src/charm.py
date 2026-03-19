@@ -85,6 +85,8 @@ from ops.charm import (
     ActionEvent,
     CharmBase,
     CollectStatusEvent,
+    PebbleCheckFailedEvent,
+    PebbleCheckRecoveredEvent,
     PebbleCustomNoticeEvent,
 )
 from ops.framework import (
@@ -132,6 +134,7 @@ RABBITMQ_PROMETHEUS_PORT = 15692
 RABBITMQ_PROTECTOR_MARKER = (
     f"{RABBITMQ_DATA_DIR}/.rabbitmq-protect-members-suspended"
 )
+RABBITMQ_SAFETY_REASON_FILE = f"{RABBITMQ_DATA_DIR}/.safety-check-reason"
 RABBITMQ_ALIVE_CHECK_PATH = "/usr/bin/rabbitmq-alive-check"
 RABBITMQ_SAFETY_CHECK_PATH = "/usr/bin/rabbitmq-safety-check"
 HEALTH_CHECK_INTERVAL = "10s"
@@ -170,12 +173,9 @@ BYTE_SUFFIXES = {
 }
 
 # Regex for Kubernetes annotation values:
-# - Allows alphanumeric characters, dots (.), dashes (-), and underscores (_)
-# - Matches the entire string
-# - Does not allow empty strings
-# - Example valid: "value1", "my-value", "value.name", "value_name"
-# - Example invalid: "value@", "value#", "value space"
-ANNOTATION_VALUE_PATTERN = re.compile(r"^[\w.\-_]+$")
+# Kubernetes annotation values have no character restrictions — only a total
+# size limit (256 KiB combined across all annotations).  We validate only
+# that the value is a non-empty string.
 
 # Based on
 # https://github.com/kubernetes/apimachinery/blob/v0.31.3/pkg/util/validation/validation.go#L204
@@ -356,6 +356,14 @@ class RabbitMQOperatorCharm(CharmBase):
             self.on[RABBITMQ_CONTAINER].pebble_custom_notice,
             self._on_pebble_custom_notice,
         )
+        self.framework.observe(
+            self.on[RABBITMQ_CONTAINER].pebble_check_failed,
+            self._on_pebble_check_failed,
+        )
+        self.framework.observe(
+            self.on[RABBITMQ_CONTAINER].pebble_check_recovered,
+            self._on_pebble_check_recovered,
+        )
 
     def _pebble_ready(self) -> bool:
         """Check whether RabbitMQ container is up and configurable."""
@@ -407,7 +415,7 @@ class RabbitMQOperatorCharm(CharmBase):
 
         self._publish_relation_data()
 
-    def _workload_reconcile_prerequisites(
+    def _workload_reconcile_prerequisites(  # noqa: C901
         self, event: EventBase | None = None
     ) -> bool:
         """Check whether enough state is present to reconcile the workload."""
@@ -417,6 +425,11 @@ class RabbitMQOperatorCharm(CharmBase):
             return False
 
         if not self.unit.is_leader() and not self.peers.erlang_cookie:
+            if event is not None:
+                event.defer()
+            return False
+
+        if not self.unit.is_leader() and not self.peers.operator_user_created:
             if event is not None:
                 event.defer()
             return False
@@ -609,6 +622,10 @@ class RabbitMQOperatorCharm(CharmBase):
                 password = self.create_user(username)
                 self.peers.store_password(username, password)
             password = self.peers.retrieve_password(username)
+            if password is None:
+                raise RabbitOperatorError(
+                    f"Password for {username} not found in peer data"
+                )
             self.set_user_permissions(username, vhost)
             relation.data[self.app]["password"] = password
 
@@ -745,7 +762,7 @@ class RabbitMQOperatorCharm(CharmBase):
         # Use the full path to the rabbitmq-server binary
         # rather than the helper wrapper script to avoid
         # redirection of console output to a log file.
-        return {
+        layer = {
             "summary": "RabbitMQ layer",
             "description": "pebble config layer for RabbitMQ",
             "services": {
@@ -767,21 +784,28 @@ class RabbitMQOperatorCharm(CharmBase):
                     "requires": [RABBITMQ_SERVICE],
                 },
             },
-            "checks": {
-                "alive": {
-                    "override": "replace",
-                    "level": "alive",
-                    "period": HEALTH_CHECK_INTERVAL,
-                    "exec": {"command": RABBITMQ_ALIVE_CHECK_PATH},
-                },
-                "ready": {
-                    "override": "replace",
-                    "level": "ready",
-                    "period": HEALTH_CHECK_INTERVAL,
-                    "exec": {"command": RABBITMQ_SAFETY_CHECK_PATH},
-                },
+        }
+
+        if not getattr(
+            getattr(self, "peers", None), "operator_user_created", None
+        ):
+            return layer
+
+        layer["checks"] = {
+            "alive": {
+                "override": "replace",
+                "level": "alive",
+                "period": HEALTH_CHECK_INTERVAL,
+                "exec": {"command": RABBITMQ_ALIVE_CHECK_PATH},
+            },
+            "ready": {
+                "override": "replace",
+                "level": "ready",
+                "period": HEALTH_CHECK_INTERVAL,
+                "exec": {"command": RABBITMQ_SAFETY_CHECK_PATH},
             },
         }
+        return layer
 
     def _reconcile_workload_layer(self, container: ops.Container) -> bool:
         """Apply the desired Pebble layer only when it has drifted."""
@@ -892,8 +916,12 @@ class RabbitMQOperatorCharm(CharmBase):
                 )
                 output, _ = process.wait_output()
                 logging.info(output)
-            except ExecError as e:
-                if "The node selected is not in the cluster" in e.stderr:
+            except (ExecError, ModelError) as e:
+                if isinstance(e, ModelError):
+                    logging.warning(
+                        f"Container unavailable while removing {leaving_node}: {e}"
+                    )
+                elif "The node selected is not in the cluster" in e.stderr:
                     logging.warning(
                         f"Removal of {leaving_node} failed, node not found"
                     )
@@ -921,7 +949,9 @@ class RabbitMQOperatorCharm(CharmBase):
         NOTE: INDIVIDUAL is expensive as an api call needs to be made
               for each queue.
         """
-        if min_q_len == max_q_len:
+        if min_q_len == 0:
+            selector = SELECTOR_ALL
+        elif min_q_len == max_q_len:
             if max_q_len < self.min_replicas():
                 # 1 -> 2
                 # 2 -> 3
@@ -1397,7 +1427,7 @@ class RabbitMQOperatorCharm(CharmBase):
     def resolved_disk_free_limit_bytes(self) -> int:
         """Return the numeric RabbitMQ disk free limit."""
         configured = str(self.config["disk-free-limit-bytes"]).strip()
-        pvc_capacity = self._rabbitmq_data_pvc_capacity_bytes()
+        pvc_capacity = self._rabbitmq_data_pvc_capacity_bytes
         try:
             parsed = self._bytes_from_string(configured)
         except ValueError as e:
@@ -1423,7 +1453,7 @@ class RabbitMQOperatorCharm(CharmBase):
     @property
     def resolved_wal_max_size_bytes(self) -> int:
         """Return the safe Raft WAL max size in bytes."""
-        pvc_capacity = self._rabbitmq_data_pvc_capacity_bytes()
+        pvc_capacity = self._rabbitmq_data_pvc_capacity_bytes
         disk_free_limit = self.resolved_disk_free_limit_bytes
         wal_max_size = min(
             WAL_MAX_SIZE_CAP, (pvc_capacity - disk_free_limit) // 2
@@ -1452,6 +1482,7 @@ class RabbitMQOperatorCharm(CharmBase):
         suffix = match.group(2).upper()
         return amount * BYTE_SUFFIXES[suffix]
 
+    @functools.cached_property
     def _rabbitmq_data_pvc_capacity_bytes(self) -> int:
         """Resolve the rabbitmq-data volume capacity from the mounted filesystem.
 
@@ -1519,45 +1550,39 @@ class RabbitMQOperatorCharm(CharmBase):
             return
         self._stored.rabbitmq_version = overview.get("product_version")
 
-    def _evaluate_broker_safety(self) -> tuple[bool, str]:
-        """Determine whether the unit is safe to keep accepting traffic."""
-        if not self._rabbitmq_running():
-            return False, SAFETY_REASON_NOT_RUNNING
+    def _on_pebble_check_failed(self, event: PebbleCheckFailedEvent) -> None:
+        """React to a Pebble health check failure."""
+        if event.info.name != "ready":
+            return
+        self._reconcile_listener_protection(safe=False)
 
+    def _on_pebble_check_recovered(
+        self, event: PebbleCheckRecoveredEvent
+    ) -> None:
+        """React to a Pebble health check recovery."""
+        if event.info.name != "ready":
+            return
+        self._reconcile_listener_protection(safe=True)
+
+    def _read_safety_status(self) -> tuple[bool, str]:
+        """Read broker safety from the Pebble ready check without shell-outs."""
         container = self.unit.get_container(RABBITMQ_CONTAINER)
+        try:
+            check = container.get_check("ready")
+        except ModelError:
+            return True, "Safety check not yet available"
+
+        # INACTIVE means the check hasn't run yet (e.g. just after layer apply).
+        # Treat as safe — we don't want to block during startup before the
+        # first check cycle completes.
+        if check.status != ops.pebble.CheckStatus.DOWN:
+            return True, "safe"
 
         try:
-            process = container.exec(
-                ["rabbitmq-diagnostics", "check_local_alarms"], timeout=30
-            )
-            process.wait_output()
-        except (ExecError, ModelError):
-            return False, SAFETY_REASON_LOCAL_ALARMS
-
-        try:
-            process = container.exec(
-                [
-                    "rabbitmq-diagnostics",
-                    "cluster_status",
-                    "--formatter=json",
-                ],
-                timeout=30,
-            )
-            output, _ = process.wait_output()
-            cluster_status = json.loads(output)
-        except (ExecError, ModelError, json.JSONDecodeError):
-            return False, SAFETY_REASON_CLUSTER_STATUS
-
-        disk_nodes = cluster_status.get("disk_nodes", [])
-        running_nodes = cluster_status.get("running_nodes", [])
-        majority = len(disk_nodes) // 2 + 1
-        if len(running_nodes) < majority:
-            return (
-                False,
-                "Cluster lost majority "
-                f"({len(running_nodes)}/{len(disk_nodes)} running disk nodes)",
-            )
-        return True, "safe"
+            reason = container.pull(RABBITMQ_SAFETY_REASON_FILE).read().strip()
+        except PathError:
+            reason = "Safety check failing"
+        return False, reason
 
     def _reconcile_listener_protection(self, safe: bool) -> None:
         """Suspend or resume listeners based on safety state."""
@@ -1589,6 +1614,9 @@ class RabbitMQOperatorCharm(CharmBase):
     ) -> None:
         """Resume listeners and clear the charm marker."""
         try:
+            container.exec(
+                ["rabbitmqctl", "await_startup"], timeout=60
+            ).wait_output()
             container.exec(
                 ["rabbitmqctl", "resume_listeners"], timeout=30
             ).wait_output()
@@ -1704,7 +1732,9 @@ class RabbitMQOperatorCharm(CharmBase):
                 logger.info(
                     "Setting ownership of %s to %s:%s", path, user, group
                 )
-                container.exec(["chown", "-R", f"{user}:{group}", path])
+                container.exec(
+                    ["chown", "-R", f"{user}:{group}", path]
+                ).wait_output()
         except ExecError as e:
             logger.error(f"Failed to set ownership: {e.stderr}")
             return False
@@ -1714,7 +1744,7 @@ class RabbitMQOperatorCharm(CharmBase):
         """Set ownership on /var/lib/rabbitmq."""
         container = self.unit.get_container(RABBITMQ_CONTAINER)
         try:
-            container.exec(["mountpoint", RABBITMQ_DATA_DIR])
+            container.exec(["mountpoint", RABBITMQ_DATA_DIR]).wait_output()
         except ExecError:
             logger.info(f"{RABBITMQ_DATA_DIR} is not mounted yet.")
             return False
@@ -1857,6 +1887,7 @@ class RabbitMQOperatorCharm(CharmBase):
         container = self.unit.get_container(RABBITMQ_CONTAINER)
         script = self._render_template(
             "rabbitmq-safety-check.sh.j2",
+            safety_reason_file=RABBITMQ_SAFETY_REASON_FILE,
             safety_reason_not_running=SAFETY_REASON_NOT_RUNNING,
             safety_reason_local_alarms=SAFETY_REASON_LOCAL_ALARMS,
             safety_reason_cluster_status=SAFETY_REASON_CLUSTER_STATUS,
@@ -2010,7 +2041,14 @@ class RabbitMQOperatorCharm(CharmBase):
             or not self._rabbitmq_running()
         ):
             return 0
-        return len(self.get_undersized_queues())
+        try:
+            return len(self.get_undersized_queues())
+        except requests.exceptions.ConnectionError as e:
+            logger.debug(
+                "RabbitMQ management API not ready for queue status, skipping: %s",
+                e,
+            )
+            return 0
 
     def _on_collect_unit_status(self, event: CollectStatusEvent) -> None:
         """Collect unit status from current state rather than event deltas."""
@@ -2025,9 +2063,16 @@ class RabbitMQOperatorCharm(CharmBase):
             return
 
         if not self.peers.operator_user_created:
-            event.add_status(
-                WaitingStatus("Waiting for leader to create operator user")
-            )
+            if self.unit.is_leader():
+                event.add_status(
+                    WaitingStatus("Waiting for RabbitMQ to start")
+                )
+            else:
+                event.add_status(
+                    WaitingStatus(
+                        "Waiting for leader to create operator user"
+                    )
+                )
             return
 
         if not self._rabbitmq_running():
@@ -2038,8 +2083,7 @@ class RabbitMQOperatorCharm(CharmBase):
             event.add_status(BlockedStatus(OPERATOR_USER_RECOVERY_MESSAGE))
             return
 
-        safe, reason = self._evaluate_broker_safety()
-        self._reconcile_listener_protection(safe)
+        safe, reason = self._read_safety_status()
         if self._stored.rabbitmq_version:
             self.unit.set_workload_version(self._stored.rabbitmq_version)
 
@@ -2465,10 +2509,8 @@ def validate_annotation_key(key: str) -> bool:
 
 def validate_annotation_value(value: str) -> bool:
     """Validate the annotation value."""
-    if not ANNOTATION_VALUE_PATTERN.match(value):
-        logger.error(
-            f"Invalid annotation value: '{value}'. Must follow Kubernetes annotation syntax."
-        )
+    if not value:
+        logger.error("Invalid annotation value: value must not be empty.")
         return False
 
     return True
