@@ -74,3 +74,10 @@ jobs:
           uv run --with tox tox -e func -- \
             "tests/functional/$TEST_FILE" \
             --charm-file rabbitmq-k8s.charm
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.test_file }}
+          path: logs/
+          if-no-files-found: ignore
