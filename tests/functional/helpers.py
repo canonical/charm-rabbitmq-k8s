@@ -107,6 +107,36 @@ def wait_for_app(
     return juju.wait(is_ready, timeout=20 * 60)
 
 
+def wait_for_app_stable(
+    juju: jubilant.Juju,
+    app_name: str,
+    units: int,
+    *,
+    timeout: int = 20 * 60,
+    interval: int = 5,
+    stable_window: int = 30,
+) -> jubilant.Status:
+    """Wait until the application stays active and idle for a sustained window."""
+    successes = max(1, math.ceil(stable_window / interval))
+
+    def is_ready(status: jubilant.Status) -> bool:
+        app = status.apps.get(app_name)
+        if app is None:
+            return False
+        return (
+            len(app.units) == units
+            and jubilant.all_active(status, app_name)
+            and jubilant.all_agents_idle(status, app_name)
+        )
+
+    return juju.wait(
+        is_ready,
+        delay=interval,
+        timeout=timeout,
+        successes=successes,
+    )
+
+
 def deploy_local(
     juju: jubilant.Juju,
     app_name: str,
