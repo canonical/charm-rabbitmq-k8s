@@ -100,6 +100,7 @@ from ops.model import (
     WaitingStatus,
 )
 from ops.pebble import (
+    APIError,
     ChangeError,
     ExecError,
     PathError,
@@ -138,10 +139,14 @@ RABBITMQ_SAFETY_REASON_FILE = f"{RABBITMQ_DATA_DIR}/.safety-check-reason"
 RABBITMQ_ALIVE_CHECK_PATH = "/usr/bin/rabbitmq-alive-check"
 RABBITMQ_SAFETY_CHECK_PATH = "/usr/bin/rabbitmq-safety-check"
 HEALTH_CHECK_INTERVAL = "10s"
+ALIVE_CHECK_TIMEOUT = "5s"
+READY_CHECK_TIMEOUT = "10s"
+HEALTH_CHECK_THRESHOLD = 3
 RABBITMQ_STARTUP_GRACE_SECONDS = 180
 SAFETY_REASON_NOT_RUNNING = "RabbitMQ not running"
 SAFETY_REASON_LOCAL_ALARMS = "Local alarms active"
 SAFETY_REASON_CLUSTER_STATUS = "Cluster status unavailable"
+HEALTH_CHECK_WAITING_MESSAGE = "Waiting for local RabbitMQ cluster join"
 OPERATOR_USER_RECOVERY_MESSAGE = (
     "Operator user missing or invalid in RabbitMQ; "
     "run recreate-operator-user action"
@@ -402,6 +407,7 @@ class RabbitMQOperatorCharm(CharmBase):
             return
 
         self._reconcile_lb(None)
+        self._reconcile_health_checks()
 
         if not self._ensure_broker_running(event):
             return
@@ -410,6 +416,7 @@ class RabbitMQOperatorCharm(CharmBase):
             return
 
         self._reconcile_running_broker_state()
+        self._reconcile_health_checks()
 
         if not self._reconcile_amqp_relations(event):
             return
@@ -801,13 +808,19 @@ class RabbitMQOperatorCharm(CharmBase):
             "alive": {
                 "override": "replace",
                 "level": "alive",
+                "startup": "disabled",
                 "period": HEALTH_CHECK_INTERVAL,
+                "timeout": ALIVE_CHECK_TIMEOUT,
+                "threshold": HEALTH_CHECK_THRESHOLD,
                 "exec": {"command": RABBITMQ_ALIVE_CHECK_PATH},
             },
             "ready": {
                 "override": "replace",
                 "level": "ready",
+                "startup": "disabled",
                 "period": HEALTH_CHECK_INTERVAL,
+                "timeout": READY_CHECK_TIMEOUT,
+                "threshold": HEALTH_CHECK_THRESHOLD,
                 "exec": {"command": RABBITMQ_SAFETY_CHECK_PATH},
             },
         }
@@ -906,6 +919,68 @@ class RabbitMQOperatorCharm(CharmBase):
                 container.restart(service_name)
             elif not layer_changed:
                 container.start(service_name)
+
+    def _local_node_in_running_cluster(self) -> bool:
+        """Return whether the local node appears in RabbitMQ running_nodes."""
+        if not self._pebble_ready():
+            return False
+
+        container = self.unit.get_container(RABBITMQ_CONTAINER)
+        try:
+            process = container.exec(
+                [
+                    "rabbitmq-diagnostics",
+                    "cluster_status",
+                    "--formatter=json",
+                ],
+                timeout=30,
+            )
+            output, _ = process.wait_output()
+            cluster_status = json.loads(output)
+        except (ExecError, ModelError, json.JSONDecodeError):
+            return False
+
+        local_node = self.generate_nodename(self.unit.name)
+        return local_node in cluster_status.get("running_nodes", [])
+
+    def _health_checks_ready(self) -> bool:
+        """Return whether Pebble health checks should currently run."""
+        if not self.peers.operator_user_created:
+            return False
+
+        if not self._rabbitmq_running():
+            return False
+
+        return self._local_node_in_running_cluster()
+
+    def _reconcile_health_checks(self) -> None:
+        """Start or stop health checks to match local broker readiness."""
+        if not self._pebble_ready():
+            return
+
+        container = self.unit.get_container(RABBITMQ_CONTAINER)
+        try:
+            ready_check = container.get_check("ready")
+        except ModelError:
+            return
+
+        try:
+            if self._health_checks_ready():
+                if (
+                    ready_check.status == ops.pebble.CheckStatus.INACTIVE
+                    and container.exists(RABBITMQ_PROTECTOR_MARKER)
+                ):
+                    self._resume_listeners(
+                        container, "before re-enabling health checks"
+                    )
+                container.start_checks("alive", "ready")
+                return
+
+            container.stop_checks("alive", "ready")
+        except (APIError, ModelError) as exc:
+            logger.warning(
+                "Unable to reconcile Pebble health checks: %s", exc
+            )
 
     def _on_peer_relation_leaving(  # noqa: C901
         self, event: EventBase
@@ -2085,6 +2160,10 @@ class RabbitMQOperatorCharm(CharmBase):
 
         if self._operator_user_recovery_required():
             event.add_status(BlockedStatus(OPERATOR_USER_RECOVERY_MESSAGE))
+            return
+
+        if not self._health_checks_ready():
+            event.add_status(WaitingStatus(HEALTH_CHECK_WAITING_MESSAGE))
             return
 
         safe, reason = self._read_safety_status()

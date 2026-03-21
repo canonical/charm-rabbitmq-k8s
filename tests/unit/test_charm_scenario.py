@@ -98,6 +98,11 @@ def _patch_config_changed_for_success(
     )
     monkeypatch.setattr(
         charm_instance,
+        "_reconcile_health_checks",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        charm_instance,
         "_operator_user_recovery_required",
         lambda: False,
     )
@@ -176,8 +181,10 @@ def test_rabbitmq_pebble_ready(ctx, rabbitmq_container, networks, monkeypatch):
         "ready",
     }
     assert (
-        container.plan.to_dict()["checks"]["alive"]["exec"]["command"]
-        == charm.RABBITMQ_ALIVE_CHECK_PATH
+        container.plan.to_dict()["checks"]["alive"]["startup"] == "disabled"
+    )
+    assert (
+        container.plan.to_dict()["checks"]["ready"]["startup"] == "disabled"
     )
     assert (
         container.service_statuses[charm.RABBITMQ_SERVICE]
@@ -676,6 +683,11 @@ def test_update_status_active_when_relations_ready(
         )
         monkeypatch.setattr(
             manager.charm,
+            "_health_checks_ready",
+            lambda: True,
+        )
+        monkeypatch.setattr(
+            manager.charm,
             "_read_safety_status",
             lambda: (True, "safe"),
         )
@@ -855,6 +867,11 @@ def test_update_status_blocked_when_protection_mode_engaged(
         )
         monkeypatch.setattr(
             manager.charm,
+            "_health_checks_ready",
+            lambda: True,
+        )
+        monkeypatch.setattr(
+            manager.charm,
             "_read_safety_status",
             lambda: (False, "Local alarms active"),
         )
@@ -898,6 +915,52 @@ def test_update_status_blocked_when_protection_mode_engaged(
     )
 
 
+def test_update_status_waiting_for_local_cluster_join(
+    ctx, rabbitmq_container, networks, monkeypatch
+):
+    """Running units wait until local cluster diagnostics show the node joined."""
+    peer = testing.PeerRelation(
+        endpoint="peers",
+        local_app_data={
+            "operator_password": "foobar",
+            "operator_user_created": "rmqadmin",
+            "erlang_cookie": "magicsecurity",
+        },
+        local_unit_data={},
+    )
+    state = _state(
+        rabbitmq_container, networks, leader=False, relations=[peer]
+    )
+
+    with ctx(ctx.on.update_status(), state) as manager:
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: True)
+        monkeypatch.setattr(
+            manager.charm,
+            "_operator_user_recovery_required",
+            lambda: False,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_health_checks_ready",
+            lambda: False,
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_disk_free_limit_bytes",
+            property(lambda self: 536870912),
+        )
+        monkeypatch.setattr(
+            type(manager.charm),
+            "resolved_wal_max_size_bytes",
+            property(lambda self: 483183821),
+        )
+        state_out = manager.run()
+
+    assert state_out.unit_status == ops.model.WaitingStatus(
+        charm.HEALTH_CHECK_WAITING_MESSAGE
+    )
+
+
 def test_update_status_warns_instead_of_blocking_when_protection_disabled(
     ctx, rabbitmq_container, networks, monkeypatch
 ):
@@ -925,6 +988,11 @@ def test_update_status_warns_instead_of_blocking_when_protection_disabled(
             manager.charm,
             "_operator_user_recovery_required",
             lambda: False,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_health_checks_ready",
+            lambda: True,
         )
         monkeypatch.setattr(
             manager.charm,
@@ -997,6 +1065,11 @@ def test_update_status_warns_when_queues_are_undersized(
             manager.charm,
             "_operator_user_recovery_required",
             lambda: False,
+        )
+        monkeypatch.setattr(
+            manager.charm,
+            "_health_checks_ready",
+            lambda: True,
         )
         monkeypatch.setattr(
             manager.charm,

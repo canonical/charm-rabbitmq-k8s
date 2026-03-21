@@ -115,8 +115,11 @@ def _fake_charm(**kwargs):
         "create_user": Mock(return_value="new-password"),
         "set_user_permissions": Mock(),
         "_rabbitmq_running": Mock(return_value=True),
+        "_local_node_in_running_cluster": Mock(return_value=True),
+        "_health_checks_ready": Mock(return_value=True),
         "_reconcile_workload": Mock(return_value=True),
         "_reconcile_running_broker_state": Mock(),
+        "_reconcile_health_checks": Mock(),
         "_reconcile": Mock(),
         "_ensure_broker_running": Mock(return_value=True),
         "_ensure_relation_credentials": Mock(),
@@ -1170,13 +1173,19 @@ def test_rabbitmq_layer_adds_checks_after_operator_bootstrap():
         "alive": {
             "override": "replace",
             "level": "alive",
+            "startup": "disabled",
             "period": charm.HEALTH_CHECK_INTERVAL,
+            "timeout": charm.ALIVE_CHECK_TIMEOUT,
+            "threshold": charm.HEALTH_CHECK_THRESHOLD,
             "exec": {"command": charm.RABBITMQ_ALIVE_CHECK_PATH},
         },
         "ready": {
             "override": "replace",
             "level": "ready",
+            "startup": "disabled",
             "period": charm.HEALTH_CHECK_INTERVAL,
+            "timeout": charm.READY_CHECK_TIMEOUT,
+            "threshold": charm.HEALTH_CHECK_THRESHOLD,
             "exec": {"command": charm.RABBITMQ_SAFETY_CHECK_PATH},
         },
     }
@@ -2570,6 +2579,53 @@ def test_reconcile_does_not_drive_listener_protection():
     fake._reconcile_listener_protection.assert_not_called()
 
 
+def test_reconcile_reconciles_health_checks_before_and_after_bootstrap():
+    """Reconcile should quiesce checks before startup and re-enable them after."""
+    order = []
+    fake = _fake_charm(
+        _reconcile_lb=Mock(side_effect=lambda *_: order.append("lb")),
+        _reconcile_health_checks=Mock(
+            side_effect=lambda: order.append("health")
+        ),
+        _ensure_broker_running=Mock(
+            side_effect=lambda *_: order.append("ensure") or True
+        ),
+        _reconcile_operator_user=Mock(
+            side_effect=lambda *_: order.append("operator") or True
+        ),
+        _reconcile_running_broker_state=Mock(
+            side_effect=lambda: order.append("running")
+        ),
+        _reconcile_amqp_relations=Mock(
+            side_effect=lambda *_: order.append("amqp") or True
+        ),
+        _cleanup_stale_amqp_users=Mock(
+            side_effect=lambda: order.append("cleanup")
+        ),
+        _reconcile_queue_membership=Mock(
+            side_effect=lambda *_: order.append("queues") or True
+        ),
+        _publish_relation_data=Mock(
+            side_effect=lambda: order.append("publish")
+        ),
+    )
+
+    charm.RabbitMQOperatorCharm._reconcile(fake, None)
+
+    assert order == [
+        "lb",
+        "health",
+        "ensure",
+        "operator",
+        "running",
+        "health",
+        "amqp",
+        "cleanup",
+        "queues",
+        "publish",
+    ]
+
+
 def test_on_pebble_check_recovered_ignores_alive_check():
     """The alive check recovery does not drive listener protection."""
     info = SimpleNamespace(name="alive")
@@ -2580,6 +2636,128 @@ def test_on_pebble_check_recovered_ignores_alive_check():
     charm.RabbitMQOperatorCharm._on_pebble_check_recovered(fake, event)
 
     fake._reconcile_listener_protection.assert_not_called()
+
+
+def test_local_node_in_running_cluster_returns_true_when_node_present():
+    """Local cluster membership relies on running_nodes from diagnostics."""
+    process = Mock(
+        wait_output=Mock(
+            return_value=(
+                json.dumps(
+                    {
+                        "running_nodes": [
+                            "rabbit@rabbitmq-k8s-0.rabbitmq-k8s-endpoints"
+                        ]
+                    }
+                ),
+                "",
+            )
+        )
+    )
+    container = Mock(exec=Mock(return_value=process))
+    fake = _fake_charm(
+        unit=SimpleNamespace(
+            name="rabbitmq-k8s/0",
+            get_container=Mock(return_value=container),
+        )
+    )
+
+    assert charm.RabbitMQOperatorCharm._local_node_in_running_cluster(fake)
+    container.exec.assert_called_once_with(
+        [
+            "rabbitmq-diagnostics",
+            "cluster_status",
+            "--formatter=json",
+        ],
+        timeout=30,
+    )
+
+
+def test_local_node_in_running_cluster_returns_false_on_exec_error():
+    """Diagnostic failures mean the unit is not yet ready for health checks."""
+    container = Mock()
+    container.exec.side_effect = ops.pebble.ExecError(
+        ["rabbitmq-diagnostics", "cluster_status", "--formatter=json"],
+        1,
+        "",
+        "not ready",
+    )
+    fake = _fake_charm(
+        unit=SimpleNamespace(
+            name="rabbitmq-k8s/0",
+            get_container=Mock(return_value=container),
+        )
+    )
+
+    assert not charm.RabbitMQOperatorCharm._local_node_in_running_cluster(fake)
+
+
+@pytest.mark.parametrize(
+    "operator_user_created,rabbitmq_running,node_in_cluster,expected",
+    [
+        (None, True, True, False),
+        ("operator", False, True, False),
+        ("operator", True, False, False),
+        ("operator", True, True, True),
+    ],
+)
+def test_health_checks_ready_requires_local_bootstrap(
+    operator_user_created, rabbitmq_running, node_in_cluster, expected
+):
+    """Health checks run only once local startup and cluster join completed."""
+    fake = _fake_charm(
+        peers=SimpleNamespace(operator_user_created=operator_user_created),
+        _rabbitmq_running=Mock(return_value=rabbitmq_running),
+        _local_node_in_running_cluster=Mock(return_value=node_in_cluster),
+    )
+
+    result = charm.RabbitMQOperatorCharm._health_checks_ready(fake)
+
+    assert result is expected
+
+
+def test_reconcile_health_checks_stops_inactive_checks_until_ready():
+    """Checks stay stopped while the local broker is still converging."""
+    container = Mock(stop_checks=Mock())
+    container.get_check.return_value = SimpleNamespace(
+        status=ops.pebble.CheckStatus.INACTIVE
+    )
+    fake = _fake_charm(
+        unit=Mock(get_container=Mock(return_value=container)),
+        _health_checks_ready=Mock(return_value=False),
+    )
+
+    charm.RabbitMQOperatorCharm._reconcile_health_checks(fake)
+
+    container.stop_checks.assert_called_once_with("alive", "ready")
+
+
+def test_reconcile_health_checks_starts_and_resumes_stale_protection():
+    """Re-enabling checks should clear a stale protection marker first."""
+    container = Mock(
+        start_checks=Mock(),
+        exists=Mock(return_value=True),
+    )
+    container.get_check.return_value = SimpleNamespace(
+        status=ops.pebble.CheckStatus.INACTIVE
+    )
+    fake = _fake_charm(
+        unit=Mock(get_container=Mock(return_value=container)),
+        _health_checks_ready=Mock(return_value=True),
+    )
+    fake._resume_listeners = (
+        lambda current, context: charm.RabbitMQOperatorCharm._resume_listeners(
+            fake, current, context
+        )
+    )
+
+    charm.RabbitMQOperatorCharm._reconcile_health_checks(fake)
+
+    assert container.exec.call_args_list == [
+        call(["rabbitmqctl", "await_startup"], timeout=60),
+        call(["rabbitmqctl", "resume_listeners"], timeout=30),
+    ]
+    container.start_checks.assert_called_once_with("alive", "ready")
 
 
 def test_read_safety_status_returns_safe_when_check_is_up():
