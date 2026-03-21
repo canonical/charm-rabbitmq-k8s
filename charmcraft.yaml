@@ -194,6 +194,14 @@ requires:
   logging:
     interface: loki_push_api
     optional: true
+  charm-tracing:
+    interface: tracing
+    limit: 1
+    optional: true
+  receive-ca-cert:
+    interface: certificate_transfer
+    limit: 1
+    optional: true
 
 provides:
   amqp:

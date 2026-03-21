@@ -334,6 +334,12 @@ class RabbitMQOperatorCharm(CharmBase):
         )
         # Logging relation
         self.logging = LogForwarder(self, relation_name="logging")
+        # Tracing relation
+        self.tracing = ops.tracing.Tracing(
+            self,
+            tracing_relation_name="charm-tracing",
+            ca_relation_name="receive-ca-cert",
+        )
 
         self.framework.observe(
             self.on.get_service_account_action, self._get_service_account
