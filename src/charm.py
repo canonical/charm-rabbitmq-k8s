@@ -2075,9 +2075,7 @@ class RabbitMQOperatorCharm(CharmBase):
                 )
             else:
                 event.add_status(
-                    WaitingStatus(
-                        "Waiting for leader to create operator user"
-                    )
+                    WaitingStatus("Waiting for leader to create operator user")
                 )
             return
 

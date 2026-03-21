@@ -1161,7 +1161,9 @@ def test_rabbitmq_layer_omits_checks_before_operator_bootstrap():
 def test_rabbitmq_layer_adds_checks_after_operator_bootstrap():
     """Health checks should be added once operator bootstrap completed."""
     layer = charm.RabbitMQOperatorCharm._rabbitmq_layer(
-        SimpleNamespace(peers=SimpleNamespace(operator_user_created="operator"))
+        SimpleNamespace(
+            peers=SimpleNamespace(operator_user_created="operator")
+        )
     )
 
     assert layer["checks"] == {
@@ -1357,8 +1359,8 @@ def test_rabbitmq_data_pvc_capacity_bytes_exec_error_raises():
     """An exec failure inside the container raises a charm error."""
     container = Mock()
     container.can_connect.return_value = True
-    container.exec.return_value.wait_output.side_effect = (
-        charm.ExecError(["python3"], 1, "", "stat failed")
+    container.exec.return_value.wait_output.side_effect = charm.ExecError(
+        ["python3"], 1, "", "stat failed"
     )
     unit = Mock()
     unit.get_container.return_value = container
