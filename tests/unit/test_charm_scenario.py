@@ -608,9 +608,7 @@ def test_update_status_leader_waiting_for_rabbitmq_start(
         local_app_data={"erlang_cookie": "magicsecurity"},
         local_unit_data={},
     )
-    state = _state(
-        rabbitmq_container, networks, leader=True, relations=[peer]
-    )
+    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
 
     with ctx(ctx.on.update_status(), state) as manager:
         ensure_running = Mock(return_value=True)
