@@ -978,9 +978,7 @@ class RabbitMQOperatorCharm(CharmBase):
 
             container.stop_checks("alive", "ready")
         except (APIError, ModelError) as exc:
-            logger.warning(
-                "Unable to reconcile Pebble health checks: %s", exc
-            )
+            logger.warning("Unable to reconcile Pebble health checks: %s", exc)
 
     def _on_peer_relation_leaving(  # noqa: C901
         self, event: EventBase
@@ -2131,59 +2129,56 @@ class RabbitMQOperatorCharm(CharmBase):
             )
             return 0
 
-    def _on_collect_unit_status(self, event: CollectStatusEvent) -> None:
-        """Collect unit status from current state rather than event deltas."""
+    def _pre_broker_status(self) -> ops.StatusBase | None:
+        """Return a blocking or waiting status before local broker checks."""
         if error := self._configuration_error():
-            event.add_status(BlockedStatus(error))
-            return
+            return BlockedStatus(error)
 
         if not self.unit.is_leader() and not self.peers.erlang_cookie:
-            event.add_status(
-                WaitingStatus("Waiting for leader to provide erlang cookie")
-            )
-            return
+            return WaitingStatus("Waiting for leader to provide erlang cookie")
 
-        if not self.peers.operator_user_created:
-            if self.unit.is_leader():
-                event.add_status(
-                    WaitingStatus("Waiting for RabbitMQ to start")
-                )
-            else:
-                event.add_status(
-                    WaitingStatus("Waiting for leader to create operator user")
-                )
-            return
+        if self.peers.operator_user_created:
+            return None
 
-        if not self._rabbitmq_running():
-            event.add_status(BlockedStatus(SAFETY_REASON_NOT_RUNNING))
-            return
+        if self.unit.is_leader():
+            return WaitingStatus("Waiting for RabbitMQ to start")
 
+        return WaitingStatus("Waiting for leader to create operator user")
+
+    def _running_broker_status(self) -> ops.StatusBase | None:
+        """Return a unit status once RabbitMQ is running locally."""
         if self._operator_user_recovery_required():
-            event.add_status(BlockedStatus(OPERATOR_USER_RECOVERY_MESSAGE))
-            return
+            return BlockedStatus(OPERATOR_USER_RECOVERY_MESSAGE)
 
         if not self._health_checks_ready():
-            event.add_status(WaitingStatus(HEALTH_CHECK_WAITING_MESSAGE))
-            return
+            return WaitingStatus(HEALTH_CHECK_WAITING_MESSAGE)
 
         safe, reason = self._read_safety_status()
         if self._stored.rabbitmq_version:
             self.unit.set_workload_version(self._stored.rabbitmq_version)
 
         if not safe:
-            event.add_status(self._unsafe_status(reason))
-            return
+            return self._unsafe_status(reason)
 
         undersized_queues = self._undersized_queue_count()
         if undersized_queues:
-            event.add_status(
-                ActiveStatus(
-                    f"WARNING: {undersized_queues} Queue(s) with insufficient members"
-                )
+            return ActiveStatus(
+                f"WARNING: {undersized_queues} Queue(s) with insufficient members"
             )
+
+        return ActiveStatus()
+
+    def _on_collect_unit_status(self, event: CollectStatusEvent) -> None:
+        """Collect unit status from current state rather than event deltas."""
+        if status := self._pre_broker_status():
+            event.add_status(status)
             return
 
-        event.add_status(ActiveStatus())
+        if not self._rabbitmq_running():
+            event.add_status(BlockedStatus(SAFETY_REASON_NOT_RUNNING))
+            return
+
+        event.add_status(self._running_broker_status())
 
     def _validate_disk_free_limit(self) -> bool:
         """Validate that disk-free-limit-bytes resolves cleanly."""

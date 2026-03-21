@@ -2423,6 +2423,12 @@ def test_on_collect_unit_status_does_not_mutate_listener_state():
         _operator_user_recovery_required=Mock(return_value=False),
         _configuration_error=Mock(return_value=None),
     )
+    fake._pre_broker_status = (
+        lambda: charm.RabbitMQOperatorCharm._pre_broker_status(fake)
+    )
+    fake._running_broker_status = (
+        lambda: charm.RabbitMQOperatorCharm._running_broker_status(fake)
+    )
     fake._reconcile_listener_protection = Mock()
 
     charm.RabbitMQOperatorCharm._on_collect_unit_status(fake, event)
@@ -2448,6 +2454,12 @@ def test_on_collect_unit_status_uses_read_safety_status():
         _undersized_queue_count=Mock(return_value=0),
         _operator_user_recovery_required=Mock(return_value=False),
         _configuration_error=Mock(return_value=None),
+    )
+    fake._pre_broker_status = (
+        lambda: charm.RabbitMQOperatorCharm._pre_broker_status(fake)
+    )
+    fake._running_broker_status = (
+        lambda: charm.RabbitMQOperatorCharm._running_broker_status(fake)
     )
     charm.RabbitMQOperatorCharm._on_collect_unit_status(fake, event)
 
