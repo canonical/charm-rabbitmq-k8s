@@ -233,6 +233,7 @@ class RabbitMQOperatorCharm(CharmBase):
         self._lightkube_client = None
         self._lightkube_field_manager: str = self.app.name
         self._lb_name: str = f"{self.app.name}-lb"
+        self._departing_unit_count: int = 0
 
         # Open ports on default cluster IP
         # OpenStack services uses cluster IP from service rabbitmq
@@ -249,6 +250,7 @@ class RabbitMQOperatorCharm(CharmBase):
         # NOTE(jamespage): This should become part of what Juju
         # does at some point in time.
         self.framework.observe(self.on.install, self._reconcile_lb)
+        self.framework.observe(self.on.leader_elected, self._reconcile)
         self.framework.observe(self.on.rabbitmq_pebble_ready, self._reconcile)
         self.framework.observe(self.on.upgrade_charm, self._reconcile)
         self.framework.observe(self.on.config_changed, self._reconcile)
@@ -481,25 +483,35 @@ class RabbitMQOperatorCharm(CharmBase):
         )
         return True
 
-    def _reconcile_running_broker_state(self) -> None:
-        """Refresh broker-managed state that only exists once RabbitMQ is up."""
+    def _reconcile_running_broker_state(self) -> bool:
+        """Refresh broker-managed state that only exists once RabbitMQ is up.
+
+        Returns False when stale cluster nodes could not yet be forgotten
+        and the caller should defer to retry.
+        """
         if not self._rabbitmq_running():
-            return
+            return True
 
         if not self.peers.operator_user_created:
-            return
+            return True
 
         if self._operator_user_recovery_required():
-            return
+            return True
 
-        self._forget_stale_cluster_nodes()
+        clean = self._forget_stale_cluster_nodes()
         self._refresh_rabbitmq_version()
         self._ensure_cluster_name()
+        self._render_and_push_safety_check()
+        return clean
 
-    def _forget_stale_cluster_nodes(self) -> None:
-        """Forget non-running cluster members that are no longer in peer data."""
+    def _forget_stale_cluster_nodes(self) -> bool:
+        """Forget non-running cluster members that are no longer in peer data.
+
+        Returns True when all stale nodes have been forgotten, False when nodes
+        that should be forgotten are still running and need a later retry.
+        """
         if not self.unit.is_leader() or self.peers.peers_rel is None:
-            return
+            return True
 
         container = self.unit.get_container(RABBITMQ_CONTAINER)
         try:
@@ -510,7 +522,7 @@ class RabbitMQOperatorCharm(CharmBase):
             output, _ = process.wait_output()
             cluster_status = json.loads(output)
         except (ExecError, ModelError, json.JSONDecodeError):
-            return
+            return True
 
         expected_nodes = {
             self.generate_nodename(unit_name)
@@ -520,11 +532,14 @@ class RabbitMQOperatorCharm(CharmBase):
             }
         }
         running_nodes = set(cluster_status.get("running_nodes", []))
-        stale_nodes = [
+        all_unexpected = [
             node
             for node in cluster_status.get("disk_nodes", [])
-            if node not in expected_nodes and node not in running_nodes
+            if node not in expected_nodes
         ]
+        stale_nodes = [n for n in all_unexpected if n not in running_nodes]
+        pending_nodes = [n for n in all_unexpected if n in running_nodes]
+
         for node in stale_nodes:
             try:
                 process = container.exec(
@@ -539,6 +554,13 @@ class RabbitMQOperatorCharm(CharmBase):
                 logger.warning(
                     "Unable to forget stale cluster node %s: %s", node, exc
                 )
+
+        if pending_nodes:
+            logger.info(
+                "Stale nodes still running, will retry: %s", pending_nodes
+            )
+            return False
+        return True
 
     def _ensure_broker_running(self, event: EventBase | None = None) -> bool:
         """Ensure the local broker is running, starting it when possible."""
@@ -986,7 +1008,7 @@ class RabbitMQOperatorCharm(CharmBase):
         if self.unit.is_leader():
             leaving_node = self.generate_nodename(event.nodename)
             container = self.unit.get_container(RABBITMQ_CONTAINER)
-            logging.info(f"Removing {leaving_node} from queues")
+            logging.info("Removing %s from queues", leaving_node)
             try:
                 # forget_cluster_node not currently supported by HTTP API
                 process = container.exec(
@@ -998,16 +1020,25 @@ class RabbitMQOperatorCharm(CharmBase):
             except (ExecError, ModelError) as e:
                 if isinstance(e, ModelError):
                     logging.warning(
-                        f"Container unavailable while removing {leaving_node}: {e}"
+                        "Container unavailable while removing %s: %s",
+                        leaving_node,
+                        e,
                     )
                 elif "The node selected is not in the cluster" in e.stderr:
                     logging.warning(
-                        f"Removal of {leaving_node} failed, node not found"
+                        "Removal of %s failed, node not found",
+                        leaving_node,
                     )
                 else:
-                    logging.error(f"Removal of {leaving_node} failed")
+                    logging.error("Removal of %s failed", leaving_node)
                     logging.error(e.stdout)
                     logging.error(e.stderr)
+
+        self._departing_unit_count = 1
+        try:
+            self._reconcile(event)
+        finally:
+            self._departing_unit_count = 0
 
     # TODO: refactor this method to reduce complexity.
     def _on_peer_relation_connected(  # noqa: C901
@@ -1961,6 +1992,18 @@ class RabbitMQOperatorCharm(CharmBase):
             description="rabbitmq.conf",
         )
 
+    @property
+    def _expected_cluster_size(self) -> int:
+        """Return the expected number of cluster members from peer relation.
+
+        During relation-departed hooks the departing unit is still present in
+        relation.units, so we subtract any known departing units.
+        """
+        rel = self.peers.peers_rel
+        if rel is None:
+            return 1
+        return max(1, len(rel.units) + 1 - self._departing_unit_count)
+
     def _render_and_push_safety_check(self) -> bool:
         """Render the workload safety-check script."""
         container = self.unit.get_container(RABBITMQ_CONTAINER)
@@ -1972,6 +2015,7 @@ class RabbitMQOperatorCharm(CharmBase):
             safety_reason_cluster_status=SAFETY_REASON_CLUSTER_STATUS,
             protect_members=str(self.protect_members).lower(),
             amqp_port=RABBITMQ_SERVICE_PORT,
+            expected_cluster_size=self._expected_cluster_size,
         )
         return self._push_text_file(
             container,

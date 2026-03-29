@@ -155,6 +155,14 @@ def deploy_local(
             resources={"rabbitmq-image": rabbitmq_image},
             trust=True,
         )
+    else:
+        current_units = len(
+            status_payload(juju)["applications"][app_name].get("units", {})
+        )
+        if current_units < units:
+            juju.add_unit(app_name, num_units=units - current_units)
+        elif current_units > units:
+            juju.cli("scale-application", app_name, str(units))
     return wait_for_app(juju, app_name, units)
 
 

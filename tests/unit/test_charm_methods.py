@@ -982,16 +982,19 @@ def test_reconcile_running_broker_state_refreshes_api_state_after_operator_user(
         _rabbitmq_running=Mock(return_value=True),
         peers=SimpleNamespace(operator_user_created="rmqadmin"),
         _operator_user_recovery_required=Mock(return_value=False),
-        _forget_stale_cluster_nodes=Mock(),
+        _forget_stale_cluster_nodes=Mock(return_value=True),
         _refresh_rabbitmq_version=Mock(),
         _ensure_cluster_name=Mock(),
+        _render_and_push_safety_check=Mock(),
     )
 
-    charm.RabbitMQOperatorCharm._reconcile_running_broker_state(fake)
+    result = charm.RabbitMQOperatorCharm._reconcile_running_broker_state(fake)
 
+    assert result is True
     fake._forget_stale_cluster_nodes.assert_called_once_with()
     fake._refresh_rabbitmq_version.assert_called_once_with()
     fake._ensure_cluster_name.assert_called_once_with()
+    fake._render_and_push_safety_check.assert_called_once_with()
 
 
 def test_reconcile_operator_user_recovers_missing_peer_flag():
@@ -1579,6 +1582,7 @@ def test_render_safety_check_checks_listener_and_honours_protection_flag():
         safety_reason_cluster_status=charm.SAFETY_REASON_CLUSTER_STATUS,
         protect_members="true",
         amqp_port=charm.RABBITMQ_SERVICE_PORT,
+        expected_cluster_size=3,
     )
 
     assert "REASON_FILE=" in script
@@ -1630,6 +1634,7 @@ def test_render_and_push_safety_check_delegates_to_push_text_file():
     fake = _fake_charm(
         unit=Mock(get_container=Mock(return_value=container)),
         _push_text_file=Mock(return_value=True),
+        _expected_cluster_size=3,
     )
 
     changed = charm.RabbitMQOperatorCharm._render_and_push_safety_check(fake)
@@ -2606,7 +2611,7 @@ def test_reconcile_reconciles_health_checks_before_and_after_bootstrap():
             side_effect=lambda *_: order.append("operator") or True
         ),
         _reconcile_running_broker_state=Mock(
-            side_effect=lambda: order.append("running")
+            side_effect=lambda: order.append("running") or True
         ),
         _reconcile_amqp_relations=Mock(
             side_effect=lambda *_: order.append("amqp") or True

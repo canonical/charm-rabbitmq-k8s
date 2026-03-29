@@ -311,7 +311,7 @@ def test_config_changed_tolerates_queue_status_api_unavailable(
             monkeypatch, manager.charm, admin_api=admin_api
         )
         monkeypatch.setattr(
-            manager.charm, "_reconcile_running_broker_state", lambda: None
+            manager.charm, "_reconcile_running_broker_state", lambda: True
         )
         monkeypatch.setattr(
             manager.charm, "_reconcile_queue_membership", lambda event: True
@@ -690,7 +690,7 @@ def test_update_status_active_when_relations_ready(
         monkeypatch.setattr(
             manager.charm,
             "_reconcile_running_broker_state",
-            lambda: None,
+            lambda: True,
         )
         monkeypatch.setattr(
             manager.charm,
@@ -874,7 +874,7 @@ def test_update_status_blocked_when_protection_mode_engaged(
         monkeypatch.setattr(
             manager.charm,
             "_reconcile_running_broker_state",
-            lambda: None,
+            lambda: True,
         )
         monkeypatch.setattr(
             manager.charm,
@@ -998,7 +998,7 @@ def test_update_status_warns_instead_of_blocking_when_protection_disabled(
         monkeypatch.setattr(
             manager.charm,
             "_reconcile_running_broker_state",
-            lambda: None,
+            lambda: True,
         )
         monkeypatch.setattr(
             manager.charm,
@@ -1075,7 +1075,7 @@ def test_update_status_warns_when_queues_are_undersized(
         monkeypatch.setattr(
             manager.charm,
             "_reconcile_running_broker_state",
-            lambda: None,
+            lambda: True,
         )
         monkeypatch.setattr(
             manager.charm,
@@ -1513,7 +1513,7 @@ def test_timer_notice_calls_ensure_queue_ha_for_leader(
         monkeypatch.setattr(
             manager.charm,
             "_reconcile_running_broker_state",
-            lambda: None,
+            lambda: True,
         )
         monkeypatch.setattr(
             manager.charm,
@@ -1579,7 +1579,7 @@ def test_timer_notice_skips_ensure_queue_ha_for_non_leader(
         monkeypatch.setattr(
             manager.charm,
             "_reconcile_running_broker_state",
-            lambda: None,
+            lambda: True,
         )
         monkeypatch.setattr(
             manager.charm,

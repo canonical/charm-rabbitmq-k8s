@@ -57,7 +57,13 @@ if [ "{{ protect_members }}" = "true" ]; then
     disk_nodes="$(extract_array "$cluster_status_json" "disk_nodes")"
     running_count="$(count_entries "$running_nodes")"
     disk_count="$(count_entries "$disk_nodes")"
-    majority=$((disk_count / 2 + 1))
+    expected_size="{{ expected_cluster_size }}"
+    if [ "$expected_size" -gt 0 ] 2>/dev/null && [ "$expected_size" -lt "$disk_count" ]; then
+        cluster_size="$expected_size"
+    else
+        cluster_size="$disk_count"
+    fi
+    majority=$((cluster_size / 2 + 1))
 
     if [ "$running_count" -lt "$majority" ]; then
         fail "Cluster lost majority ($running_count/$disk_count running disk nodes)"
