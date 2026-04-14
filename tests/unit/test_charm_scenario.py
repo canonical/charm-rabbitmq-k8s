@@ -1382,9 +1382,7 @@ def test_get_service_account_action_returns_credentials(
             "rabbit_running",
             property(lambda self: True),
         )
-        monkeypatch.setattr(
-            manager.charm, "_rabbitmq_running", lambda: True
-        )
+        monkeypatch.setattr(manager.charm, "_rabbitmq_running", lambda: True)
         monkeypatch.setattr(
             manager.charm, "does_vhost_exist", lambda vhost: True
         )
