@@ -196,7 +196,7 @@ class RabbitMQRequires(ops.Object):
 
     @property
     def ssl_ca(self) -> str | None:
-        """Return the SSL port from the RabbitMQ relation."""
+        """Return the SSL CA from the RabbitMQ relation."""
         return self._get("ssl_ca")
 
     @property
