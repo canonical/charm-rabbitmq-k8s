@@ -2234,21 +2234,49 @@ def test_get_queue_growth_selector_zero_members():
     )
 
 
-def test_peer_relation_leaving_handles_model_error():
-    """Container disconnection during peer-leaving is handled gracefully."""
+def test_peer_relation_leaving_does_not_forget_cluster_node():
+    """The auto path must never forget a cluster node.
+
+    forget_cluster_node permanently removes a node and deletes its quorum
+    queue replicas.  A peer-relation-departed event can fire for transient
+    reasons (juju agent loss, pod reschedule, controller hiccup), so the
+    charm must not run the destructive call automatically.  Operators
+    invoke the forget-cluster-node action when they are certain.
+    """
     container = Mock()
-    container.exec.side_effect = ops.model.ModelError()
     event = SimpleNamespace(nodename="rabbitmq-k8s/1")
     fake = _fake_charm(
         unit=Mock(
             is_leader=Mock(return_value=True),
             get_container=Mock(return_value=container),
         ),
+        _reconcile=Mock(),
     )
 
     charm.RabbitMQOperatorCharm._on_peer_relation_leaving(fake, event)
 
-    container.exec.assert_called_once()
+    container.exec.assert_not_called()
+
+
+def test_peer_relation_leaving_marks_departing_unit_during_reconcile():
+    """Reconcile during a leaving event must see _departing_unit_count == 1."""
+    captured: dict[str, int] = {}
+    event = SimpleNamespace(nodename="rabbitmq-k8s/1")
+
+    def capture(_event):
+        captured["count"] = fake._departing_unit_count
+
+    fake = _fake_charm(
+        unit=Mock(is_leader=Mock(return_value=True)),
+        _reconcile=Mock(side_effect=capture),
+    )
+    fake._departing_unit_count = 0
+
+    charm.RabbitMQOperatorCharm._on_peer_relation_leaving(fake, event)
+
+    assert captured["count"] == 1
+    assert fake._departing_unit_count == 0
+    fake._reconcile.assert_called_once_with(event)
 
 
 def test_workload_reconcile_prerequisites_non_leader_no_operator_user():
