@@ -7,20 +7,16 @@ from __future__ import (
     annotations,
 )
 
-import json
 import pathlib
-import shutil
 import subprocess  # nosec B404
 from typing import (
     Any,
 )
 
-import jubilant
 import pytest
 import yaml
 
 PROJECT_ROOT = pathlib.Path(__file__).parents[2]
-LOG_DIR = PROJECT_ROOT / "logs"
 
 GENERATED_METADATA_FILES = (
     "actions.yaml",
@@ -30,36 +26,12 @@ GENERATED_METADATA_FILES = (
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
-    """Register custom command-line options for functional tests."""
-    parser.addoption(
-        "--cloud",
-        action="store",
-        default=None,
-        help="Cloud to use when creating a temporary model.",
-    )
-    parser.addoption(
-        "--controller",
-        action="store",
-        default=None,
-        help="Controller to use when creating a temporary model.",
-    )
-    parser.addoption(
-        "--model",
-        action="store",
-        default=None,
-        help="Existing Juju model to run the tests against.",
-    )
+    """Register charm-specific command-line options."""
     parser.addoption(
         "--charm-file",
         action="store",
         default=None,
         help="Path to a pre-built charm artifact to deploy or refresh to.",
-    )
-    parser.addoption(
-        "--keep-models",
-        action="store_true",
-        default=False,
-        help="Keep temporary models after the test run completes.",
     )
     parser.addoption(
         "--rabbitmq-image",
@@ -154,99 +126,3 @@ def charm_file(app_name: str, pytestconfig: pytest.Config) -> pathlib.Path:
             f"Found more than one packed charm for {app_name}: {charms}"
         )
     return charms[0].resolve()
-
-
-def _collect_pod_logs(
-    kubectl_path: str, namespace: str, dest: pathlib.Path
-) -> None:
-    """Dump container logs for every pod in the namespace."""
-    try:
-        result = subprocess.run(
-            [kubectl_path, "-n", namespace, "get", "pods", "-o", "json"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )  # nosec B603
-        pods = json.loads(result.stdout).get("items", [])
-    except Exception:
-        return
-
-    for pod in pods:
-        pod_name = pod["metadata"]["name"]
-        for container in pod.get("spec", {}).get("containers", []):
-            container_name = container["name"]
-            try:
-                result = subprocess.run(
-                    [
-                        kubectl_path,
-                        "-n",
-                        namespace,
-                        "logs",
-                        pod_name,
-                        "-c",
-                        container_name,
-                        "--tail=5000",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=30,
-                )  # nosec B603
-                (dest / f"pod-{pod_name}-{container_name}.log").write_text(
-                    result.stdout
-                )
-            except Exception:
-                pass
-
-
-def _collect_logs(client: jubilant.Juju, dest: pathlib.Path) -> None:
-    """Dump juju and pod logs for post-mortem analysis."""
-    dest.mkdir(parents=True, exist_ok=True)
-
-    try:
-        (dest / "juju-debug-log.txt").write_text(client.debug_log(limit=5000))
-    except Exception:
-        pass
-
-    try:
-        (dest / "juju-status.json").write_text(
-            client.cli("status", "--format=json")
-        )
-    except Exception:
-        pass
-
-    kubectl_path = shutil.which("kubectl")
-    if kubectl_path:
-        _collect_pod_logs(kubectl_path, client.model, dest)
-
-
-@pytest.fixture(scope="module")
-def juju(
-    request: pytest.FixtureRequest,
-) -> jubilant.Juju:
-    """Provide a temporary Juju model per functional test module."""
-
-    def collect_on_failure(client: jubilant.Juju) -> None:
-        if not request.session.testsfailed:
-            return
-        module_name = request.module.__name__.rsplit(".", 1)[-1]
-        _collect_logs(client, LOG_DIR / module_name)
-
-    model = request.config.getoption("--model")
-    if model:
-        client = jubilant.Juju(model=model)
-        client.wait_timeout = 20 * 60
-        yield client
-        collect_on_failure(client)
-        return
-
-    keep_models = bool(request.config.getoption("--keep-models"))
-    cloud = request.config.getoption("--cloud")
-    controller = request.config.getoption("--controller")
-    with jubilant.temp_model(
-        keep=keep_models,
-        cloud=cloud,
-        controller=controller,
-    ) as client:
-        client.wait_timeout = 20 * 60
-        yield client
-        collect_on_failure(client)

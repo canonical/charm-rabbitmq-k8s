@@ -28,6 +28,7 @@ dev = [
     "pytest-cov",
     "pyyaml",
     "jubilant",
+    "pytest-jubilant",
 ]
 
 # Testing tools configuration
