@@ -31,16 +31,9 @@ from ipaddress import (
 from pathlib import (
     Path,
 )
-from typing import (
-    Dict,
-    List,
-    Optional,
-    Union,
-    cast,
-)
+from typing import cast
 
 import ops
-import pwgen
 import requests
 from charms.grafana_k8s.v0.grafana_dashboard import (
     GrafanaDashboardProvider,
@@ -121,7 +114,6 @@ RABBITMQ_COOKIE_PATH = "/var/lib/rabbitmq/.erlang.cookie"
 RABBITMQ_MNESIA_DIR = "/var/lib/rabbitmq/mnesia"
 
 SELECTOR_ALL = "all"
-SELECTOR_NONE = "none"
 SELECTOR_EVEN = "even"
 SELECTOR_INDIVIDUAL = "individual"
 
@@ -746,9 +738,15 @@ class RabbitMQOperatorCharm(CharmBase):
         for username in self._stored_amqp_usernames():
             if username in active_usernames:
                 continue
-            if self.does_user_exist(username):
-                api.delete_user(username)
-            self.peers.delete_user(username)
+            try:
+                if self.does_user_exist(username):
+                    api.delete_user(username)
+                self.peers.delete_user(username)
+            except (
+                requests.exceptions.HTTPError,
+                requests.exceptions.ConnectionError,
+            ):
+                logger.warning("Failed to clean up user %s", username)
 
     def _reconcile_queue_membership(
         self, event: EventBase | None = None
@@ -821,9 +819,7 @@ class RabbitMQOperatorCharm(CharmBase):
             },
         }
 
-        if not getattr(
-            getattr(self, "peers", None), "operator_user_created", None
-        ):
+        if not self.peers.operator_user_created:
             return layer
 
         layer["checks"] = {
@@ -1040,13 +1036,6 @@ class RabbitMQOperatorCharm(CharmBase):
         finally:
             self._departing_unit_count = 0
 
-    # TODO: refactor this method to reduce complexity.
-    def _on_peer_relation_connected(  # noqa: C901
-        self, event: EventBase
-    ) -> None:
-        """Compatibility wrapper for peer relation create/change reconciliation."""
-        self._reconcile(event)
-
     def get_queue_growth_selector(self, min_q_len: int, max_q_len: int):
         """Select a queue growth strategy.
 
@@ -1114,14 +1103,8 @@ class RabbitMQOperatorCharm(CharmBase):
             for q in undersized_queues:
                 if joining_node not in q["members"]:
                     api.add_member(joining_node, q["vhost"], q["name"])
-        elif selector == SELECTOR_NONE:
-            logging.debug("No queues need new replicas")
         else:
             logging.error(f"Unknown selectore type {selector}")
-
-    def _on_peer_relation_ready(self, event: EventBase) -> None:
-        """Compatibility wrapper for peer relation create/change reconciliation."""
-        self._reconcile(event)
 
     def _on_add_member_action(self, event: ActionEvent) -> None:
         """Handle add_member charm action."""
@@ -1131,7 +1114,14 @@ class RabbitMQOperatorCharm(CharmBase):
         node = self.generate_nodename(event.params["unit-name"])
         vhost = event.params.get("vhost") or "/"
         queue_name = event.params["queue-name"]
-        api.add_member(node, vhost, queue_name)
+        try:
+            api.add_member(node, vhost, queue_name)
+        except (
+            requests.exceptions.HTTPError,
+            requests.exceptions.ConnectionError,
+        ) as e:
+            event.fail(f"Failed to add member: {e}")
+            return
         event.set_results(
             {"queue-name": queue_name, "node": node, "vhost": vhost}
         )
@@ -1144,7 +1134,14 @@ class RabbitMQOperatorCharm(CharmBase):
         node = self.generate_nodename(event.params["unit-name"])
         vhost = event.params.get("vhost") or "/"
         queue_name = event.params["queue-name"]
-        api.delete_member(node, vhost, queue_name)
+        try:
+            api.delete_member(node, vhost, queue_name)
+        except (
+            requests.exceptions.HTTPError,
+            requests.exceptions.ConnectionError,
+        ) as e:
+            event.fail(f"Failed to delete member: {e}")
+            return
         event.set_results(
             {"queue-name": queue_name, "node": node, "vhost": vhost}
         )
@@ -1174,7 +1171,14 @@ class RabbitMQOperatorCharm(CharmBase):
         if not self._require_queue_management_ready(event):
             return
         api = self._get_admin_api()
-        api.rebalance_queues()
+        try:
+            api.rebalance_queues()
+        except (
+            requests.exceptions.HTTPError,
+            requests.exceptions.ConnectionError,
+        ) as e:
+            event.fail(f"Failed to rebalance queues: {e}")
+            return
         event.set_results({"status": "rebalance initiated"})
 
     def _on_grow_action(self, event: ActionEvent) -> None:
@@ -1186,7 +1190,14 @@ class RabbitMQOperatorCharm(CharmBase):
         selector = event.params["selector"]
         vhost_pattern = event.params.get("vhost-pattern") or ".*"
         queue_pattern = event.params.get("queue-pattern") or ".*"
-        api.grow_queue(node, selector, vhost_pattern, queue_pattern)
+        try:
+            api.grow_queue(node, selector, vhost_pattern, queue_pattern)
+        except (
+            requests.exceptions.HTTPError,
+            requests.exceptions.ConnectionError,
+        ) as e:
+            event.fail(f"Failed to grow queue: {e}")
+            return
         event.set_results(
             {
                 "node": node,
@@ -1217,26 +1228,18 @@ class RabbitMQOperatorCharm(CharmBase):
             results["errors"] = json.dumps(errors)
         event.set_results(results)
 
-    def _on_ready_amqp_clients(self, event) -> None:
-        """Compatibility wrapper for AMQP relation reconciliation."""
-        self._reconcile(event)
 
-    def _on_gone_away_amqp_clients(
-        self, event: ops.RelationBrokenEvent
-    ) -> None:
-        """Compatibility wrapper for AMQP relation reconciliation."""
-        self._reconcile(event)
 
     def _on_pebble_custom_notice(self, event: PebbleCustomNoticeEvent):
         """Handle the periodic notice by reconciling desired state."""
         self._reconcile(event)
 
     @property
-    def peers_bind_address(self) -> str:
+    def peers_bind_address(self) -> str | None:
         """Bind address for peer interface."""
         return self._peers_bind_address()
 
-    def _peers_bind_address(self) -> str:
+    def _peers_bind_address(self) -> str | None:
         """Bind address for the rabbit node to its peers.
 
         :returns: IP address to use for peering, or None if not yet available
@@ -1259,26 +1262,17 @@ class RabbitMQOperatorCharm(CharmBase):
         return str(self.model.get_binding(AMQP_RELATION).network.bind_address)
 
     @property
-    def ingress_address(self) -> Union[IPv4Address, IPv6Address]:
+    def ingress_address(self) -> IPv4Address | IPv6Address:
         """Network IP address for access to the RabbitMQ service."""
         return self.model.get_binding(AMQP_RELATION).network.ingress_addresses[
             0
         ]
 
     @property
-    def _loadbalancer_annotations(self) -> Optional[Dict[str, str]]:
-        """Parses and returns annotations to apply to the LoadBalancer service.
-
-        The annotations are expected as a string in the configuration,
-        formatted as: "key1=value1,key2=value2,key3=value3". This string is
-        parsed into a dictionary where each key-value pair corresponds to an annotation.
-
-        Returns:
-            Optional[Dict[str, str]]:
-            A dictionary of annotations if provided in the Juju config and valid, otherwise None.
-        """
+    def _loadbalancer_annotations(self) -> dict[str, str] | None:
+        """Parse and return annotations to apply to the LoadBalancer service."""
         lb_annotations = cast(
-            Optional[str], self.config.get("loadbalancer_annotations", None)
+            str | None, self.config.get("loadbalancer_annotations", None)
         )
         return parse_annotations(lb_annotations)
 
@@ -1311,10 +1305,9 @@ class RabbitMQOperatorCharm(CharmBase):
             api.get_user(username)
         except requests.exceptions.HTTPError as e:
             # Username does not exist
-            if e.response.status_code == 404:
+            if e.response is not None and e.response.status_code == 404:
                 return False
-            else:
-                raise e
+            raise
         return True
 
     def does_vhost_exist(self, vhost: str) -> bool:
@@ -1328,10 +1321,9 @@ class RabbitMQOperatorCharm(CharmBase):
             api.get_vhost(vhost)
         except requests.exceptions.HTTPError as e:
             # Vhost does not exist
-            if e.response.status_code == 404:
+            if e.response is not None and e.response.status_code == 404:
                 return False
-            else:
-                raise e
+            raise
         return True
 
     def create_user(self, username: str) -> str:
@@ -1343,7 +1335,7 @@ class RabbitMQOperatorCharm(CharmBase):
         :returns: password for username
         """
         api = self._get_admin_api()
-        _password = pwgen.pwgen(12)
+        _password = secrets.token_urlsafe(12)
         api.create_user(username, _password)
         return _password
 
@@ -1356,8 +1348,6 @@ class RabbitMQOperatorCharm(CharmBase):
         read: str = ".*",
     ) -> None:
         """Set permissions for a RabbitMQ user.
-
-        Return the password for the user.
 
         :param username: User to change permissions for
         :param configure: Configure perms
@@ -1416,7 +1406,7 @@ class RabbitMQOperatorCharm(CharmBase):
         return f"http://localhost:{RABBITMQ_MANAGEMENT_PORT}"
 
     @property
-    def _operator_password(self) -> Union[str, None]:
+    def _operator_password(self) -> str | None:
         """Return the operator password.
 
         If the operator password does not exist on the peer relation, create a
@@ -1429,7 +1419,7 @@ class RabbitMQOperatorCharm(CharmBase):
         :rtype: Unition[str, None]
         """
         if not self.peers.operator_password and self.unit.is_leader():
-            self.peers.set_operator_password(pwgen.pwgen(12))
+            self.peers.set_operator_password(secrets.token_urlsafe(12))
         return self.peers.operator_password
 
     @property
@@ -1468,7 +1458,7 @@ class RabbitMQOperatorCharm(CharmBase):
             raise
 
     def _get_admin_api(
-        self, username: str = None, password: str = None
+        self, username: str | None = None, password: str | None = None
     ) -> rabbit_extended_api.ExtendedAdminApi:
         """Return an administrative API for RabbitMQ.
 
@@ -1657,6 +1647,7 @@ class RabbitMQOperatorCharm(CharmBase):
             requests.exceptions.ConnectionError,
             requests.exceptions.HTTPError,
         ):
+            logger.debug("Management API not ready, skipping version refresh")
             return
         self._stored.rabbitmq_version = overview.get("product_version")
 
@@ -1918,11 +1909,7 @@ class RabbitMQOperatorCharm(CharmBase):
             self.peers.set_erlang_cookie(cookie)
 
     def _render_and_push_config_files(self) -> set[str]:
-        """Render and push configuration files.
-
-        Allow calling one utility function to render and push all required
-        files. Calls specific render and push methods.
-        """
+        """Render and push configuration files."""
         changed_services = set()
         if self._render_and_push_enabled_plugins():
             changed_services.add(RABBITMQ_SERVICE)
@@ -1957,10 +1944,7 @@ class RabbitMQOperatorCharm(CharmBase):
         return True
 
     def _render_and_push_enabled_plugins(self) -> bool:
-        """Render and push enabled plugins config.
-
-        Render enabled plugins and push to the workload container.
-        """
+        """Render and push enabled plugins config."""
         container = self.unit.get_container(RABBITMQ_CONTAINER)
         enabled_plugins = ",".join(self._stored.enabled_plugins)
         enabled_plugins_template = f"[{enabled_plugins}]."
@@ -1972,10 +1956,7 @@ class RabbitMQOperatorCharm(CharmBase):
         )
 
     def _render_and_push_rabbitmq_conf(self) -> bool:
-        """Render and push rabbitmq conf.
-
-        Render rabbitmq conf and push to the workload container.
-        """
+        """Render and push rabbitmq conf."""
         container = self.unit.get_container(RABBITMQ_CONTAINER)
         rabbitmq_conf = self._render_template(
             "rabbitmq.conf.j2",
@@ -2061,10 +2042,7 @@ class RabbitMQOperatorCharm(CharmBase):
         return self.generate_nodename(self.unit.name)
 
     def _render_and_push_rabbitmq_env(self) -> bool:
-        """Render and push rabbitmq-env conf.
-
-        Render rabbitmq-env conf and push to the workload container.
-        """
+        """Render and push rabbitmq-env conf."""
         container = self.unit.get_container(RABBITMQ_CONTAINER)
         rabbitmq_env = self._render_template(
             "rabbitmq-env.conf.j2", nodename=self.nodename
@@ -2124,11 +2102,11 @@ class RabbitMQOperatorCharm(CharmBase):
         """Whether the charm should manage queue membership."""
         return bool(self.config.get("minimum-replicas"))
 
-    def min_replicas(self) -> int:
+    def min_replicas(self) -> int | None:
         """The minimum number of replicas a queue should have."""
         return self.config.get("minimum-replicas")
 
-    def get_undersized_queues(self) -> List[dict]:
+    def get_undersized_queues(self) -> list[dict]:
         """Return a list of queues which have fewer members than minimum."""
         api = self._get_admin_api()
         undersized_queues = [
@@ -2251,6 +2229,7 @@ class RabbitMQOperatorCharm(CharmBase):
         :param event: The current event
         :param username: The requested username
         :param vhost: The requested vhost
+        :param external_connectivity: Whether to use external connectivity
         """
         # TODO TLS Support. Existing interfaces set ssl_port and ssl_ca
         logging.debug("Setting amqp connection information.")
@@ -2273,14 +2252,18 @@ class RabbitMQOperatorCharm(CharmBase):
             # If the peers binding address exists, but the operator has not
             # been set up yet, the command will fail with a http 401 error and
             # unauthorized in the message. Just check the status code for now.
-            if http_e.response.status_code == 401:
+            if (
+                http_e.response is not None
+                and http_e.response.status_code == 401
+            ):
                 logger.warning(
-                    f"Rabbitmq has not been fully configured yet, deferring. "
-                    f"Errno: {http_e.response.status_code}"
+                    "RabbitMQ not fully configured yet, deferring. "
+                    "Status: %s",
+                    http_e.response.status_code,
                 )
                 event.defer()
             else:
-                raise http_e
+                raise
         except requests.exceptions.ConnectionError as e:
             logging.warning(
                 f"Rabbitmq is not ready, deferring. Errno: {e.errno}"
@@ -2317,15 +2300,11 @@ class RabbitMQOperatorCharm(CharmBase):
         :param event: The current event
         """
         if not self.unit.is_leader():
-            msg = "Not leader unit, unable to create service account"
-            logger.error(msg)
-            event.fail(msg)
+            event.fail("Not leader unit")
             return
 
-        if not self.rabbit_running and not self.peers_bind_address:
-            msg = "RabbitMQ not running, unable to create account"
-            logger.error(msg)
-            event.fail(msg)
+        if not self._rabbitmq_running():
+            event.fail("RabbitMQ not running")
             return
 
         username = event.params["username"]
@@ -2362,10 +2341,10 @@ class RabbitMQOperatorCharm(CharmBase):
         self,
         api: rabbit_extended_api.ExtendedAdminApi,
         nodes: list[str],
-        undersized_queues: List[dict],
+        undersized_queues: list[dict],
         replicas: int,
         dry_run: bool,
-    ) -> List[str]:
+    ) -> list[str]:
         """Add members to undersized queues.
 
         Simple algorithm to select nodes with fewest queues to add replicas on.
@@ -2415,7 +2394,7 @@ class RabbitMQOperatorCharm(CharmBase):
         )
         return replicated_queues
 
-    def ensure_queue_ha(self, dry_run: bool = False) -> Dict[str, int]:
+    def ensure_queue_ha(self, dry_run: bool = False) -> dict[str, int]:
         """Ensure queue has HA.
 
         The role of this function is to ensure that all queues are available on
@@ -2466,27 +2445,7 @@ class RabbitMQOperatorCharm(CharmBase):
 
         :param event: The current event
         """
-        if not self.unit.is_leader():
-            msg = "Not leader unit, unable to ensure queue HA"
-            logger.error(msg)
-            event.fail(msg)
-            return
-
-        if not self.rabbit_running:
-            msg = "RabbitMQ not running, unable to ensure queue HA"
-            logger.error(msg)
-            event.fail(msg)
-            return
-
-        if not self.peers.operator_user_created:
-            msg = "Operator user not created, unable to ensure queue HA"
-            logger.error(msg)
-            event.fail(msg)
-            return
-
-        if self._operator_user_recovery_required():
-            logger.error(OPERATOR_USER_RECOVERY_MESSAGE)
-            event.fail(OPERATOR_USER_RECOVERY_MESSAGE)
+        if not self._require_queue_management_ready(event):
             return
 
         if not self._manage_queues():
@@ -2509,7 +2468,7 @@ class RabbitMQOperatorCharm(CharmBase):
         )
 
     @property
-    def _service_ports(self) -> List[ServicePort]:
+    def _service_ports(self) -> list[ServicePort]:
         """Kubernetes service ports to be opened for this workload.
 
         We cannot use ops unit.open_port here because Juju will provision a ClusterIP
@@ -2638,7 +2597,7 @@ def validate_annotation_value(value: str) -> bool:
     return True
 
 
-def parse_annotations(annotations: Optional[str]) -> Optional[Dict[str, str]]:
+def parse_annotations(annotations: str | None) -> dict[str, str] | None:
     """Parse and validate annotations from a string.
 
     logic is based on Kubernetes annotation validation as described here:

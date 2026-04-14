@@ -724,85 +724,6 @@ def test_publish_relation_data_on_model_error():
     fake.get_hostname.assert_not_called()
 
 
-def test_on_peer_relation_connected_attempts_recovery_before_deferring():
-    """Peer relation setup delegates to the shared reconciler."""
-    event = Mock(defer=Mock())
-    reconcile = Mock()
-    fake = _fake_charm(_reconcile=reconcile)
-
-    charm.RabbitMQOperatorCharm._on_peer_relation_connected(fake, event)
-
-    reconcile.assert_called_once_with(event)
-
-
-def test_on_peer_relation_connected_sets_cookie_and_initializes_user():
-    """Peer relation wrapper does not bypass the holistic reconciler."""
-    event = Mock(defer=Mock())
-    reconcile = Mock()
-    fake = _fake_charm(_reconcile=reconcile)
-
-    charm.RabbitMQOperatorCharm._on_peer_relation_connected(fake, event)
-
-    reconcile.assert_called_once_with(event)
-
-
-def test_on_peer_relation_ready_defers_until_unit_in_cluster():
-    """Peer-ready delegates to the shared reconciler."""
-    event = SimpleNamespace(nodename="rabbitmq-k8s/1", defer=Mock())
-    reconcile = Mock()
-    fake = _fake_charm(_reconcile=reconcile)
-
-    charm.RabbitMQOperatorCharm._on_peer_relation_ready(fake, event)
-
-    reconcile.assert_called_once_with(event)
-
-
-def test_on_peer_relation_ready_attempts_recovery_before_deferring():
-    """Peer-ready wrapper delegates to the shared reconciler."""
-    event = SimpleNamespace(nodename="rabbitmq-k8s/1", defer=Mock())
-    reconcile = Mock()
-    fake = _fake_charm(_reconcile=reconcile)
-
-    charm.RabbitMQOperatorCharm._on_peer_relation_ready(fake, event)
-
-    reconcile.assert_called_once_with(event)
-
-
-def test_on_peer_relation_ready_leader_rebalances_when_ready():
-    """Peer-ready wrapper delegates to the shared reconciler."""
-    event = SimpleNamespace(nodename="rabbitmq-k8s/1", defer=Mock())
-    reconcile = Mock()
-    fake = _fake_charm(_reconcile=reconcile)
-
-    charm.RabbitMQOperatorCharm._on_peer_relation_ready(fake, event)
-
-    reconcile.assert_called_once_with(event)
-
-
-def test_on_gone_away_amqp_clients_non_leader_noop():
-    """AMQP relation-broken delegates to the shared reconciler."""
-    relation = Mock()
-    event = SimpleNamespace(relation=relation)
-    reconcile = Mock()
-    fake = _fake_charm(_reconcile=reconcile)
-
-    charm.RabbitMQOperatorCharm._on_gone_away_amqp_clients(fake, event)
-
-    reconcile.assert_called_once_with(event)
-
-
-def test_on_gone_away_amqp_clients_leader_deletes_user():
-    """AMQP relation-broken wrapper delegates to reconciliation."""
-    relation = Mock()
-    event = SimpleNamespace(relation=relation)
-    reconcile = Mock()
-    fake = _fake_charm(_reconcile=reconcile)
-
-    charm.RabbitMQOperatorCharm._on_gone_away_amqp_clients(fake, event)
-
-    reconcile.assert_called_once_with(event)
-
-
 def test_does_user_exist_false_on_404():
     """User existence returns False when the API reports a 404."""
     admin_api = Mock()
@@ -830,7 +751,7 @@ def test_create_user_returns_generated_password():
     admin_api = Mock()
     fake = _fake_charm(_get_admin_api=Mock(return_value=admin_api))
 
-    with patch("charm.pwgen.pwgen", return_value="generated-password"):
+    with patch("charm.secrets.token_urlsafe", return_value="generated-password"):
         password = charm.RabbitMQOperatorCharm.create_user(fake, "svc-user")
 
     assert password == "generated-password"
@@ -871,7 +792,7 @@ def test_operator_password_sets_password_on_leader():
     unit.is_leader.return_value = True
     fake = _fake_charm(unit=unit, peers=peers)
 
-    with patch("charm.pwgen.pwgen", return_value="generated-password"):
+    with patch("charm.secrets.token_urlsafe", return_value="generated-password"):
         password = charm.RabbitMQOperatorCharm._operator_password.fget(fake)
 
     assert password is None
@@ -1114,7 +1035,7 @@ def test_ensure_workload_services_starts_only_required_services():
 def test_reconcile_workload_layer_skips_replan_when_plan_matches():
     """Pebble should not be replanned when the current plan already matches."""
     desired_layer = charm.RabbitMQOperatorCharm._rabbitmq_layer(
-        SimpleNamespace()
+        SimpleNamespace(peers=SimpleNamespace(operator_user_created=None))
     )
     container = Mock()
     container.get_plan.return_value.to_dict.return_value = {
@@ -1135,7 +1056,7 @@ def test_reconcile_workload_layer_skips_replan_when_plan_matches():
 def test_reconcile_workload_layer_replans_when_plan_drifts():
     """Pebble should be replanned when desired state differs from the plan."""
     desired_layer = charm.RabbitMQOperatorCharm._rabbitmq_layer(
-        SimpleNamespace()
+        SimpleNamespace(peers=SimpleNamespace(operator_user_created=None))
     )
     container = Mock()
     container.get_plan.return_value.to_dict.return_value = {
@@ -1987,34 +1908,17 @@ def test_create_amqp_credentials_defers_on_http_401():
 
 
 def test_get_service_account_fails_when_rabbit_unavailable():
-    """Service-account action fails if RabbitMQ and peer binding are both missing."""
+    """Service-account action fails if RabbitMQ is not reachable."""
     event = Mock()
     event.params = {"username": "svc-user", "vhost": "svc-vhost"}
     fake = _fake_charm(
-        peers_bind_address=None,
         peers=SimpleNamespace(retrieve_password=Mock()),
     )
-    fake.rabbit_running = False
+    fake._rabbitmq_running = Mock(return_value=False)
 
     charm.RabbitMQOperatorCharm._get_service_account(fake, event)
 
-    event.fail.assert_called_once_with(
-        "RabbitMQ not running, unable to create account"
-    )
-
-
-def test_get_service_account_fails_on_non_leader():
-    """Service-account action is leader-only."""
-    event = Mock()
-    event.params = {"username": "svc-user", "vhost": "svc-vhost"}
-    fake = _fake_charm()
-    fake.unit.is_leader.return_value = False
-
-    charm.RabbitMQOperatorCharm._get_service_account(fake, event)
-
-    event.fail.assert_called_once_with(
-        "Not leader unit, unable to create service account"
-    )
+    event.fail.assert_called_once_with("RabbitMQ not running")
 
 
 def test_get_service_account_success():
@@ -2027,7 +1931,7 @@ def test_get_service_account_success():
     )
     fake = _fake_charm(peers=peers)
     fake.unit.is_leader.return_value = True
-    fake.rabbit_running = True
+    fake._rabbitmq_running = Mock(return_value=True)
     fake.ingress_address = "10.5.0.1"
     fake.rabbitmq_url = Mock(return_value="rabbit://svc-user:svc-password")
     fake.does_vhost_exist.return_value = False
@@ -2081,74 +1985,42 @@ def test_ensure_queue_ha_rebalances_when_replicated():
     admin_api.rebalance_queues.assert_called_once_with()
 
 
-@pytest.mark.parametrize(
-    (
-        "leader",
-        "rabbit_running",
-        "operator_user_created",
-        "manage_queues",
-        "message",
-    ),
-    [
-        (
-            False,
-            True,
-            "rmqadmin",
-            True,
-            "Not leader unit, unable to ensure queue HA",
-        ),
-        (
-            True,
-            False,
-            "rmqadmin",
-            True,
-            "RabbitMQ not running, unable to ensure queue HA",
-        ),
-        (
-            True,
-            True,
-            None,
-            True,
-            "Operator user not created, unable to ensure queue HA",
-        ),
-        (
-            True,
-            True,
-            "rmqadmin",
-            False,
-            "Queue management is disabled, unable to ensure queue HA",
-        ),
-    ],
-)
-def test_ensure_queue_ha_action_gate_failures(
-    leader, rabbit_running, operator_user_created, manage_queues, message
-):
-    """Queue HA action fails early for each gating condition."""
+def test_ensure_queue_ha_action_fails_when_not_ready():
+    """Queue HA action fails when shared readiness guard fails."""
     event = Mock()
     event.params = {"dry-run": False}
-    unit = Mock()
-    unit.is_leader.return_value = leader
     fake = _fake_charm(
-        unit=unit,
-        peers=SimpleNamespace(operator_user_created=operator_user_created),
-        _manage_queues=Mock(return_value=manage_queues),
+        _require_queue_management_ready=Mock(return_value=False),
     )
-    fake.rabbit_running = rabbit_running
 
     charm.RabbitMQOperatorCharm._ensure_queue_ha_action(fake, event)
 
-    event.fail.assert_called_once_with(message)
+    fake._require_queue_management_ready.assert_called_once_with(event)
+    event.set_results.assert_not_called()
+
+
+def test_ensure_queue_ha_action_fails_when_manage_queues_disabled():
+    """Queue HA action fails when queue management is disabled."""
+    event = Mock()
+    event.params = {"dry-run": False}
+    fake = _fake_charm(
+        _require_queue_management_ready=Mock(return_value=True),
+        _manage_queues=Mock(return_value=False),
+    )
+
+    charm.RabbitMQOperatorCharm._ensure_queue_ha_action(fake, event)
+
+    event.fail.assert_called_once_with(
+        "Queue management is disabled, unable to ensure queue HA"
+    )
 
 
 def test_ensure_queue_ha_action_success():
     """Queue HA action returns the replication summary."""
     event = Mock()
     event.params = {"dry-run": True}
-    unit = Mock()
-    unit.is_leader.return_value = True
     fake = _fake_charm(
-        unit=unit,
-        peers=SimpleNamespace(operator_user_created="rmqadmin"),
+        _require_queue_management_ready=Mock(return_value=True),
         _manage_queues=Mock(return_value=True),
         ensure_queue_ha=Mock(
             return_value={
@@ -2157,7 +2029,6 @@ def test_ensure_queue_ha_action_success():
             }
         ),
     )
-    fake.rabbit_running = True
 
     charm.RabbitMQOperatorCharm._ensure_queue_ha_action(fake, event)
 

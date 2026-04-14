@@ -22,6 +22,8 @@ This is an internal interface used by the RabbitMQ operator charm.
 
 import logging
 
+logger = logging.getLogger(__name__)
+
 from ops.framework import (
     EventBase,
     EventSource,
@@ -125,48 +127,48 @@ class RabbitMQOperatorPeers(Object):
 
     def on_created(self, event):
         """Relation created event handler."""
-        logging.debug("RabbitMQOperatorPeers on_created")
+        logger.debug("RabbitMQOperatorPeers on_created")
         self.on.connected.emit()
 
     def on_broken(self, event):
         """Relation broken event handler."""
-        logging.debug("RabbitMQOperatorPeers on_broken")
+        logger.debug("RabbitMQOperatorPeers on_broken")
         self.on.goneaway.emit()
 
     def on_departed(self, event):
-        """Relation broken event handler."""
-        logging.debug("RabbitMQOperatorPeers on_departed")
+        """Relation departed event handler."""
+        logger.debug("RabbitMQOperatorPeers on_departed")
         self.on.leaving.emit(event.departing_unit.name)
 
     def on_changed(self, event):
         """Relation changed event handler."""
-        logging.debug("RabbitMQOperatorPeers on_changed")
+        logger.debug("RabbitMQOperatorPeers on_changed")
         if self.operator_password and self.erlang_cookie:
             if event.unit:
                 self.on.ready.emit(event.unit.name)
 
     def set_operator_password(self, password: str):
         """Set admin operator password in relation data bag."""
-        logging.debug("Setting operator password")
+        logger.debug("Setting operator password")
         self.peers_rel.data[self.peers_rel.app][
             self.OPERATOR_PASSWORD
         ] = password
 
     def set_operator_user_created(self, user: str):
         """Set admin operator user create information in relation data bag."""
-        logging.debug("Setting operator user created")
+        logger.debug("Setting operator user created")
         self.peers_rel.data[self.peers_rel.app][
             self.OPERATOR_USER_CREATED
         ] = user
 
     def set_erlang_cookie(self, cookie: str):
         """Set Erlang cookie for RabbitMQ clustering."""
-        logging.debug("Setting erlang cookie")
+        logger.debug("Setting erlang cookie")
         self.peers_rel.data[self.peers_rel.app][self.ERLANG_COOKIE] = cookie
 
     def store_password(self, username: str, password: str):
         """Store username and password."""
-        logging.debug(f"Storing password for {username}")
+        logger.debug(f"Storing password for {username}")
         self.peers_rel.data[self.peers_rel.app][username] = password
 
     def delete_user(self, username: str):
@@ -176,7 +178,7 @@ class RabbitMQOperatorPeers(Object):
 
     def set_nodename(self, nodename: str):
         """Advertise nodename to peers."""
-        logging.debug(f"Setting nodename {nodename}")
+        logger.debug(f"Setting nodename {nodename}")
         self.peers_rel.data[self.model.unit][self.NODENAME] = nodename
 
     def retrieve_password(self, username: str) -> str | None:
@@ -186,7 +188,7 @@ class RabbitMQOperatorPeers(Object):
         return self.peers_rel.data[self.peers_rel.app].get(username)
 
     @property
-    def operator_password(self) -> str:
+    def operator_password(self) -> str | None:
         """Password for admin operator user."""
         if not self.peers_rel:
             return None
@@ -195,7 +197,7 @@ class RabbitMQOperatorPeers(Object):
         )
 
     @property
-    def operator_user_created(self) -> str:
+    def operator_user_created(self) -> str | None:
         """Username for amdin operator user and flag to indicate created."""
         if not self.peers_rel:
             return None
@@ -204,7 +206,7 @@ class RabbitMQOperatorPeers(Object):
         )
 
     @property
-    def erlang_cookie(self) -> str:
+    def erlang_cookie(self) -> str | None:
         """Erlang cookie for RabbitMQ cluster."""
         if not self.peers_rel:
             return None

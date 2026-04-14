@@ -19,10 +19,6 @@
 
 import json
 import urllib
-from typing import (
-    Dict,
-    List,
-)
 
 import rabbitmq_admin
 import requests
@@ -42,31 +38,35 @@ class ExtendedAdminApi(rabbitmq_admin.AdminAPI):
             data={"value": cluster_name},
         )
 
-    def list_queues(self):
+    def list_queues(self) -> list[dict]:
         """A list of queues."""
         return self._api_get("/api/queues")
 
-    def list_quorum_queues(self) -> List[Dict]:
+    def list_quorum_queues(self) -> list[dict]:
         """A list of quorum queues."""
         return [
             q for q in self._api_get("/api/queues") if q["type"] == "quorum"
         ]
 
-    def get_queue(self, vhost, queue):
-        """A list of nodes in the RabbitMQ cluster."""
+    def get_queue(self, vhost: str, queue: str) -> dict:
+        """Return details for a specific queue."""
         return self._api_get(
             "/api/queues/{}/{}".format(
                 urllib.parse.quote_plus(vhost), urllib.parse.quote_plus(queue)
             )
         )
 
-    def rebalance_queues(self):
+    def rebalance_queues(self) -> None:
         """Rebalance the queues leaders."""
-        return self._api_post("/api/rebalance/queues")
+        self._api_post("/api/rebalance/queues")
 
     def grow_queue(
-        self, node, selector, vhost_pattern=None, queue_pattern=None
-    ):
+        self,
+        node: str,
+        selector: str,
+        vhost_pattern: str | None = None,
+        queue_pattern: str | None = None,
+    ) -> None:
         """Add a member to queues.
 
         Which queues have the member added is decided by the selector,
@@ -100,7 +100,7 @@ class ExtendedAdminApi(rabbitmq_admin.AdminAPI):
         response.raise_for_status()
         return response.json()
 
-    def add_member(self, node, vhost, queue):
+    def add_member(self, node: str, vhost: str, queue: str) -> None:
         """Add a member to a queue."""
         data = {"node": node}
         self._api_post(
@@ -110,8 +110,8 @@ class ExtendedAdminApi(rabbitmq_admin.AdminAPI):
             data=data,
         )
 
-    def delete_member(self, node, vhost, queue):
-        """Remove a member to a queue."""
+    def delete_member(self, node: str, vhost: str, queue: str) -> None:
+        """Remove a member from a queue."""
         # rabbitmq_admin does not seem to handle json encoding for DELETE requests
         data = json.dumps({"node": node})
         self._api_delete(
