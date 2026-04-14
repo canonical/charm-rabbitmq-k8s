@@ -356,6 +356,10 @@ class RabbitMQOperatorCharm(CharmBase):
         self.framework.observe(self.on.grow_action, self._on_grow_action)
 
         self.framework.observe(self.on.shrink_action, self._on_shrink_action)
+        self.framework.observe(
+            self.on.forget_cluster_node_action,
+            self._on_forget_cluster_node_action,
+        )
 
         self.framework.observe(
             self.on[RABBITMQ_CONTAINER].pebble_custom_notice,
@@ -475,35 +479,35 @@ class RabbitMQOperatorCharm(CharmBase):
         )
         return True
 
-    def _reconcile_running_broker_state(self) -> bool:
-        """Refresh broker-managed state that only exists once RabbitMQ is up.
-
-        Returns False when stale cluster nodes could not yet be forgotten
-        and the caller should defer to retry.
-        """
+    def _reconcile_running_broker_state(self) -> None:
+        """Refresh broker-managed state that only exists once RabbitMQ is up."""
         if not self._rabbitmq_running():
-            return True
+            return
 
         if not self.peers.operator_user_created:
-            return True
+            return
 
         if self._operator_user_recovery_required():
-            return True
+            return
 
-        clean = self._forget_stale_cluster_nodes()
         self._refresh_rabbitmq_version()
         self._ensure_cluster_name()
         self._render_and_push_safety_check()
-        return clean
 
-    def _forget_stale_cluster_nodes(self) -> bool:
-        """Forget non-running cluster members that are no longer in peer data.
+    def _on_forget_cluster_node_action(self, event: ActionEvent) -> None:
+        """Remove stale cluster members no longer present in Juju peer data.
 
-        Returns True when all stale nodes have been forgotten, False when nodes
-        that should be forgotten are still running and need a later retry.
+        This is an operator-initiated action because rabbitmqctl
+        forget_cluster_node permanently removes a node and deletes its
+        quorum queue replicas.  It should only be run when the operator
+        is certain the removed nodes will not rejoin with existing data.
         """
-        if not self.unit.is_leader() or self.peers.peers_rel is None:
-            return True
+        if not self._require_queue_management_ready(event):
+            return
+
+        if self.peers.peers_rel is None:
+            event.fail("Peer relation not available")
+            return
 
         container = self.unit.get_container(RABBITMQ_CONTAINER)
         try:
@@ -513,8 +517,9 @@ class RabbitMQOperatorCharm(CharmBase):
             )
             output, _ = process.wait_output()
             cluster_status = json.loads(output)
-        except (ExecError, ModelError, json.JSONDecodeError):
-            return True
+        except (ExecError, ModelError, json.JSONDecodeError) as e:
+            event.fail(f"Failed to retrieve cluster status: {e}")
+            return
 
         expected_nodes = {
             self.generate_nodename(unit_name)
@@ -530,8 +535,10 @@ class RabbitMQOperatorCharm(CharmBase):
             if node not in expected_nodes
         ]
         stale_nodes = [n for n in all_unexpected if n not in running_nodes]
-        pending_nodes = [n for n in all_unexpected if n in running_nodes]
+        still_running = [n for n in all_unexpected if n in running_nodes]
 
+        forgotten = []
+        failed = []
         for node in stale_nodes:
             try:
                 process = container.exec(
@@ -539,20 +546,23 @@ class RabbitMQOperatorCharm(CharmBase):
                     timeout=5 * 60,
                 )
                 process.wait_output()
-            except ExecError as exc:
-                if "not in the cluster" in exc.stderr:
-                    logger.warning("Cluster node %s already absent", node)
+                forgotten.append(node)
+            except ExecError as e:
+                if "not in the cluster" in e.stderr:
+                    forgotten.append(node)
                     continue
+                failed.append(node)
                 logger.warning(
-                    "Unable to forget stale cluster node %s: %s", node, exc
+                    "Unable to forget stale cluster node %s: %s", node, e
                 )
 
-        if pending_nodes:
-            logger.info(
-                "Stale nodes still running, will retry: %s", pending_nodes
-            )
-            return False
-        return True
+        event.set_results(
+            {
+                "forgotten": json.dumps(forgotten),
+                "failed": json.dumps(failed),
+                "still-running": json.dumps(still_running),
+            }
+        )
 
     def _ensure_broker_running(self, event: EventBase | None = None) -> bool:
         """Ensure the local broker is running, starting it when possible."""
