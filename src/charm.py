@@ -31,7 +31,9 @@ from ipaddress import (
 from pathlib import (
     Path,
 )
-from typing import cast
+from typing import (
+    cast,
+)
 
 import ops
 import requests
@@ -829,9 +831,6 @@ class RabbitMQOperatorCharm(CharmBase):
             },
         }
 
-        if not self.peers.operator_user_created:
-            return layer
-
         layer["checks"] = {
             "alive": {
                 "override": "replace",
@@ -1206,8 +1205,6 @@ class RabbitMQOperatorCharm(CharmBase):
         if errors:
             results["errors"] = json.dumps(errors)
         event.set_results(results)
-
-
 
     def _on_pebble_custom_notice(self, event: PebbleCustomNoticeEvent):
         """Handle the periodic notice by reconciling desired state."""

@@ -751,7 +751,9 @@ def test_create_user_returns_generated_password():
     admin_api = Mock()
     fake = _fake_charm(_get_admin_api=Mock(return_value=admin_api))
 
-    with patch("charm.secrets.token_urlsafe", return_value="generated-password"):
+    with patch(
+        "charm.secrets.token_urlsafe", return_value="generated-password"
+    ):
         password = charm.RabbitMQOperatorCharm.create_user(fake, "svc-user")
 
     assert password == "generated-password"
@@ -792,7 +794,9 @@ def test_operator_password_sets_password_on_leader():
     unit.is_leader.return_value = True
     fake = _fake_charm(unit=unit, peers=peers)
 
-    with patch("charm.secrets.token_urlsafe", return_value="generated-password"):
+    with patch(
+        "charm.secrets.token_urlsafe", return_value="generated-password"
+    ):
         password = charm.RabbitMQOperatorCharm._operator_password.fget(fake)
 
     assert password is None
@@ -1078,13 +1082,15 @@ def test_reconcile_workload_layer_replans_when_plan_drifts():
     container.replan.assert_called_once_with()
 
 
-def test_rabbitmq_layer_omits_checks_before_operator_bootstrap():
-    """Health checks should not be armed before the broker is bootstrapped."""
+def test_rabbitmq_layer_includes_checks_before_operator_bootstrap():
+    """Health checks are always in the layer (gated by start/stop at runtime)."""
     layer = charm.RabbitMQOperatorCharm._rabbitmq_layer(
         SimpleNamespace(peers=SimpleNamespace(operator_user_created=None))
     )
 
-    assert "checks" not in layer
+    assert "checks" in layer
+    assert "alive" in layer["checks"]
+    assert "ready" in layer["checks"]
 
 
 def test_rabbitmq_layer_adds_checks_after_operator_bootstrap():
