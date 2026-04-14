@@ -1008,38 +1008,7 @@ class RabbitMQOperatorCharm(CharmBase):
         except (APIError, ModelError) as exc:
             logger.warning("Unable to reconcile Pebble health checks: %s", exc)
 
-    def _on_peer_relation_leaving(  # noqa: C901
-        self, event: EventBase
-    ) -> None:
-        if self.unit.is_leader():
-            leaving_node = self.generate_nodename(event.nodename)
-            container = self.unit.get_container(RABBITMQ_CONTAINER)
-            logging.info("Removing %s from queues", leaving_node)
-            try:
-                # forget_cluster_node not currently supported by HTTP API
-                process = container.exec(
-                    ["rabbitmqctl", "forget_cluster_node", leaving_node],
-                    timeout=5 * 60,
-                )
-                output, _ = process.wait_output()
-                logging.info(output)
-            except (ExecError, ModelError) as e:
-                if isinstance(e, ModelError):
-                    logging.warning(
-                        "Container unavailable while removing %s: %s",
-                        leaving_node,
-                        e,
-                    )
-                elif "The node selected is not in the cluster" in e.stderr:
-                    logging.warning(
-                        "Removal of %s failed, node not found",
-                        leaving_node,
-                    )
-                else:
-                    logging.error("Removal of %s failed", leaving_node)
-                    logging.error(e.stdout)
-                    logging.error(e.stderr)
-
+    def _on_peer_relation_leaving(self, event: EventBase) -> None:
         self._departing_unit_count = 1
         try:
             self._reconcile(event)
