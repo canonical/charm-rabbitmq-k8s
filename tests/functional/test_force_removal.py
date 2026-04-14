@@ -17,7 +17,6 @@ from pathlib import (
 )
 
 import jubilant
-import pytest
 
 from .helpers import (
     deploy_local,
@@ -26,14 +25,6 @@ from .helpers import (
 )
 
 
-@pytest.mark.xfail(
-    reason=(
-        "Juju CAAS bug: force-removing an application leaves orphaned storage "
-        "references in the StatefulSet, causing redeployment to fail with "
-        "'volume not found'. Related: LP#2031931, LP#1977865."
-    ),
-    strict=False,
-)
 def test_reinstall_after_force_removal(
     juju: jubilant.Juju,
     app_name: str,
