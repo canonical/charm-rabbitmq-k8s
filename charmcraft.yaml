@@ -169,6 +169,12 @@ actions:
           Only list queues which reported an error
     required:
       - unit-name
+  forget-cluster-node:
+    description: |
+      Remove stale cluster members that are no longer present in Juju
+      peer data.  This permanently forgets absent nodes and deletes
+      their quorum queue replicas.  Only run this when you are certain
+      the removed nodes will not rejoin with their existing data.
 
 containers:
   rabbitmq:
