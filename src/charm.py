@@ -227,7 +227,7 @@ class RabbitMQOperatorCharm(CharmBase):
         self._lightkube_client = None
         self._lightkube_field_manager: str = self.app.name
         self._lb_name: str = f"{self.app.name}-lb"
-        self._departing_unit_count: int = 0
+        self._departing_unit_name: str | None = None
 
         # Open ports on default cluster IP
         # OpenStack services uses cluster IP from service rabbitmq
@@ -415,6 +415,9 @@ class RabbitMQOperatorCharm(CharmBase):
         if not self._reconcile_operator_user(event):
             return
 
+        if not self._auto_forget_stale_cluster_nodes(event):
+            return
+
         self._reconcile_running_broker_state()
         self._reconcile_health_checks()
 
@@ -566,6 +569,106 @@ class RabbitMQOperatorCharm(CharmBase):
             }
         )
 
+    def _expected_cluster_nodes(self) -> set[str]:
+        """Return RabbitMQ node names expected from current Juju peer data."""
+        unit_names = {self.unit.name}
+        rel = self.peers.peers_rel
+        if rel is not None:
+            unit_names.update(unit.name for unit in rel.units)
+
+        departing_unit_name = getattr(self, "_departing_unit_name", None)
+        if departing_unit_name is not None:
+            unit_names.discard(departing_unit_name)
+
+        return {self.generate_nodename(unit_name) for unit_name in unit_names}
+
+    def _cluster_status(self) -> dict:
+        """Return RabbitMQ cluster status from rabbitmqctl."""
+        output, _ = self._run_rabbitmqctl("cluster_status", "--formatter=json")
+        return json.loads(output)
+
+    def _forget_cluster_node_if_present(self, node: str) -> bool:
+        """Forget a cluster node, returning whether it is gone."""
+        try:
+            self._run_rabbitmqctl(
+                "forget_cluster_node",
+                node,
+                timeout=5 * 60,
+            )
+            return True
+        except ExecError as e:
+            if "not in the cluster" in e.stderr:
+                return True
+            logger.warning(
+                "Unable to forget stale RabbitMQ cluster node %s: %s", node, e
+            )
+            return False
+        except ModelError as e:
+            logger.warning(
+                "Unable to forget stale RabbitMQ cluster node %s: %s", node, e
+            )
+            return False
+
+    def _auto_forget_stale_cluster_nodes_ready(self) -> bool:
+        """Return whether automatic stale-node cleanup may run."""
+        return bool(
+            self.config.get("auto-forget-stale-nodes", False)
+            and self.unit.is_leader()
+            and self.peers.peers_rel is not None
+            and self.peers.operator_user_created
+            and self._rabbitmq_running()
+            and getattr(self, "_departing_unit_name", None) is None
+        )
+
+    def _defer_or_continue(self, event: EventBase | None) -> bool:
+        """Defer an event when possible, otherwise continue reconciliation."""
+        if event is None:
+            return True
+        event.defer()
+        return False
+
+    def _auto_forget_stale_cluster_nodes(
+        self, event: EventBase | None = None
+    ) -> bool:
+        """Forget stale RabbitMQ nodes after intentional scale-down.
+
+        The cleanup is opt-in because forgetting a node permanently deletes
+        quorum queue replicas that only exist on that node.
+        """
+        if not self._auto_forget_stale_cluster_nodes_ready():
+            return True
+
+        try:
+            cluster_status = self._cluster_status()
+        except (ExecError, ModelError, json.JSONDecodeError) as e:
+            logger.warning("Unable to retrieve RabbitMQ cluster status: %s", e)
+            return self._defer_or_continue(event)
+
+        expected_nodes = self._expected_cluster_nodes()
+        if self.generate_nodename(self.unit.name) not in expected_nodes:
+            return True
+
+        running_nodes = set(cluster_status.get("running_nodes", []))
+        unexpected_nodes = {
+            node
+            for node in cluster_status.get("disk_nodes", [])
+            if node not in expected_nodes
+        }
+        still_running = sorted(unexpected_nodes & running_nodes)
+        if still_running:
+            logger.info(
+                "Waiting for unexpected RabbitMQ nodes to stop before "
+                "forgetting them: %s",
+                ", ".join(still_running),
+            )
+            return True
+
+        for node in sorted(unexpected_nodes - running_nodes):
+            if not self._forget_cluster_node_if_present(node):
+                return self._defer_or_continue(event)
+
+        return True
+
     def _ensure_broker_running(self, event: EventBase | None = None) -> bool:
         """Ensure the local broker is running, starting it when possible."""
         if self._rabbitmq_running():
@@ -575,6 +678,9 @@ class RabbitMQOperatorCharm(CharmBase):
             return False
 
         if not self._rabbitmq_running():
+            if self._force_boot_single_survivor_after_scale_down(event):
+                return True
+
             if event is not None:
                 logger.debug(
                     "RabbitMQ not running yet after reconciliation, deferring %s",
@@ -584,6 +690,43 @@ class RabbitMQOperatorCharm(CharmBase):
             return False
 
         return True
+
+    def _scale_down_force_boot_allowed(
+        self, event: EventBase | None = None
+    ) -> bool:
+        """Return whether this hook may recover a single scale-down survivor."""
+        return bool(
+            self.config.get("auto-forget-stale-nodes", False)
+            and self.unit.is_leader()
+            and self.peers.peers_rel is not None
+            and self.peers.operator_user_created
+            and self._expected_cluster_size == 1
+            and getattr(self, "_departing_unit_name", None) is None
+        )
+
+    def _force_boot_single_survivor(self) -> bool:
+        """Force boot and restart RabbitMQ after intentional 3-to-1 scale-down."""
+        container = self.unit.get_container(RABBITMQ_CONTAINER)
+        try:
+            self._run_rabbitmqctl("force_boot", timeout=5 * 60)
+            container.restart(RABBITMQ_SERVICE)
+            self._run_rabbitmqctl(
+                "await_startup", timeout=RABBITMQ_STARTUP_GRACE_SECONDS
+            )
+        except (ExecError, ModelError) as e:
+            logger.warning(
+                "Unable to force boot RabbitMQ scale-down survivor: %s", e
+            )
+            return False
+        return self._rabbitmq_running()
+
+    def _force_boot_single_survivor_after_scale_down(
+        self, event: EventBase | None = None
+    ) -> bool:
+        """Recover a single survivor stopped by RabbitMQ pause_minority."""
+        if not self._scale_down_force_boot_allowed(event):
+            return False
+        return self._force_boot_single_survivor()
 
     def _reconcile_operator_user(self, event: EventBase | None = None) -> bool:
         """Ensure the leader has bootstrapped the operator user."""
@@ -1008,11 +1151,11 @@ class RabbitMQOperatorCharm(CharmBase):
             logger.warning("Unable to reconcile Pebble health checks: %s", exc)
 
     def _on_peer_relation_leaving(self, event: EventBase) -> None:
-        self._departing_unit_count = 1
+        self._departing_unit_name = event.nodename
         try:
             self._reconcile(event)
         finally:
-            self._departing_unit_count = 0
+            self._departing_unit_name = None
 
     def get_queue_growth_selector(self, min_q_len: int, max_q_len: int):
         """Select a queue growth strategy.
@@ -1954,12 +2097,17 @@ class RabbitMQOperatorCharm(CharmBase):
         """Return the expected number of cluster members from peer relation.
 
         During relation-departed hooks the departing unit is still present in
-        relation.units, so we subtract any known departing units.
+        relation.units, so we exclude that specific unit by name.
         """
         rel = self.peers.peers_rel
         if rel is None:
             return 1
-        return max(1, len(rel.units) + 1 - self._departing_unit_count)
+
+        peer_unit_names = {unit.name for unit in rel.units}
+        departing_unit_name = getattr(self, "_departing_unit_name", None)
+        if departing_unit_name is not None:
+            peer_unit_names.discard(departing_unit_name)
+        return max(1, len(peer_unit_names) + 1)
 
     def _render_and_push_safety_check(self) -> bool:
         """Render the workload safety-check script."""

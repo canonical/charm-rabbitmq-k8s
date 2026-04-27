@@ -30,6 +30,8 @@ def test_scale_down_cluster_membership(
 ) -> None:
     """Scale from three units to one and verify removed nodes are forgotten."""
     deploy_local(juju, app_name, charm_file, rabbitmq_image, base, units=3)
+    juju.config(app_name, {"auto-forget-stale-nodes": "true"})
+    wait_for_app(juju, app_name, units=3)
 
     juju.cli("scale-application", app_name, "1")
     wait_for_app(juju, app_name, units=1)
