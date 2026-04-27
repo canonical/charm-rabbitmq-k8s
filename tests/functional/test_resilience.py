@@ -26,10 +26,66 @@ from .helpers import (
     resilience_profile,
     run_action,
     start_perf_test,
+    status_payload,
     wait_for_app,
     wait_for_pod_ready,
     wait_for_running_nodes,
 )
+
+STOP_HOOK_FAILURE = 'hook failed: "stop"'
+
+
+def _resolve_stop_hook_failure_after_pod_recreation(
+    juju: jubilant.Juju,
+    app_name: str,
+    units: int,
+    *,
+    timeout: int = 5 * 60,
+    interval: int = 5,
+) -> None:
+    """Resolve the known Juju CaaS stop-hook failure after forced pod deletion."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        payload = status_payload(juju)
+        app = payload.get("applications", {}).get(app_name, {})
+        unit_statuses = app.get("units", {})
+        if len(unit_statuses) != units:
+            time.sleep(interval)
+            continue
+
+        stop_hook_failures = []
+        other_errors = []
+        all_active_idle = True
+        for unit_name, unit_status in unit_statuses.items():
+            workload = unit_status.get("workload-status", {})
+            juju_status = unit_status.get("juju-status", {})
+            workload_current = workload.get("current")
+            workload_message = workload.get("message", "")
+            juju_current = juju_status.get("current")
+
+            if workload_current == "error":
+                if workload_message == STOP_HOOK_FAILURE:
+                    stop_hook_failures.append(unit_name)
+                else:
+                    other_errors.append(
+                        f"{unit_name}: {workload_message or workload_current}"
+                    )
+
+            if workload_current != "active" or juju_current != "idle":
+                all_active_idle = False
+
+        if other_errors:
+            raise AssertionError(
+                "Unexpected unit error after pod recreation: "
+                + ", ".join(other_errors)
+            )
+        if stop_hook_failures:
+            juju.cli("resolved", "--all")
+            return
+        if all_active_idle:
+            return
+
+        time.sleep(interval)
 
 
 def test_resilience_during_scale_events(
@@ -186,6 +242,7 @@ def test_full_cluster_crash_and_recovery(
         "get-service-account",
         {"username": username, "vhost": vhost},
     )
+    wait_for_app(juju, app_name, units=3)
     uri = amqp_uri(
         username=service_account.results["username"],
         password=service_account.results["password"],
@@ -205,6 +262,9 @@ def test_full_cluster_crash_and_recovery(
 
         # Kill all pods simultaneously
         delete_all_app_pods(juju, app_name)
+        _resolve_stop_hook_failure_after_pod_recreation(
+            juju, app_name, units=3
+        )
 
         # Wait for full recovery
         wait_for_app(juju, app_name, units=3)
