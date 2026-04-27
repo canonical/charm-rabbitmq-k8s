@@ -122,6 +122,16 @@ def _fake_charm(**kwargs):
         "_reconcile_health_checks": Mock(),
         "_reconcile": Mock(),
         "_ensure_broker_running": Mock(return_value=True),
+        "_auto_forget_stale_cluster_nodes": Mock(return_value=True),
+        "_auto_forget_stale_cluster_nodes_ready": Mock(return_value=False),
+        "_cluster_status": Mock(return_value={}),
+        "_forget_cluster_node_if_present": Mock(return_value=True),
+        "_scale_down_force_boot_allowed": Mock(return_value=False),
+        "_force_boot_single_survivor": Mock(return_value=False),
+        "_force_boot_single_survivor_after_scale_down": Mock(
+            return_value=False
+        ),
+        "_defer_or_continue": Mock(return_value=True),
         "_ensure_relation_credentials": Mock(),
         "_on_update_status": Mock(),
         "_operator_user_recovery_required": Mock(return_value=False),
@@ -2240,14 +2250,13 @@ def test_get_queue_growth_selector_zero_members():
     )
 
 
-def test_peer_relation_leaving_does_not_forget_cluster_node():
-    """The auto path must never forget a cluster node.
+def test_peer_relation_leaving_does_not_forget_cluster_node_by_default():
+    """The default auto path must never forget a cluster node.
 
     forget_cluster_node permanently removes a node and deletes its quorum
     queue replicas.  A peer-relation-departed event can fire for transient
-    reasons (juju agent loss, pod reschedule, controller hiccup), so the
-    charm must not run the destructive call automatically.  Operators
-    invoke the forget-cluster-node action when they are certain.
+    reasons (juju agent loss, pod reschedule, controller hiccup), so automatic
+    cleanup is opt-in.
     """
     container = Mock()
     event = SimpleNamespace(nodename="rabbitmq-k8s/1")
@@ -2265,24 +2274,363 @@ def test_peer_relation_leaving_does_not_forget_cluster_node():
 
 
 def test_peer_relation_leaving_marks_departing_unit_during_reconcile():
-    """Reconcile during a leaving event must see _departing_unit_count == 1."""
-    captured: dict[str, int] = {}
+    """Reconcile during a leaving event must know the departing unit name."""
+    captured: dict[str, str | None] = {}
     event = SimpleNamespace(nodename="rabbitmq-k8s/1")
 
     def capture(_event):
-        captured["count"] = fake._departing_unit_count
+        captured["unit_name"] = fake._departing_unit_name
 
     fake = _fake_charm(
         unit=Mock(is_leader=Mock(return_value=True)),
         _reconcile=Mock(side_effect=capture),
     )
-    fake._departing_unit_count = 0
+    fake._departing_unit_name = None
 
     charm.RabbitMQOperatorCharm._on_peer_relation_leaving(fake, event)
 
-    assert captured["count"] == 1
-    assert fake._departing_unit_count == 0
+    assert captured["unit_name"] == "rabbitmq-k8s/1"
+    assert fake._departing_unit_name is None
     fake._reconcile.assert_called_once_with(event)
+
+
+def test_expected_cluster_size_excludes_named_departing_unit():
+    """Expected cluster size should ignore the unit currently departing."""
+    fake = _fake_charm(
+        peers=SimpleNamespace(
+            peers_rel=SimpleNamespace(
+                units=[
+                    SimpleNamespace(name="rabbitmq-k8s/1"),
+                    SimpleNamespace(name="rabbitmq-k8s/2"),
+                ]
+            )
+        )
+    )
+    fake._departing_unit_name = "rabbitmq-k8s/1"
+
+    assert charm.RabbitMQOperatorCharm._expected_cluster_size.fget(fake) == 2
+
+
+def test_auto_forget_stale_nodes_forgets_absent_non_running_nodes():
+    """Opt-in stale-node cleanup forgets only absent, non-running disk nodes."""
+    cluster_status = {
+        "disk_nodes": [
+            "rabbit@rabbitmq-k8s-0.rabbitmq-k8s-endpoints",
+            "rabbit@rabbitmq-k8s-1.rabbitmq-k8s-endpoints",
+            "rabbit@rabbitmq-k8s-2.rabbitmq-k8s-endpoints",
+        ],
+        "running_nodes": [
+            "rabbit@rabbitmq-k8s-0.rabbitmq-k8s-endpoints",
+            "rabbit@rabbitmq-k8s-2.rabbitmq-k8s-endpoints",
+        ],
+    }
+    container = Mock()
+    container.exec.side_effect = [
+        Mock(wait_output=Mock(return_value=(json.dumps(cluster_status), ""))),
+        Mock(wait_output=Mock(return_value=("", ""))),
+    ]
+    fake = _fake_charm(
+        config={
+            "auto-forget-stale-nodes": True,
+        },
+        unit=SimpleNamespace(
+            is_leader=lambda: True,
+            name="rabbitmq-k8s/0",
+            get_container=Mock(return_value=container),
+        ),
+        peers=SimpleNamespace(
+            operator_user_created="operator",
+            peers_rel=SimpleNamespace(
+                units=[SimpleNamespace(name="rabbitmq-k8s/2")]
+            ),
+        ),
+        _departing_unit_name=None,
+        generate_nodename=Mock(
+            side_effect=lambda unit: (
+                f"rabbit@{unit.replace('/', '-')}.rabbitmq-k8s-endpoints"
+            )
+        ),
+    )
+    fake._expected_cluster_nodes = (
+        lambda: charm.RabbitMQOperatorCharm._expected_cluster_nodes(fake)
+    )
+    fake._run_rabbitmqctl = lambda *args, timeout=30: container.exec(
+        ["rabbitmqctl", *args], timeout=timeout
+    ).wait_output()
+    fake._cluster_status = lambda: charm.RabbitMQOperatorCharm._cluster_status(
+        fake
+    )
+    fake._auto_forget_stale_cluster_nodes_ready = lambda: charm.RabbitMQOperatorCharm._auto_forget_stale_cluster_nodes_ready(
+        fake
+    )
+    fake._defer_or_continue = (
+        lambda event: charm.RabbitMQOperatorCharm._defer_or_continue(
+            fake, event
+        )
+    )
+    fake._forget_cluster_node_if_present = lambda node: charm.RabbitMQOperatorCharm._forget_cluster_node_if_present(
+        fake, node
+    )
+    event = Mock()
+
+    assert charm.RabbitMQOperatorCharm._auto_forget_stale_cluster_nodes(
+        fake, event
+    )
+
+    container.exec.assert_has_calls(
+        [
+            call(
+                ["rabbitmqctl", "cluster_status", "--formatter=json"],
+                timeout=30,
+            ),
+            call(
+                [
+                    "rabbitmqctl",
+                    "forget_cluster_node",
+                    "rabbit@rabbitmq-k8s-1.rabbitmq-k8s-endpoints",
+                ],
+                timeout=5 * 60,
+            ),
+        ]
+    )
+    event.defer.assert_not_called()
+
+
+def test_auto_forget_stale_nodes_skips_during_peer_departure():
+    """Peer-departed hooks must not run destructive stale-node cleanup."""
+    container = Mock()
+    fake = _fake_charm(
+        config={
+            "auto-forget-stale-nodes": True,
+        },
+        unit=SimpleNamespace(
+            is_leader=lambda: True,
+            name="rabbitmq-k8s/2",
+            get_container=Mock(return_value=container),
+        ),
+        peers=SimpleNamespace(
+            operator_user_created="operator",
+            peers_rel=SimpleNamespace(
+                units=[
+                    SimpleNamespace(name="rabbitmq-k8s/0"),
+                    SimpleNamespace(name="rabbitmq-k8s/1"),
+                ]
+            ),
+        ),
+        _departing_unit_name="rabbitmq-k8s/2",
+    )
+    fake._auto_forget_stale_cluster_nodes_ready = lambda: charm.RabbitMQOperatorCharm._auto_forget_stale_cluster_nodes_ready(
+        fake
+    )
+    event = Mock()
+
+    assert charm.RabbitMQOperatorCharm._auto_forget_stale_cluster_nodes(
+        fake, event
+    )
+
+    container.exec.assert_not_called()
+    event.defer.assert_not_called()
+
+
+def test_auto_forget_stale_nodes_continues_when_unexpected_node_still_running():
+    """Opt-in stale-node cleanup does not block hooks on running nodes."""
+    departing_node = "rabbit@rabbitmq-k8s-1.rabbitmq-k8s-endpoints"
+    cluster_status = {
+        "disk_nodes": [
+            "rabbit@rabbitmq-k8s-0.rabbitmq-k8s-endpoints",
+            departing_node,
+        ],
+        "running_nodes": [
+            "rabbit@rabbitmq-k8s-0.rabbitmq-k8s-endpoints",
+            departing_node,
+        ],
+    }
+    container = Mock()
+    container.exec.return_value = Mock(
+        wait_output=Mock(return_value=(json.dumps(cluster_status), ""))
+    )
+    fake = _fake_charm(
+        config={
+            "auto-forget-stale-nodes": True,
+        },
+        unit=SimpleNamespace(
+            is_leader=lambda: True,
+            name="rabbitmq-k8s/0",
+            get_container=Mock(return_value=container),
+        ),
+        peers=SimpleNamespace(
+            operator_user_created="operator",
+            peers_rel=SimpleNamespace(
+                units=[SimpleNamespace(name="rabbitmq-k8s/0")]
+            ),
+        ),
+        _departing_unit_name=None,
+        generate_nodename=Mock(
+            side_effect=lambda unit: (
+                f"rabbit@{unit.replace('/', '-')}.rabbitmq-k8s-endpoints"
+            )
+        ),
+    )
+    fake._expected_cluster_nodes = (
+        lambda: charm.RabbitMQOperatorCharm._expected_cluster_nodes(fake)
+    )
+    fake._run_rabbitmqctl = lambda *args, timeout=30: container.exec(
+        ["rabbitmqctl", *args], timeout=timeout
+    ).wait_output()
+    fake._cluster_status = lambda: charm.RabbitMQOperatorCharm._cluster_status(
+        fake
+    )
+    fake._auto_forget_stale_cluster_nodes_ready = lambda: charm.RabbitMQOperatorCharm._auto_forget_stale_cluster_nodes_ready(
+        fake
+    )
+    fake._defer_or_continue = (
+        lambda event: charm.RabbitMQOperatorCharm._defer_or_continue(
+            fake, event
+        )
+    )
+    fake._forget_cluster_node_if_present = lambda node: charm.RabbitMQOperatorCharm._forget_cluster_node_if_present(
+        fake, node
+    )
+    event = Mock()
+
+    assert charm.RabbitMQOperatorCharm._auto_forget_stale_cluster_nodes(
+        fake, event
+    )
+
+    container.exec.assert_called_once_with(
+        ["rabbitmqctl", "cluster_status", "--formatter=json"],
+        timeout=30,
+    )
+    event.defer.assert_not_called()
+
+
+def test_auto_forget_stale_nodes_skips_when_local_node_is_not_expected():
+    """A doomed unit must not perform stale-node cleanup for the survivor."""
+    container = Mock()
+    fake = _fake_charm(
+        config={
+            "auto-forget-stale-nodes": True,
+        },
+        unit=SimpleNamespace(
+            is_leader=lambda: True,
+            name="rabbitmq-k8s/2",
+            get_container=Mock(return_value=container),
+        ),
+        peers=SimpleNamespace(
+            operator_user_created="operator",
+            peers_rel=SimpleNamespace(
+                units=[SimpleNamespace(name="rabbitmq-k8s/0")]
+            ),
+        ),
+        _departing_unit_name="rabbitmq-k8s/2",
+        generate_nodename=Mock(
+            side_effect=lambda unit: (
+                f"rabbit@{unit.replace('/', '-')}.rabbitmq-k8s-endpoints"
+            )
+        ),
+    )
+    fake._expected_cluster_nodes = (
+        lambda: charm.RabbitMQOperatorCharm._expected_cluster_nodes(fake)
+    )
+    fake._auto_forget_stale_cluster_nodes_ready = lambda: charm.RabbitMQOperatorCharm._auto_forget_stale_cluster_nodes_ready(
+        fake
+    )
+    event = Mock()
+
+    assert charm.RabbitMQOperatorCharm._auto_forget_stale_cluster_nodes(
+        fake, event
+    )
+
+    container.exec.assert_not_called()
+    event.defer.assert_not_called()
+
+
+def test_ensure_broker_running_force_boots_single_survivor_after_scale_down():
+    """Opt-in single survivor recovery force-boots pause_minority shutdown."""
+    event = Mock()
+    container = Mock()
+    fake = _fake_charm(
+        config={
+            "auto-forget-stale-nodes": True,
+        },
+        unit=SimpleNamespace(
+            is_leader=lambda: True,
+            name="rabbitmq-k8s/0",
+            get_container=Mock(return_value=container),
+        ),
+        peers=SimpleNamespace(
+            operator_user_created="operator",
+            peers_rel=SimpleNamespace(units=[]),
+        ),
+        _departing_unit_name=None,
+        _rabbitmq_running=Mock(side_effect=[False, False, True]),
+        _reconcile_workload=Mock(return_value=True),
+    )
+    fake._expected_cluster_size = 1
+    fake._run_rabbitmqctl = Mock(return_value=("", ""))
+    fake._scale_down_force_boot_allowed = lambda event: charm.RabbitMQOperatorCharm._scale_down_force_boot_allowed(
+        fake, event
+    )
+    fake._force_boot_single_survivor = (
+        lambda: charm.RabbitMQOperatorCharm._force_boot_single_survivor(fake)
+    )
+    fake._force_boot_single_survivor_after_scale_down = lambda event: charm.RabbitMQOperatorCharm._force_boot_single_survivor_after_scale_down(
+        fake, event
+    )
+
+    assert charm.RabbitMQOperatorCharm._ensure_broker_running(fake, event)
+
+    fake._run_rabbitmqctl.assert_has_calls(
+        [
+            call("force_boot", timeout=5 * 60),
+            call(
+                "await_startup",
+                timeout=charm.RABBITMQ_STARTUP_GRACE_SECONDS,
+            ),
+        ]
+    )
+    container.restart.assert_called_once_with(charm.RABBITMQ_SERVICE)
+    event.defer.assert_not_called()
+
+
+def test_ensure_broker_running_does_not_force_boot_during_departure_hook():
+    """Single survivor recovery must not run from peer-departed hooks."""
+    event = Mock()
+    container = Mock()
+    fake = _fake_charm(
+        config={
+            "auto-forget-stale-nodes": True,
+        },
+        unit=SimpleNamespace(
+            is_leader=lambda: True,
+            name="rabbitmq-k8s/0",
+            get_container=Mock(return_value=container),
+        ),
+        peers=SimpleNamespace(
+            operator_user_created="operator",
+            peers_rel=SimpleNamespace(units=[]),
+        ),
+        _departing_unit_name="rabbitmq-k8s/1",
+        _rabbitmq_running=Mock(side_effect=[False, False]),
+        _reconcile_workload=Mock(return_value=True),
+    )
+    fake._expected_cluster_size = 1
+    fake._run_rabbitmqctl = Mock(return_value=("", ""))
+    fake._scale_down_force_boot_allowed = lambda event: charm.RabbitMQOperatorCharm._scale_down_force_boot_allowed(
+        fake, event
+    )
+    fake._force_boot_single_survivor = (
+        lambda: charm.RabbitMQOperatorCharm._force_boot_single_survivor(fake)
+    )
+    fake._force_boot_single_survivor_after_scale_down = lambda event: charm.RabbitMQOperatorCharm._force_boot_single_survivor_after_scale_down(
+        fake, event
+    )
+
+    assert not charm.RabbitMQOperatorCharm._ensure_broker_running(fake, event)
+
+    fake._run_rabbitmqctl.assert_not_called()
+    container.restart.assert_not_called()
+    event.defer.assert_called_once_with()
 
 
 def test_workload_reconcile_prerequisites_non_leader_no_operator_user():

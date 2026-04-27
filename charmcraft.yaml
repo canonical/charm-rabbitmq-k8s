@@ -33,6 +33,13 @@ config:
         Refuse new client traffic automatically when the unit is running but no
         longer considered safe to serve.
       type: boolean
+    auto-forget-stale-nodes:
+      default: false
+      description: |
+        Automatically forget non-running RabbitMQ cluster nodes that are no
+        longer present in Juju peer data. This is intended for intentional
+        Juju scale-down and deletes quorum queue replicas on forgotten nodes.
+      type: boolean
     disk-free-limit-bytes:
       default: auto
       description: |
