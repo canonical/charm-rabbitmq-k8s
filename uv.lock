@@ -445,15 +445,6 @@ wheels = [
 ]
 
 [[package]]
-name = "pika"
-version = "1.3.2"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/db/db/d4102f356af18f316c67f2cead8ece307f731dd63140e2c71f170ddacf9b/pika-1.3.2.tar.gz", hash = "sha256:b2a327ddddf8570b4965b3576ac77091b850262d34ce8c1d8cb4e4146aa4145f", size = 145029, upload-time = "2023-05-05T14:25:43.368Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/f9/f3/f412836ec714d36f0f4ab581b84c491e3f42c6b5b97a6c6ed1817f3c16d0/pika-1.3.2-py3-none-any.whl", hash = "sha256:0779a7c1fafd805672796085560d290213a465e4f6f76a6fb19e378d8041a14f", size = 155415, upload-time = "2023-05-05T14:25:41.484Z" },
-]
-
-[[package]]
 name = "pluggy"
 version = "1.6.0"
 source = { registry = "https://pypi.org/simple" }
@@ -461,12 +452,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/f9/e2/3e91f31a7d2b083fe
 wheels = [
     { url = "https://files.pythonhosted.org/packages/54/20/4d324d65cc6d9205fabedc306948156824eb9f0ee1633355a8f7ec5c66bf/pluggy-1.6.0-py3-none-any.whl", hash = "sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746", size = 20538, upload-time = "2025-05-15T12:30:06.134Z" },
 ]
-
-[[package]]
-name = "pwgen"
-version = "0.8.2.post0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/da/dd/4dd87f290e035ffd211068db50b276f23b532cc2fc9464b4ee612f038034/pwgen-0.8.2.post0.tar.gz", hash = "sha256:4723279de6f2a5e8e1ab49374334c920d423c5e3d2c224ae5bf82b57b3ac2b3f", size = 2946, upload-time = "2017-08-01T13:50:59.893Z" }
 
 [[package]]
 name = "pycodestyle"
@@ -570,6 +555,19 @@ wheels = [
 ]
 
 [[package]]
+name = "pytest-jubilant"
+version = "2.0.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "jubilant" },
+    { name = "pytest" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/3d/64/e83181af1004f64a3ce11c7b9770c3152832e02d00e9e7b4f01877325c5f/pytest_jubilant-2.0.1.tar.gz", hash = "sha256:960bb63d216ec746f7644b67c276b059fccdaa258ee7644aaa74058db659edac", size = 16311, upload-time = "2026-04-07T02:08:25.874Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e4/3c/5c0bc4f54f6905aa7515cf764c3f5d6c85711cdc1a928221f711d5b7532c/pytest_jubilant-2.0.1-py3-none-any.whl", hash = "sha256:df498ee79d6db5ec32baa35a121ab75852dd50f61504a12550ba81cd63a7f1ef", size = 13525, upload-time = "2026-04-07T02:08:24.531Z" },
+]
+
+[[package]]
 name = "pyyaml"
 version = "6.0.3"
 source = { registry = "https://pypi.org/simple" }
@@ -606,15 +604,14 @@ version = "3.12"
 source = { virtual = "." }
 dependencies = [
     { name = "cosl" },
+    { name = "jinja2" },
     { name = "jsonschema" },
     { name = "lightkube" },
     { name = "lightkube-extensions" },
     { name = "lightkube-models" },
     { name = "ops", extra = ["tracing"] },
-    { name = "pika" },
-    { name = "pwgen" },
     { name = "rabbitmq-admin" },
-    { name = "tenacity" },
+    { name = "requests" },
 ]
 
 [package.optional-dependencies]
@@ -625,6 +622,7 @@ dev = [
     { name = "ops", extra = ["testing"] },
     { name = "pytest" },
     { name = "pytest-cov" },
+    { name = "pytest-jubilant" },
     { name = "pyyaml" },
     { name = "rabbitmq-admin" },
 ]
@@ -634,6 +632,7 @@ requires-dist = [
     { name = "cosl", specifier = ">=0.0.53" },
     { name = "coverage", marker = "extra == 'dev'" },
     { name = "flake8", marker = "extra == 'dev'" },
+    { name = "jinja2" },
     { name = "jsonschema" },
     { name = "jubilant", marker = "extra == 'dev'" },
     { name = "lightkube" },
@@ -641,14 +640,13 @@ requires-dist = [
     { name = "lightkube-models" },
     { name = "ops", extras = ["testing"], marker = "extra == 'dev'" },
     { name = "ops", extras = ["tracing"] },
-    { name = "pika" },
-    { name = "pwgen" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "pytest-cov", marker = "extra == 'dev'" },
+    { name = "pytest-jubilant", marker = "extra == 'dev'" },
     { name = "pyyaml", marker = "extra == 'dev'" },
     { name = "rabbitmq-admin" },
     { name = "rabbitmq-admin", marker = "extra == 'dev'" },
-    { name = "tenacity" },
+    { name = "requests" },
 ]
 provides-extras = ["dev"]
 
