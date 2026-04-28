@@ -112,3 +112,40 @@ def test_stop_hook_recovery_keeps_polling_after_resolve(monkeypatch):
 
     assert juju.cli_calls == [("resolved", "--all")]
     assert statuses == []
+
+
+def test_stop_hook_recovery_returns_after_stop_hook_clears(monkeypatch):
+    """Full broker recovery is handled by the following wait_for_app call."""
+    juju = FakeJuju()
+    statuses = [
+        _status_payload(
+            _unit_status(
+                "maintenance",
+                workload_message=test_resilience.STOP_HOOK_MAINTENANCE,
+            )
+        ),
+        _status_payload(
+            _unit_status(
+                "blocked",
+                workload_message="RabbitMQ not running",
+            )
+        ),
+    ]
+
+    monkeypatch.setattr(test_resilience.time, "sleep", lambda _interval: None)
+    monkeypatch.setattr(test_resilience.time, "monotonic", lambda: 0)
+    monkeypatch.setattr(
+        test_resilience,
+        "status_payload",
+        lambda _juju: statuses.pop(0),
+    )
+
+    test_resilience._resolve_stop_hook_failure_after_pod_recreation(
+        juju,
+        "rabbitmq-k8s",
+        units=3,
+        timeout=10,
+    )
+
+    assert juju.cli_calls == [("resolved", "--all")]
+    assert statuses == []
