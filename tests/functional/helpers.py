@@ -34,8 +34,6 @@ RABBITMQ_FILLER_PATH = "/var/lib/rabbitmq/.functional-fill"
 RABBITMQ_DATA_DIR = "/var/lib/rabbitmq"
 RABBITMQ_TIMER_NOTICE = "rabbitmq.local/timer"
 
-_RABBITMQ_STOP_PROCESSES: dict[tuple[str, str], subprocess.Popen] = {}
-
 
 def status_payload(juju: jubilant.Juju) -> dict:
     """Return the full Juju status payload."""
@@ -729,43 +727,41 @@ def rabbitmqctl_start_app(juju: jubilant.Juju, unit_name: str) -> None:
 
 
 def hold_rabbitmq_service_stopped(juju: jubilant.Juju, unit_name: str) -> None:
-    """Keep the RabbitMQ unit unavailable by repeatedly deleting its pod."""
-    key = (model_name(juju), unit_name)
-    process = _RABBITMQ_STOP_PROCESSES.get(key)
-    if process and process.poll() is None:
-        return
-
-    _RABBITMQ_STOP_PROCESSES[key] = subprocess.Popen(  # nosec B603
-        [
-            "bash",
-            "-lc",
-            (
-                f"while true; do "
-                f"{shlex.quote(kubectl())} delete pod "
-                f"{shlex.quote(pod_name_for_unit(unit_name))} "
-                f"-n {shlex.quote(model_name(juju))} "
-                "--ignore-not-found=true --grace-period=0 --force "
-                ">/dev/null 2>&1 || true; "
-                "sleep 5; "
-                "done"
-            ),
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+    """Keep RabbitMQ unavailable without deleting the unit pod."""
+    juju.ssh(
+        unit_name,
+        "/charm/bin/pebble",
+        "stop-checks",
+        "alive",
+        "ready",
+        container=RABBITMQ_CONTAINER,
+    )
+    juju.ssh(
+        unit_name,
+        "/charm/bin/pebble",
+        "stop",
+        "rabbitmq",
+        container=RABBITMQ_CONTAINER,
     )
 
 
 def release_rabbitmq_service_stop(juju: jubilant.Juju, unit_name: str) -> None:
-    """Stop holding the RabbitMQ unit down and let Kubernetes recreate it."""
-    key = (model_name(juju), unit_name)
-    process = _RABBITMQ_STOP_PROCESSES.pop(key, None)
-    if process and process.poll() is None:
-        process.terminate()
-        try:
-            process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=10)
+    """Restart RabbitMQ after a deliberate service-level outage."""
+    juju.ssh(
+        unit_name,
+        "/charm/bin/pebble",
+        "start",
+        "rabbitmq",
+        container=RABBITMQ_CONTAINER,
+    )
+    juju.ssh(
+        unit_name,
+        "/charm/bin/pebble",
+        "start-checks",
+        "alive",
+        "ready",
+        container=RABBITMQ_CONTAINER,
+    )
 
 
 def rabbitmq_service_state(juju: jubilant.Juju, unit_name: str) -> str:
