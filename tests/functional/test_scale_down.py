@@ -30,10 +30,16 @@ def test_scale_down_cluster_membership(
 ) -> None:
     """Scale from three units to one and verify removed nodes are forgotten."""
     deploy_local(juju, app_name, charm_file, rabbitmq_image, base, units=3)
+    juju.config(app_name, {"auto-forget-stale-nodes": "true"})
+    wait_for_app(juju, app_name, units=3)
 
     juju.cli("scale-application", app_name, "1")
     wait_for_app(juju, app_name, units=1)
 
-    expected_nodes = {expected_rabbit_node(app_name, f"{app_name}/0")}
-    status = wait_for_running_nodes(juju, f"{app_name}/0", expected_nodes)
+    status = juju.status()
+    surviving_units = sorted(status.apps[app_name].units)
+    assert len(surviving_units) == 1
+    surviving_unit = surviving_units[0]
+    expected_nodes = {expected_rabbit_node(app_name, surviving_unit)}
+    status = wait_for_running_nodes(juju, surviving_unit, expected_nodes)
     assert set(status["running_nodes"]) == expected_nodes

@@ -17,6 +17,9 @@
 from pathlib import (
     Path,
 )
+from tempfile import (
+    TemporaryDirectory,
+)
 
 import pytest
 import yaml
@@ -26,8 +29,8 @@ from ops import (
 
 import charm
 
-CHARM_ROOT = Path(__file__).parents[2]
-CHARMCRAFT = yaml.safe_load((CHARM_ROOT / "charmcraft.yaml").read_text())
+REPO_ROOT = Path(__file__).parents[2]
+CHARMCRAFT = yaml.safe_load((REPO_ROOT / "charmcraft.yaml").read_text())
 META_FIELDS = {
     "assumes",
     "containers",
@@ -52,6 +55,23 @@ METADATA = {
 }
 ACTIONS = CHARMCRAFT.get("actions", {})
 CONFIG = CHARMCRAFT.get("config", {})
+
+
+def _build_test_charm_root(root: Path) -> None:
+    """Create an isolated charm root for ops-scenario tests."""
+    (root / "src").mkdir()
+    (root / "lib").mkdir()
+    (root / "src" / "grafana_dashboards").symlink_to(
+        REPO_ROOT / "src" / "grafana_dashboards",
+        target_is_directory=True,
+    )
+    (root / "src" / "prometheus_alert_rules").symlink_to(
+        REPO_ROOT / "src" / "prometheus_alert_rules",
+        target_is_directory=True,
+    )
+    (root / "metadata.yaml").write_text(yaml.safe_dump(METADATA))
+    (root / "actions.yaml").write_text(yaml.safe_dump(ACTIONS))
+    (root / "config.yaml").write_text(yaml.safe_dump({"options": CONFIG}))
 
 
 class TestableRabbitMQOperatorCharm(charm.RabbitMQOperatorCharm):
@@ -107,14 +127,17 @@ def build_amqp_relation(
 @pytest.fixture()
 def ctx():
     """Create the scenario test context."""
-    return testing.Context(
-        TestableRabbitMQOperatorCharm,
-        meta=METADATA,
-        actions=ACTIONS,
-        config=CONFIG,
-        charm_root=CHARM_ROOT,
-        capture_deferred_events=True,
-    )
+    with TemporaryDirectory(prefix="rabbitmq-scenario-") as tmpdir:
+        charm_root = Path(tmpdir)
+        _build_test_charm_root(charm_root)
+        yield testing.Context(
+            TestableRabbitMQOperatorCharm,
+            meta=METADATA,
+            actions=ACTIONS,
+            config=CONFIG,
+            charm_root=charm_root,
+            capture_deferred_events=True,
+        )
 
 
 @pytest.fixture()
