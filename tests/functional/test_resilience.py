@@ -39,13 +39,40 @@ STOP_HOOK_MAINTENANCE = "stopping charm software"
 def _needs_stop_hook_resolution(
     workload_current: str | None, workload_message: str
 ) -> bool:
-    """Return whether a unit is waiting for forced-delete stop-hook recovery."""
+    """Return whether a unit is waiting for forced pod deletion cleanup."""
     return (
         workload_current == "error" and workload_message == STOP_HOOK_FAILURE
     ) or (
         workload_current == "maintenance"
         and workload_message == STOP_HOOK_MAINTENANCE
     )
+
+
+def _stop_hook_recovery_state(
+    unit_statuses: dict[str, dict],
+) -> tuple[list[str], list[str], bool]:
+    """Summarise unit states relevant to forced pod deletion cleanup."""
+    stop_hook_failures = []
+    other_errors = []
+    all_active_idle = True
+    for unit_name, unit_status in unit_statuses.items():
+        workload = unit_status.get("workload-status", {})
+        juju_status = unit_status.get("juju-status", {})
+        workload_current = workload.get("current")
+        workload_message = workload.get("message", "")
+        juju_current = juju_status.get("current")
+
+        if _needs_stop_hook_resolution(workload_current, workload_message):
+            stop_hook_failures.append(unit_name)
+        elif workload_current == "error":
+            other_errors.append(
+                f"{unit_name}: {workload_message or workload_current}"
+            )
+
+        if workload_current != "active" or juju_current != "idle":
+            all_active_idle = False
+
+    return stop_hook_failures, other_errors, all_active_idle
 
 
 def _resolve_stop_hook_failure_after_pod_recreation(
@@ -56,8 +83,14 @@ def _resolve_stop_hook_failure_after_pod_recreation(
     timeout: int = 5 * 60,
     interval: int = 5,
 ) -> None:
-    """Resolve the known Juju CaaS stop-hook failure after forced pod deletion."""
+    """Resolve Juju stop-hook artifacts caused by forced pod deletion.
+
+    Forced pod deletion approximates a host-level crash for the workload, but
+    Juju may still surface the missing pod as a failed or pending stop hook.
+    Clear that lifecycle artifact before waiting for RabbitMQ recovery.
+    """
     deadline = time.monotonic() + timeout
+    resolved_stop_hook = False
     while time.monotonic() < deadline:
         payload = status_payload(juju)
         app = payload.get("applications", {}).get(app_name, {})
@@ -66,25 +99,9 @@ def _resolve_stop_hook_failure_after_pod_recreation(
             time.sleep(interval)
             continue
 
-        stop_hook_failures = []
-        other_errors = []
-        all_active_idle = True
-        for unit_name, unit_status in unit_statuses.items():
-            workload = unit_status.get("workload-status", {})
-            juju_status = unit_status.get("juju-status", {})
-            workload_current = workload.get("current")
-            workload_message = workload.get("message", "")
-            juju_current = juju_status.get("current")
-
-            if _needs_stop_hook_resolution(workload_current, workload_message):
-                stop_hook_failures.append(unit_name)
-            elif workload_current == "error":
-                other_errors.append(
-                    f"{unit_name}: {workload_message or workload_current}"
-                )
-
-            if workload_current != "active" or juju_current != "idle":
-                all_active_idle = False
+        stop_hook_failures, other_errors, all_active_idle = (
+            _stop_hook_recovery_state(unit_statuses)
+        )
 
         if other_errors:
             raise AssertionError(
@@ -95,6 +112,9 @@ def _resolve_stop_hook_failure_after_pod_recreation(
             return
         if stop_hook_failures:
             juju.cli("resolved", "--all")
+            resolved_stop_hook = True
+        elif resolved_stop_hook:
+            return
 
         time.sleep(interval)
 
@@ -237,14 +257,14 @@ def test_resilience_during_pod_restarts(
     )
 
 
-def test_full_cluster_crash_and_recovery(
+def test_unclean_full_pod_recreation_and_recovery(
     juju: jubilant.Juju,
     app_name: str,
     base: str,
     charm_file: Path,
     rabbitmq_image: str,
 ) -> None:
-    """Kill all pods simultaneously and verify cluster recovers."""
+    """Recover after every RabbitMQ pod disappears without graceful shutdown."""
     deploy_local(juju, app_name, charm_file, rabbitmq_image, base, units=3)
 
     loadbalancer_ip = loadbalancer_address(juju, app_name)
@@ -275,7 +295,7 @@ def test_full_cluster_crash_and_recovery(
     try:
         time.sleep(20)
 
-        # Kill all pods simultaneously
+        # Force-delete all pods to approximate unclean host-level loss.
         delete_all_app_pods(juju, app_name)
         _resolve_stop_hook_failure_after_pod_recreation(
             juju, app_name, units=3
@@ -295,7 +315,7 @@ def test_full_cluster_crash_and_recovery(
             perf_test.terminate()
             perf_test.wait(timeout=30)
 
-    # Re-create credentials after full crash (users may be lost)
+    # Re-create credentials after unclean full pod recreation.
     leader = leader_unit(juju, app_name)
     verify_username = f"crash-v-{uuid.uuid4().hex[:8]}"
     verify_vhost = f"crash-v-{uuid.uuid4().hex[:8]}"
@@ -331,7 +351,7 @@ def test_full_cluster_crash_and_recovery(
             verify_perf_test.wait(timeout=30)
 
     assert verify_perf_test.returncode == 0, (
-        "rabbitmq-perf-test failed after full cluster crash recovery\n"
+        "rabbitmq-perf-test failed after unclean full pod recreation\n"
         f"stdout:\n{stdout}\n"
         f"stderr:\n{stderr}"
     )
