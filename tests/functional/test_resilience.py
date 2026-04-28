@@ -33,6 +33,19 @@ from .helpers import (
 )
 
 STOP_HOOK_FAILURE = 'hook failed: "stop"'
+STOP_HOOK_MAINTENANCE = "stopping charm software"
+
+
+def _needs_stop_hook_resolution(
+    workload_current: str | None, workload_message: str
+) -> bool:
+    """Return whether a unit is waiting for forced-delete stop-hook recovery."""
+    return (
+        workload_current == "error" and workload_message == STOP_HOOK_FAILURE
+    ) or (
+        workload_current == "maintenance"
+        and workload_message == STOP_HOOK_MAINTENANCE
+    )
 
 
 def _resolve_stop_hook_failure_after_pod_recreation(
@@ -63,13 +76,12 @@ def _resolve_stop_hook_failure_after_pod_recreation(
             workload_message = workload.get("message", "")
             juju_current = juju_status.get("current")
 
-            if workload_current == "error":
-                if workload_message == STOP_HOOK_FAILURE:
-                    stop_hook_failures.append(unit_name)
-                else:
-                    other_errors.append(
-                        f"{unit_name}: {workload_message or workload_current}"
-                    )
+            if _needs_stop_hook_resolution(workload_current, workload_message):
+                stop_hook_failures.append(unit_name)
+            elif workload_current == "error":
+                other_errors.append(
+                    f"{unit_name}: {workload_message or workload_current}"
+                )
 
             if workload_current != "active" or juju_current != "idle":
                 all_active_idle = False
@@ -79,13 +91,16 @@ def _resolve_stop_hook_failure_after_pod_recreation(
                 "Unexpected unit error after pod recreation: "
                 + ", ".join(other_errors)
             )
-        if stop_hook_failures:
-            juju.cli("resolved", "--all")
-            return
         if all_active_idle:
             return
+        if stop_hook_failures:
+            juju.cli("resolved", "--all")
 
         time.sleep(interval)
+
+    raise AssertionError(
+        "Timed out resolving Juju stop-hook failure after pod recreation"
+    )
 
 
 def test_resilience_during_scale_events(
