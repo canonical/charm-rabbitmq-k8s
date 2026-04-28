@@ -2326,73 +2326,11 @@ class RabbitMQOperatorCharm(CharmBase):
 
         event.add_status(self._running_broker_status())
 
-    def _validate_disk_free_limit(self) -> bool:
-        """Validate that disk-free-limit-bytes resolves cleanly."""
-        try:
-            self.resolved_disk_free_limit_bytes
-        except RabbitOperatorError as e:
-            logger.debug("Disk free limit is not yet valid: %s", e)
-            return False
-        return True
-
     def _unsafe_status(self, reason: str):
         """Return unit status for an unsafe broker state."""
         if self.protect_members:
             return BlockedStatus(f"Protection mode: {reason}")
         return ActiveStatus(f"WARNING: protection disabled ({reason})")
-
-    def create_amqp_credentials(
-        self,
-        event: ops.RelationEvent,
-        username: str,
-        vhost: str,
-        external_connectivity: bool,
-    ) -> None:
-        """Set AMQP Credentials.
-
-        :param event: The current event
-        :param username: The requested username
-        :param vhost: The requested vhost
-        :param external_connectivity: Whether to use external connectivity
-        """
-        # TODO TLS Support. Existing interfaces set ssl_port and ssl_ca
-        logging.debug("Setting amqp connection information.")
-
-        # NOTE: fast exit if credentials are already on the relation
-        if event.relation.data[self.app].get("password"):
-            logging.debug(f"Credentials already provided for {username}")
-            return
-
-        if not self._ensure_broker_running(event):
-            return
-        try:
-            self._ensure_relation_credentials(
-                event.relation,
-                username,
-                vhost,
-                external_connectivity,
-            )
-        except requests.exceptions.HTTPError as http_e:
-            # If the peers binding address exists, but the operator has not
-            # been set up yet, the command will fail with a http 401 error and
-            # unauthorized in the message. Just check the status code for now.
-            if (
-                http_e.response is not None
-                and http_e.response.status_code == 401
-            ):
-                logger.warning(
-                    "RabbitMQ not fully configured yet, deferring. "
-                    "Status: %s",
-                    http_e.response.status_code,
-                )
-                event.defer()
-            else:
-                raise
-        except requests.exceptions.ConnectionError as e:
-            logging.warning(
-                f"Rabbitmq is not ready, deferring. Errno: {e.errno}"
-            )
-            event.defer()
 
     def _publish_relation_data(self) -> None:
         """Update all relation data to latest state."""
