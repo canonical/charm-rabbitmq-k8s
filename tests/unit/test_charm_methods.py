@@ -735,6 +735,96 @@ def test_publish_relation_data_on_model_error():
     fake.get_hostname.assert_not_called()
 
 
+def test_cleanup_amqp_relation_user_deletes_only_broken_relation_username():
+    """Relation-broken cleanup must not delete unrelated peer credentials."""
+    app_key = object()
+    remote_app = object()
+    app_data = {
+        "operator_password": "operator-password",
+        "operator_user_created": "operator",
+        "erlang_cookie": "cookie",
+        "client-user": "client-password",
+        "service-account": "service-password",
+    }
+    peers_rel = SimpleNamespace(app=app_key, data={app_key: app_data})
+    relation = SimpleNamespace(data={remote_app: {"username": "client-user"}})
+    admin_api = Mock()
+    unit = Mock()
+    unit.is_leader.return_value = True
+    peers = SimpleNamespace(
+        peers_rel=peers_rel,
+        operator_user_created="operator",
+        delete_user=Mock(side_effect=lambda username: app_data.pop(username)),
+    )
+    fake = _fake_charm(
+        unit=unit,
+        peers=peers,
+        amqp_provider=SimpleNamespace(
+            username=Mock(return_value="client-user")
+        ),
+        _is_amqp_username_in_use_elsewhere=Mock(return_value=False),
+        does_user_exist=Mock(return_value=True),
+        _get_admin_api=Mock(return_value=admin_api),
+    )
+
+    charm.RabbitMQOperatorCharm._cleanup_amqp_relation_user(
+        fake, SimpleNamespace(relation=relation)
+    )
+
+    admin_api.delete_user.assert_called_once_with("client-user")
+    assert "client-user" not in app_data
+    assert app_data["service-account"] == "service-password"
+
+
+def test_cleanup_amqp_relation_user_keeps_shared_username():
+    """Relation cleanup keeps a user requested by a surviving relation."""
+    broken = SimpleNamespace(id=1, active=False)
+    surviving = SimpleNamespace(id=2, active=True)
+    admin_api = Mock()
+    peers = SimpleNamespace(
+        operator_user_created="operator",
+        delete_user=Mock(),
+    )
+    fake = _fake_charm(
+        peers=peers,
+        amqp_provider=SimpleNamespace(username=Mock(return_value="shared")),
+        model=SimpleNamespace(
+            relations={charm.AMQP_RELATION: [broken, surviving]}
+        ),
+        _is_amqp_username_in_use_elsewhere=(
+            lambda username, exclude: charm.RabbitMQOperatorCharm._is_amqp_username_in_use_elsewhere(
+                fake, username, exclude
+            )
+        ),
+        _get_admin_api=Mock(return_value=admin_api),
+    )
+
+    charm.RabbitMQOperatorCharm._cleanup_amqp_relation_user(
+        fake, SimpleNamespace(relation=broken)
+    )
+
+    admin_api.delete_user.assert_not_called()
+    peers.delete_user.assert_not_called()
+
+
+def test_is_amqp_username_in_use_elsewhere_skips_model_errors():
+    """Unreadable surviving relations do not break relation cleanup."""
+    broken = SimpleNamespace(id=1, active=False, name="amqp")
+    unreadable = SimpleNamespace(id=2, active=True, name="amqp")
+    fake = _fake_charm(
+        amqp_provider=SimpleNamespace(
+            username=Mock(side_effect=ops.ModelError("denied"))
+        ),
+        model=SimpleNamespace(
+            relations={charm.AMQP_RELATION: [broken, unreadable]}
+        ),
+    )
+
+    assert not charm.RabbitMQOperatorCharm._is_amqp_username_in_use_elsewhere(
+        fake, "shared", broken
+    )
+
+
 def test_does_user_exist_false_on_404():
     """User existence returns False when the API reports a 404."""
     admin_api = Mock()
@@ -2312,6 +2402,8 @@ def test_get_service_account_syncs_password_to_amqp_relation():
     fake._update_amqp_relation_password.assert_called_once_with(
         "svc-user", "svc-password"
     )
+
+
 def test_get_queue_growth_selector_zero_members():
     """A queue with zero members needs all nodes as candidates."""
     fake = _fake_charm()
@@ -2915,7 +3007,6 @@ def test_reconcile_does_not_drive_listener_protection():
         _ensure_broker_running=Mock(return_value=True),
         _reconcile_operator_user=Mock(return_value=True),
         _reconcile_amqp_relations=Mock(return_value=True),
-        _cleanup_stale_amqp_users=Mock(),
         _reconcile_queue_membership=Mock(return_value=True),
         _publish_relation_data=Mock(),
         _reconcile_lb=Mock(),
@@ -2947,9 +3038,6 @@ def test_reconcile_reconciles_health_checks_before_and_after_bootstrap():
         _reconcile_amqp_relations=Mock(
             side_effect=lambda *_: order.append("amqp") or True
         ),
-        _cleanup_stale_amqp_users=Mock(
-            side_effect=lambda: order.append("cleanup")
-        ),
         _reconcile_queue_membership=Mock(
             side_effect=lambda *_: order.append("queues") or True
         ),
@@ -2968,7 +3056,6 @@ def test_reconcile_reconciles_health_checks_before_and_after_bootstrap():
         "running",
         "health",
         "amqp",
-        "cleanup",
         "queues",
         "publish",
     ]

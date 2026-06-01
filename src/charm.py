@@ -298,7 +298,7 @@ class RabbitMQOperatorCharm(CharmBase):
         )
         self.framework.observe(
             self.on[AMQP_RELATION].relation_broken,
-            self._reconcile,
+            self._on_amqp_relation_broken,
         )
         self.framework.observe(self.on.remove, self._on_remove)
 
@@ -423,8 +423,6 @@ class RabbitMQOperatorCharm(CharmBase):
 
         if not self._reconcile_amqp_relations(event):
             return
-
-        self._cleanup_stale_amqp_users()
 
         if not self._reconcile_queue_membership(event):
             return
@@ -815,6 +813,27 @@ class RabbitMQOperatorCharm(CharmBase):
             external_connectivity
         )
 
+    def _is_amqp_username_in_use_elsewhere(
+        self, username: str, exclude: ops.Relation
+    ) -> bool:
+        """Return whether another active AMQP relation uses the username."""
+        for relation in self.model.relations[AMQP_RELATION]:
+            if relation.id == exclude.id or not relation.active:
+                continue
+            try:
+                relation_username = self.amqp_provider.username(relation)
+            except ops.ModelError:
+                logger.debug(
+                    "Failed to read AMQP username: relation=%s id=%d",
+                    relation.name,
+                    relation.id,
+                    exc_info=True,
+                )
+                continue
+            if relation_username == username:
+                return True
+        return False
+
     def _reconcile_amqp_relations(
         self, event: EventBase | None = None
     ) -> bool:
@@ -860,21 +879,10 @@ class RabbitMQOperatorCharm(CharmBase):
                 return False
         return True
 
-    def _stored_amqp_usernames(self) -> set[str]:
-        """Return usernames with passwords persisted in peer app data."""
-        if not self.peers.peers_rel:
-            return set()
-
-        reserved = {
-            interface_rabbitmq_peers.RabbitMQOperatorPeers.OPERATOR_PASSWORD,
-            interface_rabbitmq_peers.RabbitMQOperatorPeers.OPERATOR_USER_CREATED,
-            interface_rabbitmq_peers.RabbitMQOperatorPeers.ERLANG_COOKIE,
-        }
-        app_data = self.peers.peers_rel.data[self.peers.peers_rel.app]
-        return {key for key in app_data if key not in reserved}
-
-    def _cleanup_stale_amqp_users(self) -> None:
-        """Remove users that are no longer requested by any active AMQP relation."""
+    def _cleanup_amqp_relation_user(
+        self, event: ops.RelationBrokenEvent
+    ) -> None:
+        """Remove only the user requested by the broken AMQP relation."""
         if (
             not self.unit.is_leader()
             or not self.peers.operator_user_created
@@ -886,22 +894,31 @@ class RabbitMQOperatorCharm(CharmBase):
             logger.warning(OPERATOR_USER_RECOVERY_MESSAGE)
             return
 
-        active_usernames = {
-            username for _, username, _, _ in self._requested_amqp_relations()
-        }
+        username = self.amqp_provider.username(event.relation)
+        if not username:
+            return
+
+        if self._is_amqp_username_in_use_elsewhere(username, event.relation):
+            logger.debug(
+                "User %s is still used by another AMQP relation", username
+            )
+            return
+
         api = self._get_admin_api()
-        for username in self._stored_amqp_usernames():
-            if username in active_usernames:
-                continue
-            try:
-                if self.does_user_exist(username):
-                    api.delete_user(username)
-                self.peers.delete_user(username)
-            except (
-                requests.exceptions.HTTPError,
-                requests.exceptions.ConnectionError,
-            ):
-                logger.warning("Failed to clean up user %s", username)
+        try:
+            if self.does_user_exist(username):
+                api.delete_user(username)
+            self.peers.delete_user(username)
+        except (
+            requests.exceptions.HTTPError,
+            requests.exceptions.ConnectionError,
+        ):
+            logger.warning("Failed to clean up user %s", username)
+
+    def _on_amqp_relation_broken(self, event: ops.RelationBrokenEvent) -> None:
+        """Clean up the broken AMQP relation user and reconcile remaining state."""
+        self._cleanup_amqp_relation_user(event)
+        self._reconcile(event)
 
     def _reconcile_queue_membership(
         self, event: EventBase | None = None

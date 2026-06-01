@@ -39,6 +39,21 @@ def test_refresh_from_stable_to_local(
     assert pre_refresh.results["operator-user"] == "operator"
     assert pre_refresh.results["operator-password"]
 
+    leader = leader_unit(juju, app_name)
+    pre_refresh_username = f"refresh-pre-{uuid.uuid4().hex[:8]}"
+    pre_refresh_vhost = f"refresh-pre-{uuid.uuid4().hex[:8]}"
+    pre_refresh_service_account = run_action(
+        juju,
+        leader,
+        "get-service-account",
+        {"username": pre_refresh_username, "vhost": pre_refresh_vhost},
+    )
+    assert (
+        pre_refresh_service_account.results["username"] == pre_refresh_username
+    )
+    assert pre_refresh_service_account.results["vhost"] == pre_refresh_vhost
+    assert pre_refresh_service_account.results["password"]
+
     # Pin the OCI image to the local build's upstream-source during
     # refresh.  The stable channel bundles its own image; we override
     # it here to test the exact image this charm revision ships with.
@@ -55,6 +70,17 @@ def test_refresh_from_stable_to_local(
     assert post_refresh.results["operator-password"]
 
     leader = leader_unit(juju, app_name)
+    post_refresh_service_account = run_action(
+        juju,
+        leader,
+        "get-service-account",
+        {"username": pre_refresh_username, "vhost": pre_refresh_vhost},
+    )
+    assert (
+        post_refresh_service_account.results["password"]
+        == pre_refresh_service_account.results["password"]
+    )
+
     username = f"refresh-{uuid.uuid4().hex[:8]}"
     vhost = f"refresh-{uuid.uuid4().hex[:8]}"
     service_account = run_action(

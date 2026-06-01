@@ -699,11 +699,6 @@ def test_update_status_active_when_relations_ready(
         )
         monkeypatch.setattr(
             manager.charm,
-            "_cleanup_stale_amqp_users",
-            lambda: None,
-        )
-        monkeypatch.setattr(
-            manager.charm,
             "_reconcile_queue_membership",
             lambda event=None: True,
         )
@@ -883,11 +878,6 @@ def test_update_status_blocked_when_protection_mode_engaged(
         )
         monkeypatch.setattr(
             manager.charm,
-            "_cleanup_stale_amqp_users",
-            lambda: None,
-        )
-        monkeypatch.setattr(
-            manager.charm,
             "_reconcile_queue_membership",
             lambda event=None: True,
         )
@@ -1007,11 +997,6 @@ def test_update_status_warns_instead_of_blocking_when_protection_disabled(
         )
         monkeypatch.setattr(
             manager.charm,
-            "_cleanup_stale_amqp_users",
-            lambda: None,
-        )
-        monkeypatch.setattr(
-            manager.charm,
             "_reconcile_queue_membership",
             lambda event=None: True,
         )
@@ -1081,11 +1066,6 @@ def test_update_status_warns_when_queues_are_undersized(
             manager.charm,
             "_reconcile_amqp_relations",
             lambda event=None: True,
-        )
-        monkeypatch.setattr(
-            manager.charm,
-            "_cleanup_stale_amqp_users",
-            lambda: None,
         )
         monkeypatch.setattr(
             manager.charm,
@@ -1521,11 +1501,6 @@ def test_timer_notice_calls_ensure_queue_ha_for_leader(
             "_reconcile_amqp_relations",
             lambda event=None: True,
         )
-        monkeypatch.setattr(
-            manager.charm,
-            "_cleanup_stale_amqp_users",
-            lambda: None,
-        )
         monkeypatch.setattr(manager.charm, "ensure_queue_ha", ensure_queue_ha)
         monkeypatch.setattr(
             manager.charm,
@@ -1586,11 +1561,6 @@ def test_timer_notice_skips_ensure_queue_ha_for_non_leader(
             manager.charm,
             "_reconcile_amqp_relations",
             lambda event=None: True,
-        )
-        monkeypatch.setattr(
-            manager.charm,
-            "_cleanup_stale_amqp_users",
-            lambda: None,
         )
         monkeypatch.setattr(manager.charm, "ensure_queue_ha", ensure_queue_ha)
         monkeypatch.setattr(
