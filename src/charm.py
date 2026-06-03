@@ -97,6 +97,9 @@ from ops.model import (
 from ops.pebble import (
     APIError,
     ChangeError,
+)
+from ops.pebble import ConnectionError as PebbleConnectionError
+from ops.pebble import (
     ExecError,
     PathError,
 )
@@ -468,18 +471,24 @@ class RabbitMQOperatorCharm(CharmBase):
 
         try:
             changed_services = self._render_and_push_config_files()
+            changed_services.update(self._render_and_push_workload_scripts())
+            self._ensure_erlang_cookie()
+
+            container = self.unit.get_container(RABBITMQ_CONTAINER)
+            layer_changed = self._reconcile_workload_layer(container)
+            self._ensure_workload_services(
+                container, changed_services, layer_changed=layer_changed
+            )
         except RabbitOperatorError as e:
             logger.error("Unable to render workload configuration: %s", e)
             return False
-
-        changed_services.update(self._render_and_push_workload_scripts())
-        self._ensure_erlang_cookie()
-
-        container = self.unit.get_container(RABBITMQ_CONTAINER)
-        layer_changed = self._reconcile_workload_layer(container)
-        self._ensure_workload_services(
-            container, changed_services, layer_changed=layer_changed
-        )
+        except PebbleConnectionError as e:
+            logger.warning(
+                "Pebble disconnected during workload reconciliation: %s", e
+            )
+            if event is not None:
+                event.defer()
+            return False
         return True
 
     def _reconcile_running_broker_state(self) -> None:

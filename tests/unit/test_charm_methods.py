@@ -1139,6 +1139,29 @@ def test_ensure_workload_services_starts_only_required_services():
     container.autostart.assert_not_called()
 
 
+def test_reconcile_workload_defers_on_transient_pebble_disconnect():
+    """Workload reconciliation should defer when Pebble disappears mid-hook."""
+    event = Mock(defer=Mock())
+    fake = _fake_charm(
+        _workload_reconcile_prerequisites=Mock(return_value=True),
+        _render_and_push_config_files=Mock(
+            side_effect=ops.pebble.ConnectionError("socket not found")
+        ),
+        _render_and_push_workload_scripts=Mock(),
+        _ensure_erlang_cookie=Mock(),
+        _reconcile_workload_layer=Mock(),
+        _ensure_workload_services=Mock(),
+    )
+
+    assert not charm.RabbitMQOperatorCharm._reconcile_workload(fake, event)
+
+    event.defer.assert_called_once_with()
+    fake._render_and_push_workload_scripts.assert_not_called()
+    fake._ensure_erlang_cookie.assert_not_called()
+    fake._reconcile_workload_layer.assert_not_called()
+    fake._ensure_workload_services.assert_not_called()
+
+
 def test_reconcile_workload_layer_skips_replan_when_plan_matches():
     """Pebble should not be replanned when the current plan already matches."""
     desired_layer = charm.RabbitMQOperatorCharm._rabbitmq_layer(

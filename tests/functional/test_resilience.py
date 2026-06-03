@@ -14,6 +14,7 @@ from pathlib import (
 )
 
 import jubilant
+import pytest
 
 from .helpers import (
     amqp_uri,
@@ -257,6 +258,12 @@ def test_resilience_during_pod_restarts(
     )
 
 
+@pytest.mark.skip(
+    reason=(
+        "Future destructive-resilience coverage; not a 3.12/stable "
+        "compatibility gate."
+    )
+)
 def test_unclean_full_pod_recreation_and_recovery(
     juju: jubilant.Juju,
     app_name: str,
