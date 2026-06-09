@@ -734,6 +734,7 @@ def hold_rabbitmq_service_stopped(juju: jubilant.Juju, unit_name: str) -> None:
         "stop-checks",
         "alive",
         "ready",
+        "safety",
         container=RABBITMQ_CONTAINER,
     )
     juju.ssh(
@@ -760,6 +761,7 @@ def release_rabbitmq_service_stop(juju: jubilant.Juju, unit_name: str) -> None:
         "start-checks",
         "alive",
         "ready",
+        "safety",
         container=RABBITMQ_CONTAINER,
     )
 

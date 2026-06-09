@@ -1,0 +1,13 @@
+#!/bin/bash
+set -u
+
+fail() {
+    echo "$1"
+    exit 1
+}
+
+if ! (: > /dev/tcp/127.0.0.1/{{ amqp_port }}) >/dev/null 2>&1; then
+    fail "AMQP listener unavailable"
+fi
+
+echo ready

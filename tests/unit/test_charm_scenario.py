@@ -179,9 +179,13 @@ def test_rabbitmq_pebble_ready(ctx, rabbitmq_container, networks, monkeypatch):
     assert set(container.plan.to_dict()["checks"]) == {
         "alive",
         "ready",
+        "safety",
     }
     assert container.plan.to_dict()["checks"]["alive"]["startup"] == "disabled"
     assert container.plan.to_dict()["checks"]["ready"]["startup"] == "disabled"
+    assert (
+        container.plan.to_dict()["checks"]["safety"]["startup"] == "disabled"
+    )
     assert (
         container.service_statuses[charm.RABBITMQ_SERVICE]
         == ops.pebble.ServiceStatus.ACTIVE

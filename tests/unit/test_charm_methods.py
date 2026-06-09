@@ -1230,7 +1230,7 @@ def test_rabbitmq_layer_adds_checks_after_operator_bootstrap():
             "override": "replace",
             "level": "alive",
             "startup": "disabled",
-            "period": charm.HEALTH_CHECK_INTERVAL,
+            "period": charm.ALIVE_CHECK_PERIOD,
             "timeout": charm.ALIVE_CHECK_TIMEOUT,
             "threshold": charm.HEALTH_CHECK_THRESHOLD,
             "exec": {"command": charm.RABBITMQ_ALIVE_CHECK_PATH},
@@ -1239,18 +1239,39 @@ def test_rabbitmq_layer_adds_checks_after_operator_bootstrap():
             "override": "replace",
             "level": "ready",
             "startup": "disabled",
-            "period": charm.HEALTH_CHECK_INTERVAL,
+            "period": charm.READY_CHECK_PERIOD,
             "timeout": charm.READY_CHECK_TIMEOUT,
             "threshold": charm.HEALTH_CHECK_THRESHOLD,
+            "exec": {"command": charm.RABBITMQ_READY_CHECK_PATH},
+        },
+        "safety": {
+            "override": "replace",
+            "level": "ready",
+            "startup": "disabled",
+            "period": charm.SAFETY_CHECK_PERIOD,
+            "timeout": charm.SAFETY_CHECK_TIMEOUT,
+            "threshold": charm.SAFETY_CHECK_THRESHOLD,
             "exec": {"command": charm.RABBITMQ_SAFETY_CHECK_PATH},
         },
     }
+
+
+def test_health_check_cadence_keeps_expensive_checks_off_the_fast_path():
+    """The RabbitMQ CLI safety check should not run at readiness frequency."""
+    assert charm.ALIVE_CHECK_PERIOD == "30s"
+    assert charm.ALIVE_CHECK_TIMEOUT == "5s"
+    assert charm.READY_CHECK_PERIOD == "10s"
+    assert charm.READY_CHECK_TIMEOUT == "5s"
+    assert charm.SAFETY_CHECK_PERIOD == "60s"
+    assert charm.SAFETY_CHECK_TIMEOUT == "30s"
+    assert charm.SAFETY_CHECK_THRESHOLD == 2
 
 
 def test_render_and_push_workload_scripts_only_restarts_notifier_for_notifier_changes():
     """Only notifier script updates should mark the notifier service dirty."""
     fake = _fake_charm(
         _render_and_push_alive_check=Mock(return_value=True),
+        _render_and_push_ready_check=Mock(return_value=True),
         _render_and_push_pebble_notifier=Mock(return_value=False),
         _render_and_push_safety_check=Mock(return_value=True),
     )
@@ -1262,6 +1283,7 @@ def test_render_and_push_workload_scripts_only_restarts_notifier_for_notifier_ch
     assert changed_services == set()
 
     fake._render_and_push_alive_check.assert_called_once_with()
+    fake._render_and_push_ready_check.assert_called_once_with()
     fake._render_and_push_pebble_notifier.assert_called_once_with()
     fake._render_and_push_safety_check.assert_called_once_with()
 
@@ -1270,6 +1292,7 @@ def test_render_and_push_workload_scripts_marks_notifier_when_notifier_changes()
     """Notifier script drift should be surfaced as a notifier restart."""
     fake = _fake_charm(
         _render_and_push_alive_check=Mock(return_value=False),
+        _render_and_push_ready_check=Mock(return_value=False),
         _render_and_push_pebble_notifier=Mock(return_value=True),
         _render_and_push_safety_check=Mock(return_value=False),
     )
@@ -1647,7 +1670,7 @@ def test_render_safety_check_checks_listener_and_honours_protection_flag():
 
 
 def test_render_alive_check_allows_bounded_startup_grace():
-    """The alive script should tolerate broker bootstrap for a bounded period."""
+    """The alive script should avoid slow RabbitMQ CLI diagnostics."""
     fake = _fake_charm()
 
     script = charm.RabbitMQOperatorCharm._render_template(
@@ -1657,13 +1680,30 @@ def test_render_alive_check_allows_bounded_startup_grace():
         safety_reason_not_running=charm.SAFETY_REASON_NOT_RUNNING,
     )
 
-    assert "rabbitmq-diagnostics check_running" in script
     assert "pgrep -u rabbitmq -f 'beam.smp'" in script
+    assert "rabbitmq-diagnostics" not in script
     assert (
         f'[ "$beam_age" -lt "{charm.RABBITMQ_STARTUP_GRACE_SECONDS}" ]'
         in script
     )
     assert charm.SAFETY_REASON_NOT_RUNNING in script
+
+
+def test_render_ready_check_checks_amqp_listener_without_safety_logic():
+    """The ready script should stay cheap and avoid cluster safety checks."""
+    fake = _fake_charm()
+
+    script = charm.RabbitMQOperatorCharm._render_template(
+        fake,
+        "rabbitmq-ready-check.sh.j2",
+        safety_reason_not_running=charm.SAFETY_REASON_NOT_RUNNING,
+        amqp_port=charm.RABBITMQ_SERVICE_PORT,
+    )
+
+    assert "/dev/tcp/127.0.0.1/5672" in script
+    assert "rabbitmq-diagnostics" not in script
+    assert "cluster_status" not in script
+    assert "check_local_alarms" not in script
 
 
 def test_render_and_push_alive_check_delegates_to_push_text_file():
@@ -1675,6 +1715,21 @@ def test_render_and_push_alive_check_delegates_to_push_text_file():
     )
 
     changed = charm.RabbitMQOperatorCharm._render_and_push_alive_check(fake)
+
+    assert changed is True
+    fake._push_text_file.assert_called_once()
+    container.pull.assert_not_called()
+
+
+def test_render_and_push_ready_check_delegates_to_push_text_file():
+    """Ready check pushes through the shared drift-detection helper."""
+    container = Mock()
+    fake = _fake_charm(
+        unit=Mock(get_container=Mock(return_value=container)),
+        _push_text_file=Mock(return_value=True),
+    )
+
+    changed = charm.RabbitMQOperatorCharm._render_and_push_ready_check(fake)
 
     assert changed is True
     fake._push_text_file.assert_called_once()
@@ -1754,13 +1809,12 @@ def test_reconcile_listener_protection_resumes_only_with_charm_marker():
 
     container.reset_mock()
     container.exists.return_value = True
-    container.exec.side_effect = [Mock(), Mock()]
+    container.exec.return_value = Mock()
     charm.RabbitMQOperatorCharm._reconcile_listener_protection(fake, True)
 
-    assert container.exec.call_args_list == [
-        call(["rabbitmqctl", "await_startup"], timeout=60),
-        call(["rabbitmqctl", "resume_listeners"], timeout=30),
-    ]
+    container.exec.assert_called_once_with(
+        ["rabbitmqctl", "resume_listeners"], timeout=30
+    )
     container.remove_path.assert_called_once_with(
         charm.RABBITMQ_PROTECTOR_MARKER
     )
@@ -2737,12 +2791,12 @@ def test_auto_forget_stale_nodes_skips_when_local_node_is_not_expected():
 
 
 def test_ensure_broker_running_force_boots_single_survivor_after_scale_down():
-    """Opt-in single survivor recovery force-boots pause_minority shutdown."""
+    """Single survivor recovery force-boots pause_minority shutdown."""
     event = Mock()
     container = Mock()
     fake = _fake_charm(
         config={
-            "auto-forget-stale-nodes": True,
+            "auto-forget-stale-nodes": False,
         },
         unit=SimpleNamespace(
             is_leader=lambda: True,
@@ -2782,6 +2836,47 @@ def test_ensure_broker_running_force_boots_single_survivor_after_scale_down():
     )
     container.restart.assert_called_once_with(charm.RABBITMQ_SERVICE)
     event.defer.assert_not_called()
+
+
+def test_ensure_broker_running_does_not_force_boot_without_pause_minority():
+    """Single survivor recovery is specific to pause_minority shutdown."""
+    event = Mock()
+    container = Mock()
+    fake = _fake_charm(
+        config={
+            "cluster-partition-handling": "ignore",
+        },
+        cluster_partition_handling="ignore",
+        unit=SimpleNamespace(
+            is_leader=lambda: True,
+            name="rabbitmq-k8s/0",
+            get_container=Mock(return_value=container),
+        ),
+        peers=SimpleNamespace(
+            operator_user_created="operator",
+            peers_rel=SimpleNamespace(units=[]),
+        ),
+        _departing_unit_name=None,
+        _rabbitmq_running=Mock(side_effect=[False, False]),
+        _reconcile_workload=Mock(return_value=True),
+    )
+    fake._expected_cluster_size = 1
+    fake._run_rabbitmqctl = Mock(return_value=("", ""))
+    fake._scale_down_force_boot_allowed = lambda event: charm.RabbitMQOperatorCharm._scale_down_force_boot_allowed(
+        fake, event
+    )
+    fake._force_boot_single_survivor = (
+        lambda: charm.RabbitMQOperatorCharm._force_boot_single_survivor(fake)
+    )
+    fake._force_boot_single_survivor_after_scale_down = lambda event: charm.RabbitMQOperatorCharm._force_boot_single_survivor_after_scale_down(
+        fake, event
+    )
+
+    assert not charm.RabbitMQOperatorCharm._ensure_broker_running(fake, event)
+
+    fake._run_rabbitmqctl.assert_not_called()
+    container.restart.assert_not_called()
+    event.defer.assert_called_once_with()
 
 
 def test_ensure_broker_running_does_not_force_boot_during_departure_hook():
@@ -2943,11 +3038,11 @@ def test_retrieve_password_returns_none_not_string_none():
     assert result != "None"
 
 
-def test_on_pebble_check_failed_suspends_on_ready_check():
-    """The ready check failure drives listener suspension."""
+def test_on_pebble_check_failed_suspends_on_safety_check():
+    """The safety check failure drives listener suspension."""
     container = Mock()
     container.exists.return_value = False
-    info = SimpleNamespace(name="ready")
+    info = SimpleNamespace(name="safety")
     event = SimpleNamespace(info=info)
     fake = _fake_charm(
         unit=Mock(get_container=Mock(return_value=container)),
@@ -2968,9 +3063,10 @@ def test_on_pebble_check_failed_suspends_on_ready_check():
     )
 
 
-def test_on_pebble_check_failed_ignores_alive_check():
-    """The alive check failure does not drive listener protection."""
-    info = SimpleNamespace(name="alive")
+@pytest.mark.parametrize("check_name", ["alive", "ready"])
+def test_on_pebble_check_failed_ignores_non_safety_checks(check_name):
+    """Non-safety check failures do not drive listener protection."""
+    info = SimpleNamespace(name=check_name)
     event = SimpleNamespace(info=info)
     fake = _fake_charm()
     fake._reconcile_listener_protection = Mock()
@@ -2980,12 +3076,12 @@ def test_on_pebble_check_failed_ignores_alive_check():
     fake._reconcile_listener_protection.assert_not_called()
 
 
-def test_on_pebble_check_recovered_resumes_on_ready_check():
-    """The ready check recovery drives listener resumption."""
+def test_on_pebble_check_recovered_resumes_on_safety_check():
+    """The safety check recovery drives listener resumption."""
     container = Mock()
     container.exists.return_value = True
     container.exec.side_effect = [Mock(), Mock()]
-    info = SimpleNamespace(name="ready")
+    info = SimpleNamespace(name="safety")
     event = SimpleNamespace(info=info)
     fake = _fake_charm(
         unit=Mock(get_container=Mock(return_value=container)),
@@ -3001,10 +3097,52 @@ def test_on_pebble_check_recovered_resumes_on_ready_check():
 
     charm.RabbitMQOperatorCharm._on_pebble_check_recovered(fake, event)
 
-    assert container.exec.call_args_list == [
-        call(["rabbitmqctl", "await_startup"], timeout=60),
-        call(["rabbitmqctl", "resume_listeners"], timeout=30),
-    ]
+    container.exec.assert_called_once_with(
+        ["rabbitmqctl", "resume_listeners"], timeout=30
+    )
+
+
+def test_on_pebble_check_recovered_does_not_resume_when_rabbitmq_stopped():
+    """Recovered safety events should not resume listeners while RabbitMQ is down."""
+    container = Mock()
+    container.exists.return_value = True
+    info = SimpleNamespace(name="safety")
+    event = SimpleNamespace(info=info)
+    fake = _fake_charm(
+        unit=Mock(get_container=Mock(return_value=container)),
+        _rabbitmq_running=Mock(return_value=False),
+    )
+    fake._reconcile_listener_protection = lambda safe: charm.RabbitMQOperatorCharm._reconcile_listener_protection(
+        fake, safe
+    )
+
+    charm.RabbitMQOperatorCharm._on_pebble_check_recovered(fake, event)
+
+    container.exec.assert_not_called()
+    container.remove_path.assert_not_called()
+
+
+def test_resume_listeners_handles_pebble_wait_timeout():
+    """Listener recovery should not crash a hook if RabbitMQ CLI hangs."""
+    process = Mock(
+        wait_output=Mock(
+            side_effect=ops.pebble.TimeoutError(
+                "timed out waiting for change 160 (61 seconds)"
+            )
+        )
+    )
+    container = Mock()
+    container.exec.return_value = process
+    fake = _fake_charm()
+
+    charm.RabbitMQOperatorCharm._resume_listeners(
+        fake, container, "after safety recovered"
+    )
+
+    container.exec.assert_called_once_with(
+        ["rabbitmqctl", "resume_listeners"], timeout=30
+    )
+    container.remove_path.assert_not_called()
 
 
 def test_undersized_queue_count_returns_zero_when_admin_api_unavailable():
@@ -3084,9 +3222,10 @@ def test_reconcile_reconciles_health_checks_before_and_after_bootstrap():
     ]
 
 
-def test_on_pebble_check_recovered_ignores_alive_check():
-    """The alive check recovery does not drive listener protection."""
-    info = SimpleNamespace(name="alive")
+@pytest.mark.parametrize("check_name", ["alive", "ready"])
+def test_on_pebble_check_recovered_ignores_non_safety_checks(check_name):
+    """Non-safety check recoveries do not drive listener protection."""
+    info = SimpleNamespace(name=check_name)
     event = SimpleNamespace(info=info)
     fake = _fake_charm()
     fake._reconcile_listener_protection = Mock()
@@ -3187,7 +3326,7 @@ def test_reconcile_health_checks_stops_inactive_checks_until_ready():
 
     charm.RabbitMQOperatorCharm._reconcile_health_checks(fake)
 
-    container.stop_checks.assert_called_once_with("alive", "ready")
+    container.stop_checks.assert_called_once_with("alive", "ready", "safety")
 
 
 def test_reconcile_health_checks_starts_and_resumes_stale_protection():
@@ -3211,15 +3350,14 @@ def test_reconcile_health_checks_starts_and_resumes_stale_protection():
 
     charm.RabbitMQOperatorCharm._reconcile_health_checks(fake)
 
-    assert container.exec.call_args_list == [
-        call(["rabbitmqctl", "await_startup"], timeout=60),
-        call(["rabbitmqctl", "resume_listeners"], timeout=30),
-    ]
-    container.start_checks.assert_called_once_with("alive", "ready")
+    container.exec.assert_called_once_with(
+        ["rabbitmqctl", "resume_listeners"], timeout=30
+    )
+    container.start_checks.assert_called_once_with("alive", "ready", "safety")
 
 
 def test_read_safety_status_returns_safe_when_check_is_up():
-    """A passing ready check means the broker is safe."""
+    """A passing safety check means the broker is safe."""
     container = Mock()
     check_info = SimpleNamespace(status=ops.pebble.CheckStatus.UP)
     container.get_check.return_value = check_info
@@ -3231,11 +3369,11 @@ def test_read_safety_status_returns_safe_when_check_is_up():
 
     assert safe is True
     assert reason == "safe"
-    container.get_check.assert_called_once_with("ready")
+    container.get_check.assert_called_once_with("safety")
 
 
 def test_read_safety_status_returns_unsafe_with_reason_from_file():
-    """A failing ready check reads the reason from the reason file."""
+    """A failing safety check reads the reason from the reason file."""
     container = Mock()
     check_info = SimpleNamespace(status=ops.pebble.CheckStatus.DOWN)
     container.get_check.return_value = check_info

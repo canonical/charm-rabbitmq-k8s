@@ -103,6 +103,7 @@ from ops.pebble import (
     ExecError,
     PathError,
 )
+from ops.pebble import TimeoutError as PebbleTimeoutError
 
 import interface_rabbitmq_peers
 import rabbit_extended_api
@@ -134,11 +135,16 @@ RABBITMQ_PROTECTOR_MARKER = (
 )
 RABBITMQ_SAFETY_REASON_FILE = f"{RABBITMQ_DATA_DIR}/.safety-check-reason"
 RABBITMQ_ALIVE_CHECK_PATH = "/usr/bin/rabbitmq-alive-check"
+RABBITMQ_READY_CHECK_PATH = "/usr/bin/rabbitmq-ready-check"
 RABBITMQ_SAFETY_CHECK_PATH = "/usr/bin/rabbitmq-safety-check"
-HEALTH_CHECK_INTERVAL = "10s"
+ALIVE_CHECK_PERIOD = "30s"
+READY_CHECK_PERIOD = "10s"
+SAFETY_CHECK_PERIOD = "60s"
 ALIVE_CHECK_TIMEOUT = "5s"
-READY_CHECK_TIMEOUT = "10s"
+READY_CHECK_TIMEOUT = "5s"
+SAFETY_CHECK_TIMEOUT = "30s"
 HEALTH_CHECK_THRESHOLD = 3
+SAFETY_CHECK_THRESHOLD = 2
 RABBITMQ_STARTUP_GRACE_SECONDS = 180
 SAFETY_REASON_NOT_RUNNING = "RabbitMQ not running"
 SAFETY_REASON_LOCAL_ALARMS = "Local alarms active"
@@ -703,10 +709,10 @@ class RabbitMQOperatorCharm(CharmBase):
     ) -> bool:
         """Return whether this hook may recover a single scale-down survivor."""
         return bool(
-            self.config.get("auto-forget-stale-nodes", False)
-            and self.unit.is_leader()
+            self.unit.is_leader()
             and self.peers.peers_rel is not None
             and self.peers.operator_user_created
+            and self.cluster_partition_handling == "pause_minority"
             and self._expected_cluster_size == 1
             and getattr(self, "_departing_unit_name", None) is None
         )
@@ -1005,7 +1011,7 @@ class RabbitMQOperatorCharm(CharmBase):
                 "override": "replace",
                 "level": "alive",
                 "startup": "disabled",
-                "period": HEALTH_CHECK_INTERVAL,
+                "period": ALIVE_CHECK_PERIOD,
                 "timeout": ALIVE_CHECK_TIMEOUT,
                 "threshold": HEALTH_CHECK_THRESHOLD,
                 "exec": {"command": RABBITMQ_ALIVE_CHECK_PATH},
@@ -1014,9 +1020,18 @@ class RabbitMQOperatorCharm(CharmBase):
                 "override": "replace",
                 "level": "ready",
                 "startup": "disabled",
-                "period": HEALTH_CHECK_INTERVAL,
+                "period": READY_CHECK_PERIOD,
                 "timeout": READY_CHECK_TIMEOUT,
                 "threshold": HEALTH_CHECK_THRESHOLD,
+                "exec": {"command": RABBITMQ_READY_CHECK_PATH},
+            },
+            "safety": {
+                "override": "replace",
+                "level": "ready",
+                "startup": "disabled",
+                "period": SAFETY_CHECK_PERIOD,
+                "timeout": SAFETY_CHECK_TIMEOUT,
+                "threshold": SAFETY_CHECK_THRESHOLD,
                 "exec": {"command": RABBITMQ_SAFETY_CHECK_PATH},
             },
         }
@@ -1057,6 +1072,7 @@ class RabbitMQOperatorCharm(CharmBase):
         """Render and push workload scripts, returning affected services."""
         changed_services = set()
         self._render_and_push_alive_check()
+        self._render_and_push_ready_check()
         if self._render_and_push_pebble_notifier():
             changed_services.add(NOTIFIER_SERVICE)
         self._render_and_push_safety_check()
@@ -1075,6 +1091,24 @@ class RabbitMQOperatorCharm(CharmBase):
             RABBITMQ_ALIVE_CHECK_PATH,
             script,
             description="alive-check script",
+            permissions=0o755,
+            user=RABBITMQ_USER,
+            group=RABBITMQ_GROUP,
+        )
+
+    def _render_and_push_ready_check(self) -> bool:
+        """Render the workload ready-check script."""
+        container = self.unit.get_container(RABBITMQ_CONTAINER)
+        script = self._render_template(
+            "rabbitmq-ready-check.sh.j2",
+            safety_reason_not_running=SAFETY_REASON_NOT_RUNNING,
+            amqp_port=RABBITMQ_SERVICE_PORT,
+        )
+        return self._push_text_file(
+            container,
+            RABBITMQ_READY_CHECK_PATH,
+            script,
+            description="ready-check script",
             permissions=0o755,
             user=RABBITMQ_USER,
             group=RABBITMQ_GROUP,
@@ -1169,10 +1203,10 @@ class RabbitMQOperatorCharm(CharmBase):
                     self._resume_listeners(
                         container, "before re-enabling health checks"
                     )
-                container.start_checks("alive", "ready")
+                container.start_checks("alive", "ready", "safety")
                 return
 
-            container.stop_checks("alive", "ready")
+            container.stop_checks("alive", "ready", "safety")
         except (APIError, ModelError) as exc:
             logger.warning("Unable to reconcile Pebble health checks: %s", exc)
 
@@ -1798,7 +1832,7 @@ class RabbitMQOperatorCharm(CharmBase):
 
     def _on_pebble_check_failed(self, event: PebbleCheckFailedEvent) -> None:
         """React to a Pebble health check failure."""
-        if event.info.name != "ready":
+        if event.info.name != "safety":
             return
         self._reconcile_listener_protection(safe=False)
 
@@ -1806,15 +1840,15 @@ class RabbitMQOperatorCharm(CharmBase):
         self, event: PebbleCheckRecoveredEvent
     ) -> None:
         """React to a Pebble health check recovery."""
-        if event.info.name != "ready":
+        if event.info.name != "safety":
             return
         self._reconcile_listener_protection(safe=True)
 
     def _read_safety_status(self) -> tuple[bool, str]:
-        """Read broker safety from the Pebble ready check without shell-outs."""
+        """Read broker safety from the Pebble safety check without shell-outs."""
         container = self.unit.get_container(RABBITMQ_CONTAINER)
         try:
-            check = container.get_check("ready")
+            check = container.get_check("safety")
         except ModelError:
             return True, "Safety check not yet available"
 
@@ -1842,6 +1876,11 @@ class RabbitMQOperatorCharm(CharmBase):
         if safe:
             if not marker_exists:
                 return
+            if not self._rabbitmq_running():
+                logger.info(
+                    "Skipping listener resume until RabbitMQ is running"
+                )
+                return
             self._resume_listeners(container, "after safety recovered")
             return
 
@@ -1861,13 +1900,10 @@ class RabbitMQOperatorCharm(CharmBase):
         """Resume listeners and clear the charm marker."""
         try:
             container.exec(
-                ["rabbitmqctl", "await_startup"], timeout=60
-            ).wait_output()
-            container.exec(
                 ["rabbitmqctl", "resume_listeners"], timeout=30
             ).wait_output()
             container.remove_path(RABBITMQ_PROTECTOR_MARKER)
-        except (ExecError, PathError):
+        except (ExecError, PathError, PebbleTimeoutError):
             logger.warning(
                 "Failed to resume listeners %s", context, exc_info=True
             )
