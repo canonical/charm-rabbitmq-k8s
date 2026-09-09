@@ -13,6 +13,7 @@ from pathlib import (
 )
 
 import jubilant
+import pytest
 
 from .helpers import (
     cluster_status,
@@ -24,6 +25,9 @@ from .helpers import (
 )
 
 
+@pytest.mark.skip(
+    reason="Skipped while waiting for 4.0/stable to be available."
+)
 def test_refresh_from_stable_to_local(
     juju: jubilant.Juju,
     app_name: str,
