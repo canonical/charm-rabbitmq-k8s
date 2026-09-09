@@ -8,11 +8,10 @@ requires-python = "~=3.12.0"
 
 dependencies = [
     "cosl>=0.0.53",
-    "ops",
-    "pika",
-    "pwgen",
+    "jinja2",
+    "ops[tracing]",
     "rabbitmq-admin",
-    "tenacity",
+    "requests",
     "lightkube",
     "lightkube-models",
     "lightkube-extensions @ git+https://github.com/canonical/lightkube-extensions.git@main",
@@ -29,6 +28,7 @@ dev = [
     "pytest-cov",
     "pyyaml",
     "jubilant",
+    "pytest-jubilant",
 ]
 
 # Testing tools configuration
@@ -41,7 +41,9 @@ omit = [
     ".tox/*",
     "tests/*",
     "src/templates/*",
+    "lib/charms/grafana_k8s/*",
     "lib/charms/loki_k8s/*",
+    "lib/charms/prometheus_k8s/*",
     "lib/charms/traefik_k8s/*",
 ]
 

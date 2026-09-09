@@ -1,0 +1,74 @@
+#!/bin/bash
+set -u
+
+REASON_FILE="{{ safety_reason_file }}"
+
+fail() {
+    echo "$1"
+    printf '%s\n' "$1" > "$REASON_FILE"
+    exit 1
+}
+
+compact_json() {
+    tr -d '\n'
+}
+
+extract_array() {
+    local payload="$1"
+    local key="$2"
+    printf '%s' "$payload" | sed -n "s/.*\\\"$key\\\":\\[\\([^]]*\\)\\].*/\\1/p"
+}
+
+count_entries() {
+    local value="$1"
+    if [ -z "$value" ]; then
+        echo 0
+        return
+    fi
+    printf '%s' "$value" | grep -o '"[^"]*"' | wc -l
+}
+
+if ! rabbitmq-diagnostics check_running >/dev/null 2>&1; then
+    fail "{{ safety_reason_not_running }}"
+fi
+
+if ! rabbitmq-diagnostics listeners 2>/dev/null | grep -Eq '(^|[^0-9])port: {{ amqp_port }}([^0-9]|$)'; then
+    fail "AMQP listener unavailable"
+fi
+
+if [ "{{ protect_members }}" = "true" ]; then
+    if ! rabbitmq-diagnostics check_local_alarms >/dev/null 2>&1; then
+        fail "{{ safety_reason_local_alarms }}"
+    fi
+
+    cluster_status_json="$(rabbitmq-diagnostics cluster_status --formatter=json 2>/dev/null)" || {
+        fail "{{ safety_reason_cluster_status }}"
+    }
+
+    cluster_status_json="$(printf '%s' "$cluster_status_json" | compact_json)"
+    if ! printf '%s' "$cluster_status_json" | grep -q '"running_nodes":\['; then
+        fail "{{ safety_reason_cluster_status }}"
+    fi
+    if ! printf '%s' "$cluster_status_json" | grep -q '"disk_nodes":\['; then
+        fail "{{ safety_reason_cluster_status }}"
+    fi
+
+    running_nodes="$(extract_array "$cluster_status_json" "running_nodes")"
+    disk_nodes="$(extract_array "$cluster_status_json" "disk_nodes")"
+    running_count="$(count_entries "$running_nodes")"
+    disk_count="$(count_entries "$disk_nodes")"
+    expected_size="{{ expected_cluster_size }}"
+    if [ "$expected_size" -gt 0 ] 2>/dev/null && [ "$expected_size" -lt "$disk_count" ]; then
+        cluster_size="$expected_size"
+    else
+        cluster_size="$disk_count"
+    fi
+    majority=$((cluster_size / 2 + 1))
+
+    if [ "$running_count" -lt "$majority" ]; then
+        fail "Cluster lost majority ($running_count/$disk_count running disk nodes)"
+    fi
+fi
+
+rm -f "$REASON_FILE"
+echo safe

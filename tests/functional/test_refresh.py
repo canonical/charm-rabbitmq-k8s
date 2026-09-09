@@ -18,8 +18,9 @@ from .helpers import (
     cluster_status,
     deploy_stable,
     expected_rabbit_node,
+    leader_unit,
     run_action,
-    wait_for_app,
+    wait_for_app_stable,
 )
 
 
@@ -38,23 +39,53 @@ def test_refresh_from_stable_to_local(
     assert pre_refresh.results["operator-user"] == "operator"
     assert pre_refresh.results["operator-password"]
 
+    leader = leader_unit(juju, app_name)
+    pre_refresh_username = f"refresh-pre-{uuid.uuid4().hex[:8]}"
+    pre_refresh_vhost = f"refresh-pre-{uuid.uuid4().hex[:8]}"
+    pre_refresh_service_account = run_action(
+        juju,
+        leader,
+        "get-service-account",
+        {"username": pre_refresh_username, "vhost": pre_refresh_vhost},
+    )
+    assert (
+        pre_refresh_service_account.results["username"] == pre_refresh_username
+    )
+    assert pre_refresh_service_account.results["vhost"] == pre_refresh_vhost
+    assert pre_refresh_service_account.results["password"]
+
+    # Pin the OCI image to the local build's upstream-source during
+    # refresh.  The stable channel bundles its own image; we override
+    # it here to test the exact image this charm revision ships with.
     juju.refresh(
         app_name,
         path=str(charm_file),
         resources={"rabbitmq-image": rabbitmq_image},
         trust=True,
     )
-    wait_for_app(juju, app_name, units=1)
+    wait_for_app_stable(juju, app_name, units=1)
 
     post_refresh = run_action(juju, f"{app_name}/0", "get-operator-info")
     assert post_refresh.results["operator-user"] == "operator"
     assert post_refresh.results["operator-password"]
 
+    leader = leader_unit(juju, app_name)
+    post_refresh_service_account = run_action(
+        juju,
+        leader,
+        "get-service-account",
+        {"username": pre_refresh_username, "vhost": pre_refresh_vhost},
+    )
+    assert (
+        post_refresh_service_account.results["password"]
+        == pre_refresh_service_account.results["password"]
+    )
+
     username = f"refresh-{uuid.uuid4().hex[:8]}"
     vhost = f"refresh-{uuid.uuid4().hex[:8]}"
     service_account = run_action(
         juju,
-        f"{app_name}/0",
+        leader,
         "get-service-account",
         {"username": username, "vhost": vhost},
     )

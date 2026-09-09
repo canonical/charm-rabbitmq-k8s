@@ -5,8 +5,22 @@ on:
 
 
 jobs:
-  deploy:
-    name: deploy
+  discover:
+    name: Discover test files
+    runs-on: ubuntu-latest
+    outputs:
+      test_files: ${{ steps.list.outputs.test_files }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: List functional test files
+        id: list
+        run: |
+          files=$(find tests/functional -name 'test_*.py' -printf '%f\n' | sort | jq -R -s -c 'split("\n") | map(select(. != ""))')
+          echo "test_files=$files" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build charm
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -17,13 +31,53 @@ jobs:
         run: |
           sudo snap install --classic charmcraft
           sudo snap install --classic concierge
+      - name: Prepare build environment
+        run: sudo concierge prepare -p crafts
+      - name: Build Charm
+        run: |
+          charmcraft -v pack
+          mv rabbitmq-k8s*charm rabbitmq-k8s.charm
+      - name: Upload charm artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: charm
+          path: rabbitmq-k8s.charm
+
+  functional-test:
+    name: ${{ matrix.test_file }}
+    runs-on: ubuntu-latest
+    needs: [discover, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        test_file: ${{ fromJson(needs.discover.outputs.test_files) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+      - name: Install snaps
+        run: |
+          sudo snap install --classic concierge
+          sudo snap install rabbitmq-perf-test
       - name: Prepare charm test environment
         run: |
           sudo concierge prepare -p k8s
-      - name: Build Charm
-        run: |
-          sudo --user $(whoami) --preserve-env charmcraft -v pack
-          mv rabbitmq-k8s*charm rabbitmq-k8s.charm
+      - name: Download charm artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: charm
       - name: Run functional tests
+        env:
+          TEST_FILE: ${{ matrix.test_file }}
         run: |
-          uv run --with tox tox -e func-smoke -- --charm-file rabbitmq-k8s.charm
+          uv run --with tox tox -e func -- \
+            "tests/functional/$TEST_FILE" \
+            --charm-file rabbitmq-k8s.charm
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.test_file }}
+          path: logs/
+          if-no-files-found: ignore
