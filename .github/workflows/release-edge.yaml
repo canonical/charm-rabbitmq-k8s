@@ -44,8 +44,9 @@ jobs:
         with:
           fetch-depth: 1
       - name: Upload charm to Charmhub
-        uses: canonical/charming-actions/upload-charm@2.6.3
+        uses: canonical/charming-actions/upload-charm@2.7.0
         with:
           credentials: "${{ secrets.CHARMHUB_TOKEN }}"
           github-token: "${{ secrets.GITHUB_TOKEN }}"
           channel: 3.12/edge
+          charmcraft-channel: 4.4.1
