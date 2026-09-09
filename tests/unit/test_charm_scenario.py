@@ -28,6 +28,7 @@ from ops import (
 
 import charm
 from tests.unit.conftest import (
+    build_amqp_relation,
     build_peer_relation,
 )
 
@@ -106,6 +107,52 @@ def _patch_config_changed_for_success(
         "_operator_user_recovery_required",
         lambda: False,
     )
+
+
+@pytest.mark.parametrize("event_name", ["config_changed", "update_status"])
+def test_missing_amqp_password_blocks_and_recovers(
+    ctx, rabbitmq_container, networks, monkeypatch, event_name
+):
+    """Missing peer credentials block the hook until credentials are restored."""
+    peer = build_peer_relation()
+    amqp = build_amqp_relation()
+    state = _state(
+        rabbitmq_container, networks, leader=True, relations=[peer, amqp]
+    )
+    create_user = Mock()
+    set_permissions = Mock()
+    for password in (None, "restored-password"):
+        with ctx(getattr(ctx.on, event_name)(), state) as manager:
+            _patch_config_changed_for_success(monkeypatch, manager.charm)
+            for name in (
+                "_health_checks_ready",
+                "does_vhost_exist",
+                "does_user_exist",
+            ):
+                monkeypatch.setattr(manager.charm, name, lambda *args: True)
+            monkeypatch.setattr(manager.charm, "create_user", create_user)
+            monkeypatch.setattr(
+                manager.charm, "set_user_permissions", set_permissions
+            )
+            if password is not None:
+                manager.charm.peers.store_password("client", password)
+            state = manager.run()
+
+        relation_data = state.get_relation(amqp.id).local_app_data
+        if password is None:
+            assert state.unit_status == ops.model.BlockedStatus(
+                "Password for client not found in peer data"
+            )
+            assert "password" not in relation_data
+            assert "hostname" not in relation_data
+            set_permissions.assert_not_called()
+        else:
+            assert state.unit_status == ops.model.ActiveStatus()
+            assert relation_data["password"] == password
+            assert relation_data["hostname"]
+            set_permissions.assert_called_once_with("client", "client-vhost")
+        create_user.assert_not_called()
+        assert not state.deferred
 
 
 def test_get_operator_info_action(ctx, rabbitmq_container, networks):

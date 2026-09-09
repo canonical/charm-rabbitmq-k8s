@@ -134,6 +134,7 @@ def _fake_charm(**kwargs):
         ),
         "_defer_or_continue": Mock(return_value=True),
         "_ensure_relation_credentials": Mock(),
+        "_amqp_reconcile_error": None,
         "_on_update_status": Mock(),
         "_operator_user_recovery_required": Mock(return_value=False),
         "_manage_queues": Mock(return_value=True),

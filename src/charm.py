@@ -229,6 +229,8 @@ class RabbitMQOperatorCharm(CharmBase):
 
     _stored = StoredState()
     _operator_user = "operator"
+    # Carry reconciliation failures into status collection for this invocation.
+    _amqp_reconcile_error: str | None = None
 
     def __init__(self, *args):
         super().__init__(*args)
@@ -853,6 +855,7 @@ class RabbitMQOperatorCharm(CharmBase):
         self, event: EventBase | None = None
     ) -> bool:
         """Ensure all active AMQP relations have the desired server state."""
+        self._amqp_reconcile_error = None
         if (
             not self.unit.is_leader()
             or not self.peers.operator_user_created
@@ -874,6 +877,10 @@ class RabbitMQOperatorCharm(CharmBase):
                 self._ensure_relation_credentials(
                     relation, username, vhost, external_connectivity
                 )
+            except RabbitOperatorError as e:
+                self._amqp_reconcile_error = str(e)
+                logger.warning("AMQP reconciliation blocked: %s", e)
+                return False
             except requests.exceptions.HTTPError as http_e:
                 if (
                     http_e.response is not None
@@ -883,14 +890,12 @@ class RabbitMQOperatorCharm(CharmBase):
                         "RabbitMQ auth not ready for relation %s, deferring",
                         relation.id,
                     )
-                    if event is not None:
-                        event.defer()
+                    self._defer_or_continue(event)
                     return False
                 raise
             except requests.exceptions.ConnectionError as e:
                 logger.warning("RabbitMQ is not ready, deferring. %s", e)
-                if event is not None:
-                    event.defer()
+                self._defer_or_continue(event)
                 return False
         return True
 
@@ -2377,7 +2382,10 @@ class RabbitMQOperatorCharm(CharmBase):
         return ActiveStatus()
 
     def _on_collect_unit_status(self, event: CollectStatusEvent) -> None:
-        """Collect unit status from current state rather than event deltas."""
+        """Collect unit status from current state and reconciliation errors."""
+        if self._amqp_reconcile_error:
+            event.add_status(BlockedStatus(self._amqp_reconcile_error))
+
         if status := self._pre_broker_status():
             event.add_status(status)
             return
