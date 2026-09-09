@@ -195,7 +195,7 @@ resources:
   rabbitmq-image:
     type: oci-image
     description: OCI image for rabbitmq
-    upstream-source: ghcr.io/canonical/rabbitmq:3.12.1-24.04_edge
+    upstream-source: ghcr.io/canonical/rabbitmq:4.0.5-26.04_edge
 
 storage:
   rabbitmq-data:
