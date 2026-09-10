@@ -42,7 +42,7 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
         "--stable-channel",
         action="store",
-        default="3.12/stable",
+        default="4.0/stable",
         help="Charmhub channel used as the refresh source baseline.",
     )
     parser.addoption(

@@ -600,7 +600,7 @@ wheels = [
 
 [[package]]
 name = "rabbitmq-k8s"
-version = "3.12"
+version = "4.0"
 source = { virtual = "." }
 dependencies = [
     { name = "cosl" },
