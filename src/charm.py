@@ -1677,6 +1677,7 @@ class RabbitMQOperatorCharm(CharmBase):
             self._run_rabbitmqctl(
                 "authenticate_user",
                 self._operator_user,
+                "--",
                 self._operator_password,
             )
         except (ExecError, ModelError):
@@ -1968,7 +1969,9 @@ class RabbitMQOperatorCharm(CharmBase):
             raise RabbitOperatorError("Operator password not available")
 
         try:
-            self._run_rabbitmqctl("add_user", self._operator_user, password)
+            self._run_rabbitmqctl(
+                "add_user", self._operator_user, "--", password
+            )
         except ExecError as e:
             output = f"{e.stdout}\n{e.stderr}".lower()
             if "already exists" not in output:
@@ -1976,7 +1979,7 @@ class RabbitMQOperatorCharm(CharmBase):
                     f"Failed to add operator user: {e.stderr or e.stdout}"
                 ) from e
             self._run_rabbitmqctl(
-                "change_password", self._operator_user, password
+                "change_password", self._operator_user, "--", password
             )
 
         self._run_rabbitmqctl(
