@@ -1883,6 +1883,25 @@ def test_operator_user_auth_valid_detects_stale_credentials():
     assert not charm.RabbitMQOperatorCharm._operator_user_auth_valid(fake)
 
 
+def test_operator_user_commands_guard_dash_prefixed_password():
+    """Passwords starting with '-' must not be parsed as rabbitmqctl options."""
+    password = "-sEmulatedPassword"
+    run_rabbitmqctl = Mock(return_value=("", ""))
+    fake = _fake_charm(
+        _rabbitmq_running=Mock(return_value=True),
+        _operator_password=password,
+        _run_rabbitmqctl=run_rabbitmqctl,
+    )
+
+    assert charm.RabbitMQOperatorCharm._operator_user_auth_valid(fake)
+    charm.RabbitMQOperatorCharm._recreate_operator_user(fake)
+
+    run_rabbitmqctl.assert_any_call(
+        "authenticate_user", "operator", "--", password
+    )
+    run_rabbitmqctl.assert_any_call("add_user", "operator", "--", password)
+
+
 def test_operator_user_recovery_required_leader_only():
     """Only the leader should report operator-user recovery drift."""
     fake = _fake_charm(
@@ -1938,8 +1957,8 @@ def test_recreate_operator_user_changes_password_when_user_exists():
 
     fake._run_rabbitmqctl.assert_has_calls(
         [
-            call("add_user", "operator", "operator-password"),
-            call("change_password", "operator", "operator-password"),
+            call("add_user", "operator", "--", "operator-password"),
+            call("change_password", "operator", "--", "operator-password"),
             call("set_user_tags", "operator", "administrator"),
             call(
                 "set_permissions",
