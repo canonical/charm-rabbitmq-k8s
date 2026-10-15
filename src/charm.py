@@ -24,6 +24,12 @@ import json
 import logging
 import re
 import secrets
+from collections.abc import (
+    Iterator,
+)
+from contextlib import (
+    contextmanager,
+)
 from ipaddress import (
     IPv4Address,
     IPv6Address,
@@ -118,6 +124,10 @@ RABBITMQ_STORAGE_NAME = "rabbitmq-data"
 RABBITMQ_DATA_DIR = "/var/lib/rabbitmq"
 RABBITMQ_COOKIE_PATH = "/var/lib/rabbitmq/.erlang.cookie"
 RABBITMQ_MNESIA_DIR = "/var/lib/rabbitmq/mnesia"
+# CLI VMs do not need one scheduler per CPU visible to the container.
+RABBITMQ_CLI_ENV = {
+    "RABBITMQ_CTL_ERL_ARGS": "+S 2:2 +SDcpu 1 +SDio 1",
+}
 
 SELECTOR_ALL = "all"
 SELECTOR_EVEN = "even"
@@ -235,6 +245,7 @@ class RabbitMQOperatorCharm(CharmBase):
     def __init__(self, *args):
         super().__init__(*args)
 
+        self._broker_probe_results: dict[str, bool] | None = None
         self._lightkube_client = None
         self._lightkube_field_manager: str = self.app.name
         self._lb_name: str = f"{self.app.name}-lb"
@@ -391,19 +402,41 @@ class RabbitMQOperatorCharm(CharmBase):
         """Check whether RabbitMQ container is up and configurable."""
         return self.unit.get_container(RABBITMQ_CONTAINER).can_connect()
 
+    @contextmanager
+    def _broker_probe_scope(self) -> Iterator[None]:
+        """Reuse successful probes within one read/reconcile phase only."""
+        self._broker_probe_results = {}
+        try:
+            yield
+        finally:
+            self._broker_probe_results = None
+
+    def _invalidate_broker_probes(self) -> None:
+        """Discard observations before changing broker state or credentials."""
+        if self._broker_probe_results is not None:
+            self._broker_probe_results.clear()
+
     def _rabbitmq_running(self) -> bool:
         """Check whether the broker is actually running."""
         if not self._pebble_ready():
             return False
 
+        cache = self._broker_probe_results
+        if cache is not None and cache.get("running"):
+            return True
+
         container = self.unit.get_container(RABBITMQ_CONTAINER)
         try:
             process = container.exec(
-                ["rabbitmq-diagnostics", "check_running"], timeout=30
+                ["rabbitmq-diagnostics", "check_running"],
+                timeout=30,
+                environment=RABBITMQ_CLI_ENV,
             )
             process.wait_output()
         except (ExecError, ModelError):
             return False
+        if cache is not None:
+            cache["running"] = True
         return True
 
     def _noop_amqp_credentials_callback(self, *args, **kwargs) -> None:
@@ -417,28 +450,29 @@ class RabbitMQOperatorCharm(CharmBase):
         ):
             return
 
-        self._reconcile_lb(None)
-        self._reconcile_health_checks()
+        with self._broker_probe_scope():
+            self._reconcile_lb(None)
+            self._reconcile_health_checks()
 
-        if not self._ensure_broker_running(event):
-            return
+            if not self._ensure_broker_running(event):
+                return
 
-        if not self._reconcile_operator_user(event):
-            return
+            if not self._reconcile_operator_user(event):
+                return
 
-        if not self._auto_forget_stale_cluster_nodes(event):
-            return
+            if not self._auto_forget_stale_cluster_nodes(event):
+                return
 
-        self._reconcile_running_broker_state()
-        self._reconcile_health_checks()
+            self._reconcile_running_broker_state()
+            self._reconcile_health_checks()
 
-        if not self._reconcile_amqp_relations(event):
-            return
+            if not self._reconcile_amqp_relations(event):
+                return
 
-        if not self._reconcile_queue_membership(event):
-            return
+            if not self._reconcile_queue_membership(event):
+                return
 
-        self._publish_relation_data()
+            self._publish_relation_data()
 
     def _workload_reconcile_prerequisites(  # noqa: C901
         self, event: EventBase | None = None
@@ -474,6 +508,7 @@ class RabbitMQOperatorCharm(CharmBase):
 
     def _reconcile_workload(self, event: EventBase | None = None) -> bool:
         """Render config, refresh Pebble layer, and ensure services are running."""
+        self._invalidate_broker_probes()
         if not self._workload_reconcile_prerequisites(event):
             return False
 
@@ -534,6 +569,7 @@ class RabbitMQOperatorCharm(CharmBase):
             process = container.exec(
                 ["rabbitmqctl", "cluster_status", "--formatter=json"],
                 timeout=30,
+                environment=RABBITMQ_CLI_ENV,
             )
             output, _ = process.wait_output()
             cluster_status = json.loads(output)
@@ -560,10 +596,12 @@ class RabbitMQOperatorCharm(CharmBase):
         forgotten = []
         failed = []
         for node in stale_nodes:
+            self._invalidate_broker_probes()
             try:
                 process = container.exec(
                     ["rabbitmqctl", "forget_cluster_node", node],
                     timeout=5 * 60,
+                    environment=RABBITMQ_CLI_ENV,
                 )
                 process.wait_output()
                 forgotten.append(node)
@@ -1037,7 +1075,10 @@ class RabbitMQOperatorCharm(CharmBase):
                 "period": SAFETY_CHECK_PERIOD,
                 "timeout": SAFETY_CHECK_TIMEOUT,
                 "threshold": SAFETY_CHECK_THRESHOLD,
-                "exec": {"command": RABBITMQ_SAFETY_CHECK_PATH},
+                "exec": {
+                    "command": RABBITMQ_SAFETY_CHECK_PATH,
+                    "environment": RABBITMQ_CLI_ENV,
+                },
             },
         }
         return layer
@@ -1058,6 +1099,7 @@ class RabbitMQOperatorCharm(CharmBase):
             logger.debug("Pebble layer unchanged, skipping replan")
             return False
 
+        self._invalidate_broker_probes()
         container.add_layer("rabbitmq", desired_layer, combine=True)
         try:
             container.replan()
@@ -1127,6 +1169,7 @@ class RabbitMQOperatorCharm(CharmBase):
         layer_changed: bool = False,
     ) -> None:
         """Ensure Pebble services are started and restarted when needed."""
+        self._invalidate_broker_probes()
         started_services = set()
 
         if (
@@ -1160,6 +1203,10 @@ class RabbitMQOperatorCharm(CharmBase):
         if not self._pebble_ready():
             return False
 
+        cache = self._broker_probe_results
+        if cache is not None and cache.get("cluster"):
+            return True
+
         container = self.unit.get_container(RABBITMQ_CONTAINER)
         try:
             process = container.exec(
@@ -1169,6 +1216,7 @@ class RabbitMQOperatorCharm(CharmBase):
                     "--formatter=json",
                 ],
                 timeout=30,
+                environment=RABBITMQ_CLI_ENV,
             )
             output, _ = process.wait_output()
             cluster_status = json.loads(output)
@@ -1176,7 +1224,10 @@ class RabbitMQOperatorCharm(CharmBase):
             return False
 
         local_node = self.generate_nodename(self.unit.name)
-        return local_node in cluster_status.get("running_nodes", [])
+        running = local_node in cluster_status.get("running_nodes", [])
+        if running and cache is not None:
+            cache["cluster"] = True
+        return running
 
     def _health_checks_ready(self) -> bool:
         """Return whether Pebble health checks should currently run."""
@@ -1662,8 +1713,18 @@ class RabbitMQOperatorCharm(CharmBase):
         self, *args: str, timeout: int = 30
     ) -> tuple[str, str]:
         """Run a rabbitmqctl command in the workload container."""
+        if not args or args[0] not in {
+            "authenticate_user",
+            "cluster_status",
+            "version",
+        }:
+            self._invalidate_broker_probes()
         container = self.unit.get_container(RABBITMQ_CONTAINER)
-        process = container.exec(["rabbitmqctl", *args], timeout=timeout)
+        process = container.exec(
+            ["rabbitmqctl", *args],
+            timeout=timeout,
+            environment=RABBITMQ_CLI_ENV,
+        )
         return process.wait_output()
 
     def _operator_user_auth_valid(self) -> bool:
@@ -1672,6 +1733,10 @@ class RabbitMQOperatorCharm(CharmBase):
             return False
         if not self._rabbitmq_running():
             return False
+
+        cache = self._broker_probe_results
+        if cache is not None and cache.get("auth"):
+            return True
 
         try:
             self._run_rabbitmqctl(
@@ -1682,6 +1747,8 @@ class RabbitMQOperatorCharm(CharmBase):
             )
         except (ExecError, ModelError):
             return False
+        if cache is not None:
+            cache["auth"] = True
         return True
 
     def _operator_user_recovery_required(self) -> bool:
@@ -1904,9 +1971,12 @@ class RabbitMQOperatorCharm(CharmBase):
         self, container: ops.Container, context: str
     ) -> None:
         """Resume listeners and clear the charm marker."""
+        self._invalidate_broker_probes()
         try:
             container.exec(
-                ["rabbitmqctl", "resume_listeners"], timeout=30
+                ["rabbitmqctl", "resume_listeners"],
+                timeout=30,
+                environment=RABBITMQ_CLI_ENV,
             ).wait_output()
             container.remove_path(RABBITMQ_PROTECTOR_MARKER)
         except (ExecError, PathError, PebbleTimeoutError):
@@ -1916,9 +1986,12 @@ class RabbitMQOperatorCharm(CharmBase):
 
     def _suspend_listeners(self, container: ops.Container) -> None:
         """Suspend listeners and write the charm marker."""
+        self._invalidate_broker_probes()
         try:
             container.exec(
-                ["rabbitmqctl", "suspend_listeners"], timeout=30
+                ["rabbitmqctl", "suspend_listeners"],
+                timeout=30,
+                environment=RABBITMQ_CLI_ENV,
             ).wait_output()
             container.push(
                 RABBITMQ_PROTECTOR_MARKER,
@@ -1947,6 +2020,7 @@ class RabbitMQOperatorCharm(CharmBase):
 
         Burn the bridge behind us and remove the guest user.
         """
+        self._invalidate_broker_probes()
         logging.info("Initializing the operator user.")
         # Use guest to create operator user
         api = self._get_admin_api("guest", "guest")
@@ -1964,6 +2038,7 @@ class RabbitMQOperatorCharm(CharmBase):
 
     def _recreate_operator_user(self) -> None:
         """Recreate the operator administrative user from peer data."""
+        self._invalidate_broker_probes()
         password = self._operator_password
         if not password:
             raise RabbitOperatorError("Operator password not available")
@@ -2386,18 +2461,19 @@ class RabbitMQOperatorCharm(CharmBase):
 
     def _on_collect_unit_status(self, event: CollectStatusEvent) -> None:
         """Collect unit status from current state and reconciliation errors."""
-        if self._amqp_reconcile_error:
-            event.add_status(BlockedStatus(self._amqp_reconcile_error))
+        with self._broker_probe_scope():
+            if self._amqp_reconcile_error:
+                event.add_status(BlockedStatus(self._amqp_reconcile_error))
 
-        if status := self._pre_broker_status():
-            event.add_status(status)
-            return
+            if status := self._pre_broker_status():
+                event.add_status(status)
+                return
 
-        if not self._rabbitmq_running():
-            event.add_status(BlockedStatus(SAFETY_REASON_NOT_RUNNING))
-            return
+            if not self._rabbitmq_running():
+                event.add_status(BlockedStatus(SAFETY_REASON_NOT_RUNNING))
+                return
 
-        event.add_status(self._running_broker_status())
+            event.add_status(self._running_broker_status())
 
     def _unsafe_status(self, reason: str):
         """Return unit status for an unsafe broker state."""
