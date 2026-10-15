@@ -916,7 +916,9 @@ def test_rabbitmq_running_uses_diagnostics_instead_of_pebble_state():
 
     assert charm.RabbitMQOperatorCharm._rabbitmq_running(fake)
     container.exec.assert_called_once_with(
-        ["rabbitmq-diagnostics", "check_running"], timeout=30
+        ["rabbitmq-diagnostics", "check_running"],
+        timeout=30,
+        environment=charm.RABBITMQ_CLI_ENV,
     )
 
 
@@ -932,6 +934,25 @@ def test_rabbitmq_running_returns_false_when_diagnostics_fails():
     )
 
     assert not charm.RabbitMQOperatorCharm._rabbitmq_running(fake)
+
+
+def test_rabbitmqctl_limits_cli_schedulers_and_preserves_timeout():
+    """CLI limits apply to authentication without changing its timeout or args."""
+    container = Mock()
+    container.exec.return_value.wait_output.return_value = ("ok", "")
+    fake = _fake_charm(
+        unit=Mock(get_container=Mock(return_value=container)),
+    )
+
+    assert charm.RabbitMQOperatorCharm._run_rabbitmqctl(
+        fake, "authenticate_user", "operator", "--", "-password", timeout=60
+    ) == ("ok", "")
+
+    container.exec.assert_called_once_with(
+        ["rabbitmqctl", "authenticate_user", "operator", "--", "-password"],
+        timeout=60,
+        environment={"RABBITMQ_CTL_ERL_ARGS": "+S 2:2 +SDcpu 1 +SDio 1"},
+    )
 
 
 def test_rabbit_running_caches_version_when_broker_is_running():
@@ -1082,6 +1103,7 @@ def test_forget_cluster_node_action_removes_absent_non_running_members():
             call(
                 ["rabbitmqctl", "cluster_status", "--formatter=json"],
                 timeout=30,
+                environment=charm.RABBITMQ_CLI_ENV,
             ),
             call(
                 [
@@ -1090,6 +1112,7 @@ def test_forget_cluster_node_action_removes_absent_non_running_members():
                     "rabbit@rabbitmq-k8s-1.rabbitmq-k8s-endpoints",
                 ],
                 timeout=5 * 60,
+                environment=charm.RABBITMQ_CLI_ENV,
             ),
             call(
                 [
@@ -1098,6 +1121,7 @@ def test_forget_cluster_node_action_removes_absent_non_running_members():
                     "rabbit@rabbitmq-k8s-2.rabbitmq-k8s-endpoints",
                 ],
                 timeout=5 * 60,
+                environment=charm.RABBITMQ_CLI_ENV,
             ),
         ]
     )
@@ -1252,7 +1276,10 @@ def test_rabbitmq_layer_adds_checks_after_operator_bootstrap():
             "period": charm.SAFETY_CHECK_PERIOD,
             "timeout": charm.SAFETY_CHECK_TIMEOUT,
             "threshold": charm.SAFETY_CHECK_THRESHOLD,
-            "exec": {"command": charm.RABBITMQ_SAFETY_CHECK_PATH},
+            "exec": {
+                "command": charm.RABBITMQ_SAFETY_CHECK_PATH,
+                "environment": charm.RABBITMQ_CLI_ENV,
+            },
         },
     }
 
@@ -1789,7 +1816,9 @@ def test_reconcile_listener_protection_suspends_on_unsafe_transition():
     charm.RabbitMQOperatorCharm._reconcile_listener_protection(fake, False)
 
     container.exec.assert_called_once_with(
-        ["rabbitmqctl", "suspend_listeners"], timeout=30
+        ["rabbitmqctl", "suspend_listeners"],
+        timeout=30,
+        environment=charm.RABBITMQ_CLI_ENV,
     )
     container.push.assert_called_once()
 
@@ -1814,7 +1843,9 @@ def test_reconcile_listener_protection_resumes_only_with_charm_marker():
     charm.RabbitMQOperatorCharm._reconcile_listener_protection(fake, True)
 
     container.exec.assert_called_once_with(
-        ["rabbitmqctl", "resume_listeners"], timeout=30
+        ["rabbitmqctl", "resume_listeners"],
+        timeout=30,
+        environment=charm.RABBITMQ_CLI_ENV,
     )
     container.remove_path.assert_called_once_with(
         charm.RABBITMQ_PROTECTOR_MARKER
@@ -2619,9 +2650,11 @@ def test_auto_forget_stale_nodes_forgets_absent_non_running_nodes():
     fake._expected_cluster_nodes = (
         lambda: charm.RabbitMQOperatorCharm._expected_cluster_nodes(fake)
     )
-    fake._run_rabbitmqctl = lambda *args, timeout=30: container.exec(
-        ["rabbitmqctl", *args], timeout=timeout
-    ).wait_output()
+    fake._run_rabbitmqctl = (
+        lambda *args, timeout=30: charm.RabbitMQOperatorCharm._run_rabbitmqctl(
+            fake, *args, timeout=timeout
+        )
+    )
     fake._cluster_status = lambda: charm.RabbitMQOperatorCharm._cluster_status(
         fake
     )
@@ -2647,6 +2680,7 @@ def test_auto_forget_stale_nodes_forgets_absent_non_running_nodes():
             call(
                 ["rabbitmqctl", "cluster_status", "--formatter=json"],
                 timeout=30,
+                environment=charm.RABBITMQ_CLI_ENV,
             ),
             call(
                 [
@@ -2655,6 +2689,7 @@ def test_auto_forget_stale_nodes_forgets_absent_non_running_nodes():
                     "rabbit@rabbitmq-k8s-1.rabbitmq-k8s-endpoints",
                 ],
                 timeout=5 * 60,
+                environment=charm.RABBITMQ_CLI_ENV,
             ),
         ]
     )
@@ -2739,9 +2774,11 @@ def test_auto_forget_stale_nodes_continues_when_unexpected_node_still_running():
     fake._expected_cluster_nodes = (
         lambda: charm.RabbitMQOperatorCharm._expected_cluster_nodes(fake)
     )
-    fake._run_rabbitmqctl = lambda *args, timeout=30: container.exec(
-        ["rabbitmqctl", *args], timeout=timeout
-    ).wait_output()
+    fake._run_rabbitmqctl = (
+        lambda *args, timeout=30: charm.RabbitMQOperatorCharm._run_rabbitmqctl(
+            fake, *args, timeout=timeout
+        )
+    )
     fake._cluster_status = lambda: charm.RabbitMQOperatorCharm._cluster_status(
         fake
     )
@@ -2765,6 +2802,7 @@ def test_auto_forget_stale_nodes_continues_when_unexpected_node_still_running():
     container.exec.assert_called_once_with(
         ["rabbitmqctl", "cluster_status", "--formatter=json"],
         timeout=30,
+        environment=charm.RABBITMQ_CLI_ENV,
     )
     event.defer.assert_not_called()
 
@@ -3079,7 +3117,9 @@ def test_on_pebble_check_failed_suspends_on_safety_check():
     # Handler calls _reconcile_listener_protection(safe=False), which reads
     # container from self.unit.get_container() (not event.workload).
     container.exec.assert_called_once_with(
-        ["rabbitmqctl", "suspend_listeners"], timeout=30
+        ["rabbitmqctl", "suspend_listeners"],
+        timeout=30,
+        environment=charm.RABBITMQ_CLI_ENV,
     )
 
 
@@ -3118,7 +3158,9 @@ def test_on_pebble_check_recovered_resumes_on_safety_check():
     charm.RabbitMQOperatorCharm._on_pebble_check_recovered(fake, event)
 
     container.exec.assert_called_once_with(
-        ["rabbitmqctl", "resume_listeners"], timeout=30
+        ["rabbitmqctl", "resume_listeners"],
+        timeout=30,
+        environment=charm.RABBITMQ_CLI_ENV,
     )
 
 
@@ -3160,7 +3202,9 @@ def test_resume_listeners_handles_pebble_wait_timeout():
     )
 
     container.exec.assert_called_once_with(
-        ["rabbitmqctl", "resume_listeners"], timeout=30
+        ["rabbitmqctl", "resume_listeners"],
+        timeout=30,
+        environment=charm.RABBITMQ_CLI_ENV,
     )
     container.remove_path.assert_not_called()
 
@@ -3287,6 +3331,7 @@ def test_local_node_in_running_cluster_returns_true_when_node_present():
             "--formatter=json",
         ],
         timeout=30,
+        environment=charm.RABBITMQ_CLI_ENV,
     )
 
 
@@ -3371,7 +3416,9 @@ def test_reconcile_health_checks_starts_and_resumes_stale_protection():
     charm.RabbitMQOperatorCharm._reconcile_health_checks(fake)
 
     container.exec.assert_called_once_with(
-        ["rabbitmqctl", "resume_listeners"], timeout=30
+        ["rabbitmqctl", "resume_listeners"],
+        timeout=30,
+        environment=charm.RABBITMQ_CLI_ENV,
     )
     container.start_checks.assert_called_once_with("alive", "ready", "safety")
 
