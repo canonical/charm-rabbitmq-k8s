@@ -118,6 +118,10 @@ RABBITMQ_STORAGE_NAME = "rabbitmq-data"
 RABBITMQ_DATA_DIR = "/var/lib/rabbitmq"
 RABBITMQ_COOKIE_PATH = "/var/lib/rabbitmq/.erlang.cookie"
 RABBITMQ_MNESIA_DIR = "/var/lib/rabbitmq/mnesia"
+# CLI VMs do not need one scheduler per CPU visible to the container.
+RABBITMQ_CLI_ENV = {
+    "RABBITMQ_CTL_ERL_ARGS": "+S 2:2 +SDcpu 1 +SDio 1",
+}
 
 SELECTOR_ALL = "all"
 SELECTOR_EVEN = "even"
@@ -399,7 +403,9 @@ class RabbitMQOperatorCharm(CharmBase):
         container = self.unit.get_container(RABBITMQ_CONTAINER)
         try:
             process = container.exec(
-                ["rabbitmq-diagnostics", "check_running"], timeout=30
+                ["rabbitmq-diagnostics", "check_running"],
+                timeout=30,
+                environment=RABBITMQ_CLI_ENV,
             )
             process.wait_output()
         except (ExecError, ModelError):
@@ -534,6 +540,7 @@ class RabbitMQOperatorCharm(CharmBase):
             process = container.exec(
                 ["rabbitmqctl", "cluster_status", "--formatter=json"],
                 timeout=30,
+                environment=RABBITMQ_CLI_ENV,
             )
             output, _ = process.wait_output()
             cluster_status = json.loads(output)
@@ -564,6 +571,7 @@ class RabbitMQOperatorCharm(CharmBase):
                 process = container.exec(
                     ["rabbitmqctl", "forget_cluster_node", node],
                     timeout=5 * 60,
+                    environment=RABBITMQ_CLI_ENV,
                 )
                 process.wait_output()
                 forgotten.append(node)
@@ -1037,7 +1045,10 @@ class RabbitMQOperatorCharm(CharmBase):
                 "period": SAFETY_CHECK_PERIOD,
                 "timeout": SAFETY_CHECK_TIMEOUT,
                 "threshold": SAFETY_CHECK_THRESHOLD,
-                "exec": {"command": RABBITMQ_SAFETY_CHECK_PATH},
+                "exec": {
+                    "command": RABBITMQ_SAFETY_CHECK_PATH,
+                    "environment": RABBITMQ_CLI_ENV,
+                },
             },
         }
         return layer
@@ -1169,6 +1180,7 @@ class RabbitMQOperatorCharm(CharmBase):
                     "--formatter=json",
                 ],
                 timeout=30,
+                environment=RABBITMQ_CLI_ENV,
             )
             output, _ = process.wait_output()
             cluster_status = json.loads(output)
@@ -1663,7 +1675,11 @@ class RabbitMQOperatorCharm(CharmBase):
     ) -> tuple[str, str]:
         """Run a rabbitmqctl command in the workload container."""
         container = self.unit.get_container(RABBITMQ_CONTAINER)
-        process = container.exec(["rabbitmqctl", *args], timeout=timeout)
+        process = container.exec(
+            ["rabbitmqctl", *args],
+            timeout=timeout,
+            environment=RABBITMQ_CLI_ENV,
+        )
         return process.wait_output()
 
     def _operator_user_auth_valid(self) -> bool:
@@ -1906,7 +1922,9 @@ class RabbitMQOperatorCharm(CharmBase):
         """Resume listeners and clear the charm marker."""
         try:
             container.exec(
-                ["rabbitmqctl", "resume_listeners"], timeout=30
+                ["rabbitmqctl", "resume_listeners"],
+                timeout=30,
+                environment=RABBITMQ_CLI_ENV,
             ).wait_output()
             container.remove_path(RABBITMQ_PROTECTOR_MARKER)
         except (ExecError, PathError, PebbleTimeoutError):
@@ -1918,7 +1936,9 @@ class RabbitMQOperatorCharm(CharmBase):
         """Suspend listeners and write the charm marker."""
         try:
             container.exec(
-                ["rabbitmqctl", "suspend_listeners"], timeout=30
+                ["rabbitmqctl", "suspend_listeners"],
+                timeout=30,
+                environment=RABBITMQ_CLI_ENV,
             ).wait_output()
             container.push(
                 RABBITMQ_PROTECTOR_MARKER,
