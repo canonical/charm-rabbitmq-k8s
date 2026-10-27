@@ -1337,7 +1337,7 @@ def test_forget_cluster_node_action_removes_absent_non_running_members():
         [
             call(
                 ["rabbitmqctl", "cluster_status", "--formatter=json"],
-                timeout=30,
+                timeout=charm.RABBITMQ_CLUSTER_STATUS_TIMEOUT,
                 environment=charm.RABBITMQ_CLI_ENV,
             ),
             call(
@@ -3565,7 +3565,7 @@ def test_local_node_in_running_cluster_returns_true_when_node_present():
             "cluster_status",
             "--formatter=json",
         ],
-        timeout=30,
+        timeout=charm.RABBITMQ_CLUSTER_STATUS_TIMEOUT,
         environment=charm.RABBITMQ_CLI_ENV,
     )
 

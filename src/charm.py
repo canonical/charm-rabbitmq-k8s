@@ -156,6 +156,8 @@ SAFETY_CHECK_TIMEOUT = "30s"
 HEALTH_CHECK_THRESHOLD = 3
 SAFETY_CHECK_THRESHOLD = 2
 RABBITMQ_STARTUP_GRACE_SECONDS = 180
+# Degraded cluster (losing 1 out of 3, for example) may take 2 minutes at least
+RABBITMQ_CLUSTER_STATUS_TIMEOUT = 5 * 60
 SAFETY_REASON_NOT_RUNNING = "RabbitMQ not running"
 SAFETY_REASON_LOCAL_ALARMS = "Local alarms active"
 SAFETY_REASON_CLUSTER_STATUS = "Cluster status unavailable"
@@ -568,7 +570,7 @@ class RabbitMQOperatorCharm(CharmBase):
         try:
             process = container.exec(
                 ["rabbitmqctl", "cluster_status", "--formatter=json"],
-                timeout=30,
+                timeout=RABBITMQ_CLUSTER_STATUS_TIMEOUT,
                 environment=RABBITMQ_CLI_ENV,
             )
             output, _ = process.wait_output()
@@ -1215,7 +1217,7 @@ class RabbitMQOperatorCharm(CharmBase):
                     "cluster_status",
                     "--formatter=json",
                 ],
-                timeout=30,
+                timeout=RABBITMQ_CLUSTER_STATUS_TIMEOUT,
                 environment=RABBITMQ_CLI_ENV,
             )
             output, _ = process.wait_output()
