@@ -3,7 +3,7 @@ name: Release to Edge
 on:
   push:
     branches:
-      - main
+      - stable/3.12
 
 jobs:
   lint:
@@ -34,6 +34,8 @@ jobs:
 
   release-to-charmhub:
     name: Release to CharmHub
+    permissions:
+      contents: write
     needs:
       - lint
       - unit-test
