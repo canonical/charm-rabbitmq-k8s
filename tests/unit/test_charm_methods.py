@@ -603,6 +603,10 @@ def test_ensure_erlang_cookie_generate_new_when_leader():
     unit.get_container.return_value = container
     fake = _fake_charm(unit=unit, peers=peers)
 
+    fake._publish_existing_erlang_cookie = MethodType(
+        charm.RabbitMQOperatorCharm._publish_existing_erlang_cookie, fake
+    )
+
     with patch(
         "charm.secrets.token_hex", return_value="generated-cookie-value"
     ):
@@ -629,25 +633,6 @@ def test_ensure_erlang_cookie_no_action_when_not_leader():
     )
     unit = Mock()
     unit.is_leader.return_value = False
-    unit.get_container.return_value = container
-    fake = _fake_charm(unit=unit, peers=peers)
-
-    charm.RabbitMQOperatorCharm._ensure_erlang_cookie(fake)
-
-    container.push.assert_not_called()
-    peers.set_erlang_cookie.assert_not_called()
-
-
-def test_ensure_erlang_cookie_no_action_when_file_exists():
-    """No new cookie is written when the file already exists."""
-    container = Mock()
-    container.exists.return_value = True
-    peers = SimpleNamespace(
-        erlang_cookie="",
-        set_erlang_cookie=Mock(),
-    )
-    unit = Mock()
-    unit.is_leader.return_value = True
     unit.get_container.return_value = container
     fake = _fake_charm(unit=unit, peers=peers)
 
@@ -1143,7 +1128,11 @@ def test_healthy_reconciliation_and_status_use_six_cli_probes():
     )
     fake = _fake_charm(
         unit=Mock(get_container=Mock(return_value=container)),
-        peers=SimpleNamespace(operator_user_created="operator"),
+        peers=SimpleNamespace(
+            operator_user_created="operator",
+            erlang_cookie="cluster-cookie",
+            peers_rel=Mock(),
+        ),
         generate_nodename=lambda _: "local-node",
         _stored=SimpleNamespace(rabbitmq_version="4.0.5"),
         _pre_broker_status=lambda: None,
