@@ -51,6 +51,12 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default="latest/stable",
         help="Charmhub channel used for the COS Lite bundle.",
     )
+    parser.addoption(
+        "--base",
+        action="store",
+        default="ubuntu@26.04",
+        help="Charm base (e.g. ubuntu@24.04 or ubuntu@26.04) to deploy and test.",
+    )
 
 
 @pytest.fixture(scope="session")
@@ -67,9 +73,9 @@ def app_name(charmcraft_config: dict[str, Any]) -> str:
 
 
 @pytest.fixture(scope="session")
-def base(charmcraft_config: dict[str, Any]) -> str:
+def base(pytestconfig: pytest.Config) -> str:
     """Return the charm base."""
-    return charmcraft_config["base"]
+    return pytestconfig.getoption("--base")
 
 
 @pytest.fixture(scope="session")
@@ -121,8 +127,4 @@ def charm_file(app_name: str, pytestconfig: pytest.Config) -> pathlib.Path:
     charms = sorted(PROJECT_ROOT.glob(f"{app_name}*.charm"))
     if not charms:
         raise FileNotFoundError(f"Unable to find packed charm for {app_name}")
-    if len(charms) > 1:
-        raise RuntimeError(
-            f"Found more than one packed charm for {app_name}: {charms}"
-        )
     return charms[0].resolve()
