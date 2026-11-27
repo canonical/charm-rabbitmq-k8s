@@ -294,28 +294,39 @@ def test_upgrade_charm_reconciles_and_autostarts(
     assert state_out.deferred == []
 
 
-def test_config_changed_proceeds_without_operator_user(
+def test_follower_starts_broker_before_operator_user_is_created(
     ctx, rabbitmq_container, networks, monkeypatch
 ):
-    """Non-leaders should still reconcile startup without operator-user state."""
-    peer = testing.PeerRelation(
-        endpoint="peers",
-        local_app_data={
-            "operator_password": "foobar",
-            "operator_user_created": "rmqadmin",
-            "erlang_cookie": "magicsecurity",
-        },
-        local_unit_data={},
-    )
+    """Allow peer discovery before the cluster operator user is ready."""
+    peer = build_peer_relation(operator_user_created=None)
     state = _state(
         rabbitmq_container, networks, leader=False, relations=[peer]
     )
 
     with ctx(ctx.on.config_changed(), state) as manager:
         _patch_config_changed_for_success(monkeypatch, manager.charm)
+        reconcile_amqp = Mock()
+        monkeypatch.setattr(
+            manager.charm, "_reconcile_amqp_relations", reconcile_amqp
+        )
         state_out = manager.run()
+        container = manager.charm.unit.get_container(charm.RABBITMQ_CONTAINER)
+        statuses = state_out.get_container(
+            charm.RABBITMQ_CONTAINER
+        ).service_statuses
+        assert (
+            statuses.get(charm.RABBITMQ_SERVICE)
+            == ops.pebble.ServiceStatus.ACTIVE
+        )
+        with container.pull("/etc/rabbitmq/rabbitmq.conf") as stream:
+            config = stream.read()
 
-    assert state_out.deferred == []
+    assert "cluster_formation.peer_discovery_backend = k8s" in config
+    assert "loopback_users.guest = true" in config
+    assert state_out.unit_status == ops.model.WaitingStatus(
+        "Waiting for leader to create operator user"
+    )
+    reconcile_amqp.assert_not_called()
 
 
 def test_config_changed_proceeds_for_leader_without_operator_user(

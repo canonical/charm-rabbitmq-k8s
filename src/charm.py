@@ -483,12 +483,9 @@ class RabbitMQOperatorCharm(CharmBase):
                 event.defer()
             return False
 
+        # Discovery on the first broker probes its peers before it can finish
+        # starting, so followers only need the Erlang cookie to start.
         if not self.unit.is_leader() and not self.peers.erlang_cookie:
-            if event is not None:
-                event.defer()
-            return False
-
-        if not self.unit.is_leader() and not self.peers.operator_user_created:
             if event is not None:
                 event.defer()
             return False
@@ -795,9 +792,9 @@ class RabbitMQOperatorCharm(CharmBase):
         return self._force_boot_single_survivor()
 
     def _reconcile_operator_user(self, event: EventBase | None = None) -> bool:
-        """Ensure the leader has bootstrapped the operator user."""
+        """Gate further reconciliation on operator credentials."""
         if not self.unit.is_leader():
-            return True
+            return bool(self.peers.operator_user_created)
 
         if self.peers.operator_user_created:
             return True
@@ -2248,7 +2245,6 @@ class RabbitMQOperatorCharm(CharmBase):
         container = self.unit.get_container(RABBITMQ_CONTAINER)
         rabbitmq_conf = self._render_template(
             "rabbitmq.conf.j2",
-            loopback_users="none",
             app_name=self.app.name,
             cluster_partition_handling=self.cluster_partition_handling,
             disk_free_limit_bytes=self.resolved_disk_free_limit_bytes,

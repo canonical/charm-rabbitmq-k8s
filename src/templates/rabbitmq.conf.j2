@@ -1,7 +1,6 @@
-# allowing remote connections for default user is highly discouraged
-# as it dramatically decreases the security of the system. Delete the user
-# instead and create a new one with generated secure credentials.
-loopback_users = {{ loopback_users }}
+# The leader uses the default guest user locally to create the operator
+# user. Other pods must not be able to log in as guest during bootstrap.
+loopback_users.guest = true
 
 # enable k8s clustering
 cluster_formation.peer_discovery_backend = k8s
