@@ -1614,7 +1614,6 @@ def test_render_rabbitmq_conf_skips_push_when_unchanged():
     rabbitmq_conf = charm.RabbitMQOperatorCharm._render_template(
         fake,
         "rabbitmq.conf.j2",
-        loopback_users="none",
         app_name=fake.app.name,
         cluster_partition_handling=fake.cluster_partition_handling,
         disk_free_limit_bytes=fake.resolved_disk_free_limit_bytes,
@@ -3202,7 +3201,7 @@ def test_ensure_broker_running_does_not_force_boot_during_departure_hook():
 
 
 def test_workload_reconcile_prerequisites_non_leader_no_operator_user():
-    """Non-leader without operator_user_created defers and returns False."""
+    """Non-leaders can start the broker with the shared Erlang cookie."""
     event = Mock()
     fake = _fake_charm(
         unit=Mock(is_leader=Mock(return_value=False)),
@@ -3211,14 +3210,15 @@ def test_workload_reconcile_prerequisites_non_leader_no_operator_user():
             operator_user_created=None,
         ),
         peers_bind_address="10.10.1.1",
+        _set_ownership_on_data_dir=Mock(return_value=True),
     )
 
     result = charm.RabbitMQOperatorCharm._workload_reconcile_prerequisites(
         fake, event
     )
 
-    assert result is False
-    event.defer.assert_called_once()
+    assert result is True
+    event.defer.assert_not_called()
 
 
 def test_annotation_values_with_special_characters_accepted():
