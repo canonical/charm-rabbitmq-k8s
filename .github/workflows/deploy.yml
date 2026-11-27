@@ -2,6 +2,11 @@ name: deploy
 
 on:
   workflow_call:
+    inputs:
+      bases:
+        description: JSON list of charm bases to build and test against
+        type: string
+        default: '["ubuntu@26.04"]'
 
 
 jobs:
@@ -36,21 +41,21 @@ jobs:
       - name: Build Charm
         run: |
           charmcraft -v pack
-          mv rabbitmq-k8s*charm rabbitmq-k8s.charm
       - name: Upload charm artifact
         uses: actions/upload-artifact@v4
         with:
           name: charm
-          path: rabbitmq-k8s.charm
+          path: "*.charm"
 
   functional-test:
-    name: ${{ matrix.test_file }}
+    name: ${{ matrix.test_file }} (${{ matrix.base }})
     runs-on: ubuntu-latest
     needs: [discover, build]
     strategy:
       fail-fast: false
       matrix:
         test_file: ${{ fromJson(needs.discover.outputs.test_files) }}
+        base: ${{ fromJson(inputs.bases) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v3
@@ -71,13 +76,15 @@ jobs:
         env:
           TEST_FILE: ${{ matrix.test_file }}
         run: |
+          charm_file="$(ls *_$(echo "${{ matrix.base }}" | tr ':' '-')-amd64.charm)"
           uv run --with tox tox -e func -- \
             "tests/functional/$TEST_FILE" \
-            --charm-file rabbitmq-k8s.charm
+            --charm-file "$charm_file" \
+            --base "${{ matrix.base }}"
       - name: Upload test logs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-${{ matrix.test_file }}
+          name: logs-${{ matrix.test_file }}-${{ matrix.base }}
           path: logs/
           if-no-files-found: ignore

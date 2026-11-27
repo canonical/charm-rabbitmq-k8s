@@ -33,3 +33,5 @@ jobs:
         run: uv run --with tox tox -e py3
   deploy:
     uses: ./.github/workflows/deploy.yml
+    with:
+      bases: '["ubuntu@24.04", "ubuntu@26.04"]'

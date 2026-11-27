@@ -34,6 +34,8 @@ jobs:
 
   release-to-charmhub:
     name: Release to CharmHub
+    permissions:
+      contents: write
     needs:
       - lint
       - unit-test
@@ -44,8 +46,9 @@ jobs:
         with:
           fetch-depth: 1
       - name: Upload charm to Charmhub
-        uses: canonical/charming-actions/upload-charm@2.6.3
+        uses: canonical/charming-actions/upload-charm@2.7.0
         with:
           credentials: "${{ secrets.CHARMHUB_TOKEN }}"
           github-token: "${{ secrets.GITHUB_TOKEN }}"
           channel: 4.0/edge
+          destructive-mode: "true"
