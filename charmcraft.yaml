@@ -5,10 +5,11 @@ description: RabbitMQ
 links:
   documentation: https://discourse.charmhub.io/t/thedac-rabbitmq-operator-docs-index/4630
 
-base: ubuntu@24.04
 platforms:
-  amd64:
-  s390x:
+  ubuntu@24.04:amd64:
+  ubuntu@24.04:s390x:
+  ubuntu@26.04:amd64:
+  ubuntu@26.04:s390x:
 
 config:
   options:
@@ -246,8 +247,8 @@ parts:
       # s390x: build cryptography (openssl-sys/Rust) from source
       - libssl-dev
       - pkg-config
-      - rustc-1.80
-      - cargo-1.80
+      - rustc-1.91
+      - cargo-1.91
     charm-binary-python-packages:
       - cryptography
       - jsonschema
