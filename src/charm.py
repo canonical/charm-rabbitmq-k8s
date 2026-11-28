@@ -483,12 +483,9 @@ class RabbitMQOperatorCharm(CharmBase):
                 event.defer()
             return False
 
+        # Discovery on the first broker probes its peers before it can finish
+        # starting, so followers only need the Erlang cookie to start.
         if not self.unit.is_leader() and not self.peers.erlang_cookie:
-            if event is not None:
-                event.defer()
-            return False
-
-        if not self.unit.is_leader() and not self.peers.operator_user_created:
             if event is not None:
                 event.defer()
             return False
@@ -725,6 +722,19 @@ class RabbitMQOperatorCharm(CharmBase):
     def _ensure_broker_running(self, event: EventBase | None = None) -> bool:
         """Ensure the local broker is running, starting it when possible."""
         if self._rabbitmq_running():
+            if (
+                self.unit.is_leader()
+                and self.peers.peers_rel is not None
+                and not self.peers.erlang_cookie
+            ):
+                container = self.unit.get_container(RABBITMQ_CONTAINER)
+                try:
+                    self._publish_existing_erlang_cookie(container)
+                except PebbleConnectionError:
+                    logger.warning(
+                        "Pebble disconnected while recovering Erlang cookie"
+                    )
+                    return self._defer_or_continue(event)
             return True
 
         if not self._reconcile_workload(event):
@@ -782,9 +792,9 @@ class RabbitMQOperatorCharm(CharmBase):
         return self._force_boot_single_survivor()
 
     def _reconcile_operator_user(self, event: EventBase | None = None) -> bool:
-        """Ensure the leader has bootstrapped the operator user."""
+        """Gate further reconciliation on operator credentials."""
         if not self.unit.is_leader():
-            return True
+            return bool(self.peers.operator_user_created)
 
         if self.peers.operator_user_created:
             return True
@@ -2142,7 +2152,7 @@ class RabbitMQOperatorCharm(CharmBase):
         return True
 
     def _ensure_erlang_cookie(self):
-        """Ensure an erlang cookie file is present."""
+        """Synchronize the Erlang cookie between the workload and peer data."""
         container = self.unit.get_container(RABBITMQ_CONTAINER)
         if self.peers.erlang_cookie:
             container.push(
@@ -2154,23 +2164,34 @@ class RabbitMQOperatorCharm(CharmBase):
                 group=RABBITMQ_GROUP,
             )
             return
-        if (
-            not container.exists(RABBITMQ_COOKIE_PATH)
-            and self.unit.is_leader()
-        ):
-            logger.info("Creating erlang cookie file")
-            cookie = secrets.token_hex(32)
-            container.push(
-                path=RABBITMQ_COOKIE_PATH,
-                source=cookie,
-                make_dirs=True,
-                user=RABBITMQ_USER,
-                group=RABBITMQ_GROUP,
-                permissions=0o600,
-            )
-            # _ensure_erlang_cookie is called after checking the peer
-            # relation is present.
-            self.peers.set_erlang_cookie(cookie)
+        if not self.unit.is_leader():
+            return
+
+        if self._publish_existing_erlang_cookie(container):
+            return
+
+        logger.info("Creating erlang cookie file")
+        cookie = secrets.token_hex(32)
+        container.push(
+            path=RABBITMQ_COOKIE_PATH,
+            source=cookie,
+            make_dirs=True,
+            user=RABBITMQ_USER,
+            group=RABBITMQ_GROUP,
+            permissions=0o600,
+        )
+        self.peers.set_erlang_cookie(cookie)
+
+    def _publish_existing_erlang_cookie(
+        self, container: ops.Container
+    ) -> bool:
+        """Recover the cookie if a hook wrote it before committing peer data."""
+        if not container.exists(RABBITMQ_COOKIE_PATH):
+            return False
+        with container.pull(RABBITMQ_COOKIE_PATH) as stream:
+            cookie = stream.read()
+        self.peers.set_erlang_cookie(cookie)
+        return True
 
     def _render_and_push_config_files(self) -> set[str]:
         """Render and push configuration files."""
@@ -2224,7 +2245,6 @@ class RabbitMQOperatorCharm(CharmBase):
         container = self.unit.get_container(RABBITMQ_CONTAINER)
         rabbitmq_conf = self._render_template(
             "rabbitmq.conf.j2",
-            loopback_users="none",
             app_name=self.app.name,
             cluster_partition_handling=self.cluster_partition_handling,
             disk_free_limit_bytes=self.resolved_disk_free_limit_bytes,

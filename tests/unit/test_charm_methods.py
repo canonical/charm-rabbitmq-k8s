@@ -603,6 +603,10 @@ def test_ensure_erlang_cookie_generate_new_when_leader():
     unit.get_container.return_value = container
     fake = _fake_charm(unit=unit, peers=peers)
 
+    fake._publish_existing_erlang_cookie = MethodType(
+        charm.RabbitMQOperatorCharm._publish_existing_erlang_cookie, fake
+    )
+
     with patch(
         "charm.secrets.token_hex", return_value="generated-cookie-value"
     ):
@@ -629,25 +633,6 @@ def test_ensure_erlang_cookie_no_action_when_not_leader():
     )
     unit = Mock()
     unit.is_leader.return_value = False
-    unit.get_container.return_value = container
-    fake = _fake_charm(unit=unit, peers=peers)
-
-    charm.RabbitMQOperatorCharm._ensure_erlang_cookie(fake)
-
-    container.push.assert_not_called()
-    peers.set_erlang_cookie.assert_not_called()
-
-
-def test_ensure_erlang_cookie_no_action_when_file_exists():
-    """No new cookie is written when the file already exists."""
-    container = Mock()
-    container.exists.return_value = True
-    peers = SimpleNamespace(
-        erlang_cookie="",
-        set_erlang_cookie=Mock(),
-    )
-    unit = Mock()
-    unit.is_leader.return_value = True
     unit.get_container.return_value = container
     fake = _fake_charm(unit=unit, peers=peers)
 
@@ -1143,7 +1128,11 @@ def test_healthy_reconciliation_and_status_use_six_cli_probes():
     )
     fake = _fake_charm(
         unit=Mock(get_container=Mock(return_value=container)),
-        peers=SimpleNamespace(operator_user_created="operator"),
+        peers=SimpleNamespace(
+            operator_user_created="operator",
+            erlang_cookie="cluster-cookie",
+            peers_rel=Mock(),
+        ),
         generate_nodename=lambda _: "local-node",
         _stored=SimpleNamespace(rabbitmq_version="4.0.5"),
         _pre_broker_status=lambda: None,
@@ -1625,7 +1614,6 @@ def test_render_rabbitmq_conf_skips_push_when_unchanged():
     rabbitmq_conf = charm.RabbitMQOperatorCharm._render_template(
         fake,
         "rabbitmq.conf.j2",
-        loopback_users="none",
         app_name=fake.app.name,
         cluster_partition_handling=fake.cluster_partition_handling,
         disk_free_limit_bytes=fake.resolved_disk_free_limit_bytes,
@@ -3213,7 +3201,7 @@ def test_ensure_broker_running_does_not_force_boot_during_departure_hook():
 
 
 def test_workload_reconcile_prerequisites_non_leader_no_operator_user():
-    """Non-leader without operator_user_created defers and returns False."""
+    """Non-leaders can start the broker with the shared Erlang cookie."""
     event = Mock()
     fake = _fake_charm(
         unit=Mock(is_leader=Mock(return_value=False)),
@@ -3222,14 +3210,15 @@ def test_workload_reconcile_prerequisites_non_leader_no_operator_user():
             operator_user_created=None,
         ),
         peers_bind_address="10.10.1.1",
+        _set_ownership_on_data_dir=Mock(return_value=True),
     )
 
     result = charm.RabbitMQOperatorCharm._workload_reconcile_prerequisites(
         fake, event
     )
 
-    assert result is False
-    event.defer.assert_called_once()
+    assert result is True
+    event.defer.assert_not_called()
 
 
 def test_annotation_values_with_special_characters_accepted():
