@@ -14,6 +14,9 @@
 
 """Scenario tests for RabbitMQOperatorCharm."""
 
+from pathlib import (
+    Path,
+)
 from unittest.mock import (
     Mock,
 )
@@ -291,28 +294,39 @@ def test_upgrade_charm_reconciles_and_autostarts(
     assert state_out.deferred == []
 
 
-def test_config_changed_proceeds_without_operator_user(
+def test_follower_starts_broker_before_operator_user_is_created(
     ctx, rabbitmq_container, networks, monkeypatch
 ):
-    """Non-leaders should still reconcile startup without operator-user state."""
-    peer = testing.PeerRelation(
-        endpoint="peers",
-        local_app_data={
-            "operator_password": "foobar",
-            "operator_user_created": "rmqadmin",
-            "erlang_cookie": "magicsecurity",
-        },
-        local_unit_data={},
-    )
+    """Allow peer discovery before the cluster operator user is ready."""
+    peer = build_peer_relation(operator_user_created=None)
     state = _state(
         rabbitmq_container, networks, leader=False, relations=[peer]
     )
 
     with ctx(ctx.on.config_changed(), state) as manager:
         _patch_config_changed_for_success(monkeypatch, manager.charm)
+        reconcile_amqp = Mock()
+        monkeypatch.setattr(
+            manager.charm, "_reconcile_amqp_relations", reconcile_amqp
+        )
         state_out = manager.run()
+        container = manager.charm.unit.get_container(charm.RABBITMQ_CONTAINER)
+        statuses = state_out.get_container(
+            charm.RABBITMQ_CONTAINER
+        ).service_statuses
+        assert (
+            statuses.get(charm.RABBITMQ_SERVICE)
+            == ops.pebble.ServiceStatus.ACTIVE
+        )
+        with container.pull("/etc/rabbitmq/rabbitmq.conf") as stream:
+            config = stream.read()
 
-    assert state_out.deferred == []
+    assert "cluster_formation.peer_discovery_backend = k8s" in config
+    assert "loopback_users.guest = true" in config
+    assert state_out.unit_status == ops.model.WaitingStatus(
+        "Waiting for leader to create operator user"
+    )
+    reconcile_amqp.assert_not_called()
 
 
 def test_config_changed_proceeds_for_leader_without_operator_user(
@@ -335,6 +349,65 @@ def test_config_changed_proceeds_for_leader_without_operator_user(
         state_out = manager.run()
 
     assert state_out.deferred == []
+
+
+@pytest.mark.parametrize("published_cookie", [None, "published-cookie"])
+@pytest.mark.parametrize("broker_running", [False, True])
+def test_leader_reconciles_cookie_after_interrupted_bootstrap(
+    ctx,
+    networks,
+    monkeypatch,
+    published_cookie,
+    broker_running,
+    tmp_path,
+):
+    """Recover the on-disk cookie and keep published peer data authoritative."""
+    peer = build_peer_relation(
+        operator_user_created=None, erlang_cookie=published_cookie
+    )
+    disk_cookie = "on-disk-cookie"
+    cookie_path = Path(charm.RABBITMQ_COOKIE_PATH)
+    (tmp_path / cookie_path.name).write_text(disk_cookie)
+    rabbitmq_container = testing.Container(
+        name=charm.RABBITMQ_CONTAINER,
+        can_connect=True,
+        mounts={
+            "rabbitmq-data": testing.Mount(
+                location=cookie_path.parent, source=tmp_path
+            )
+        },
+    )
+    state = _state(rabbitmq_container, networks, leader=True, relations=[peer])
+    expected_cookie = published_cookie or disk_cookie
+    expected_disk_cookie = disk_cookie if broker_running else expected_cookie
+    generate_cookie = Mock(return_value="unexpected-new-cookie")
+    monkeypatch.setattr(charm.secrets, "token_hex", generate_cookie)
+
+    for _ in range(2):
+        with ctx(ctx.on.config_changed(), state) as manager:
+            ensure_broker_running = manager.charm._ensure_broker_running
+            _patch_config_changed_for_success(monkeypatch, manager.charm)
+            if broker_running:
+                monkeypatch.setattr(
+                    manager.charm,
+                    "_ensure_broker_running",
+                    ensure_broker_running,
+                )
+            monkeypatch.setattr(
+                manager.charm, "_reconcile_operator_user", lambda event: False
+            )
+            state = manager.run()
+
+        assert (
+            tmp_path / cookie_path.name
+        ).read_text() == expected_disk_cookie
+
+        assert (
+            state.get_relation(peer.id).local_app_data.get("erlang_cookie")
+            == expected_cookie
+        )
+
+    generate_cookie.assert_not_called()
 
 
 def test_config_changed_tolerates_queue_status_api_unavailable(
